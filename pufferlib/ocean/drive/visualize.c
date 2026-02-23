@@ -49,7 +49,7 @@ bool OpenVideo(VideoRecorder *recorder, const char *output_filename, int width, 
                "-f", "rawvideo",
                "-pix_fmt", "rgba",
                "-s", size_str,
-               "-r", "30",
+               "-r", "10",
                "-i", "-",
                "-c:v", "libx264",
                "-pix_fmt", "yuv420p",
@@ -80,6 +80,8 @@ void CloseVideo(VideoRecorder *recorder) {
 void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int lasers, int trajectories, int frame_count, float* path, int log_trajectories, int show_grid) {
 
     BeginDrawing();
+    AgentLabel labels[MAX_AGENTS] = {0};
+    int label_count = 0;
 
     // Top-down orthographic camera
     Camera3D camera = {0};
@@ -88,6 +90,22 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
     camera.up       = (Vector3){ 0.0f, -1.0f, 0.0f };
     camera.fovy     = map_height;
     camera.projection = CAMERA_ORTHOGRAPHIC;
+
+    const char* follow_agent = getenv("FOLLOW_AGENT");
+    if (follow_agent && strcmp(follow_agent, "1") == 0 && env->active_agent_count >= 1) {
+        int idx = env->active_agent_indices[0];
+        Entity* e = &env->entities[idx];
+        if (e->reached_goal_this_episode) {
+            camera.position = (Vector3){e->goal_position_x, e->goal_position_y, 500.0f};
+            camera.target = (Vector3){e->goal_position_x, e->goal_position_y, 0.0f};
+            camera.fovy = 150;
+        } else {
+            camera.position = (Vector3){e->x, e->y, 500.0f};
+            camera.target = (Vector3){e->x, e->y, 0.0f};
+            camera.fovy = 150;
+        }
+
+    }
 
     Color road = (Color){35, 35, 37, 255};
     ClearBackground(road);
@@ -131,74 +149,21 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
     }
 
     // Draw scene
-    draw_scene(env, client, 1, obs, lasers, show_grid);
+    draw_scene(env, client, 1, obs, lasers, show_grid, camera, labels, MAX_AGENTS, &label_count);
     EndMode3D();
-    EndDrawing();
-}
-
-void renderAgentView(Drive* env, Client* client, int map_height, int obs_only, int lasers, int show_grid) {
-    // Agent perspective camera following the selected agent
-    int agent_idx = env->active_agent_indices[env->human_agent_idx];
-    Entity* agent = &env->entities[agent_idx];
-
-    BeginDrawing();
-
-    Camera3D camera = {0};
-    // Position camera behind and above the agent
-    camera.position = (Vector3){
-        agent->x - (25.0f * cosf(agent->heading)),
-        agent->y - (25.0f * sinf(agent->heading)),
-        15.0f
-    };
-    camera.target = (Vector3){
-        agent->x + 40.0f * cosf(agent->heading),
-        agent->y + 40.0f * sinf(agent->heading),
-        1.0f
-    };
-    camera.up = (Vector3){ 0.0f, 0.0f, 1.0f };
-    camera.fovy = 45.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
-
-    Color road = (Color){35, 35, 37, 255};
-
-    ClearBackground(road);
-    BeginMode3D(camera);
-    rlEnableDepthTest();
-    draw_scene(env, client, 0, obs_only, lasers, show_grid); // mode=0 for agent view
-    EndMode3D();
-    EndDrawing();
-}
-
-static int run_cmd(const char *cmd) {
-    int rc = system(cmd);
-    if (rc != 0) {
-        fprintf(stderr, "[ffmpeg] command failed (%d): %s\n", rc, cmd);
+    for(int i = 0; i < label_count; i++) {
+        if(!labels[i].visible) continue;
+        // printf("%f %d %f %f\n", labels[i].speed_kph, i, labels[i].screen_pos.x, labels[i].screen_pos.y);
+        DrawText(
+            TextFormat("%.0f km/h", labels[i].speed_kph),
+            (int)labels[i].screen_pos.x,
+            (int)labels[i].screen_pos.y,
+            48,
+            RED
+        );
     }
-    return rc;
+    EndDrawing();
 }
-
-// Make a high-quality GIF from numbered PNG frames like frame_000.png
-static int make_gif_from_frames(const char *pattern, int fps,
-                                const char *palette_path,
-                                const char *out_gif) {
-    char cmd[1024];
-
-    // 1) Generate palette (no quotes needed for simple filter)
-    //    NOTE: if your frames start at 000, you don't need -start_number.
-    snprintf(cmd, sizeof(cmd),
-             "ffmpeg -y -framerate %d -i %s -vf palettegen %s",
-             fps, pattern, palette_path);
-    if (run_cmd(cmd) != 0) return -1;
-
-    // 2) Use palette to encode the GIF
-    snprintf(cmd, sizeof(cmd),
-             "ffmpeg -y -framerate %d -i %s -i %s -lavfi paletteuse -loop 0 %s",
-             fps, pattern, palette_path, out_gif);
-    if (run_cmd(cmd) != 0) return -1;
-
-    return 0;
-}
-
 
 int eval_gif(const char* map_name, const char* policy_name, int show_grid, int obs_only, int lasers, int log_trajectories, int frame_skip, float goal_radius, int control_non_vehicles, int init_steps, int control_all_agents, int policy_agents_per_env, int deterministic_selection, const char* view_mode, const char* output_topdown, const char* output_agent, int num_maps, int scenario_length_override) {
 
@@ -237,6 +202,7 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
 
     Drive env = {
         .dynamics_model = conf.dynamics_model,
+        .reward_goal = 1,
         .reward_vehicle_collision = conf.reward_vehicle_collision,
         .reward_offroad_collision = conf.reward_offroad_collision,
         .reward_ade = conf.reward_ade,
@@ -249,9 +215,24 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         .policy_agents_per_env = conf.num_policy_controlled_agents,
         .deterministic_agent_selection = conf.deterministic_agent_selection
     };
-    env.scenario_length = (scenario_length_override > 0) ? scenario_length_override :
-                          (conf.scenario_length > 0) ? conf.scenario_length : TRAJECTORY_LENGTH_DEFAULT;
     allocate(&env);
+    
+    for (int i = 0; i < env.active_agent_count; i++) {
+        Entity* e = &env.entities[env.active_agent_indices[i]];
+        e->max_speed = 90/3.6f;
+        e->lane_center_reward_coefficient = 3.8e-4f;
+        e->comfort_reward_coefficient = 0.05f;
+        e->lane_align_reward_coefficient = 2.5e-4f;
+        e->collision_reward_coefficient = 1.0f;
+        e->offroad_reward_coefficient = 1.0f;
+        e->lane_center_bias = 0.0f;
+    }
+    
+    if (scenario_length_override != -1) {
+        env.scenario_length = scenario_length_override;
+    }
+
+    printf("scenario length is %d\n", env.scenario_length);
 
     // Set which vehicle to focus on for obs mode
     env.human_agent_idx = 0;
@@ -282,13 +263,12 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     DriveNet* net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
 
     int frame_count = env.scenario_length > 0 ? env.scenario_length : TRAJECTORY_LENGTH_DEFAULT;
-    int log_trajectory = log_trajectories;
-    char filename_topdown[256];
-    char filename_agent[256];
+    frame_count -= env.init_steps;
+    frame_count -= 1;
+    char filename_topdown[1024];
 
     if (output_topdown != NULL && output_agent != NULL) {
         strcpy(filename_topdown, output_topdown);
-        strcpy(filename_agent, output_agent);
     } else {
         char policy_base[256];
         strcpy(policy_base, policy_name);
@@ -299,66 +279,35 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         *strrchr(map, '.') = '\0';
 
         // Create video directory if it doesn't exist
-        char video_dir[256];
+        char video_dir[512];
         sprintf(video_dir, "%s/video", policy_base);
-        char mkdir_cmd[512];
+        char mkdir_cmd[1024];
         snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", video_dir);
         system(mkdir_cmd);
 
         sprintf(filename_topdown, "%s/video/%s_topdown.mp4", policy_base, map);
-        sprintf(filename_agent, "%s/video/%s_agent.mp4", policy_base, map);
     }
 
     bool render_topdown = (strcmp(view_mode, "both") == 0 || strcmp(view_mode, "topdown") == 0);
-    bool render_agent = (strcmp(view_mode, "both") == 0 || strcmp(view_mode, "agent") == 0);
-
-    printf("Rendering: %s\n", view_mode);
 
     int rendered_frames = 0;
     double startTime = GetTime();
 
-    VideoRecorder topdown_recorder, agent_recorder;
+    VideoRecorder topdown_recorder;
 
     if (render_topdown) {
         if (!OpenVideo(&topdown_recorder, filename_topdown, img_width, img_height)) {
             CloseWindow();
             return -1;
         }
-    }
 
-    if (render_agent) {
-        if (!OpenVideo(&agent_recorder, filename_agent, img_width, img_height)) {
-            if (render_topdown) CloseVideo(&topdown_recorder);
-            CloseWindow();
-            return -1;
-        }
-    }
-
-    if (render_topdown) {
         printf("Recording topdown view...\n");
-        for(int i = 0; i < frame_count; i++) {
+        for (int i = 0; i < frame_count; i++) {
             if (i % frame_skip == 0) {
                 renderTopDownView(&env, client, map_height, 0, 0, 0, frame_count, NULL, log_trajectories, show_grid);
                 WriteFrame(&topdown_recorder, img_width, img_height);
                 rendered_frames++;
             }
-            int (*actions)[2] = (int(*)[2])env.actions;
-            forward(net, env.observations, (int*)env.actions);
-            c_step(&env);
-        }
-
-    }
-
-    if (render_agent) {
-        c_reset(&env);
-        printf("Recording agent view...\n");
-        for(int i = 0; i < frame_count; i++) {
-            if (i % frame_skip == 0) {
-                renderAgentView(&env, client, map_height, obs_only, lasers, show_grid);
-                WriteFrame(&agent_recorder, img_width, img_height);
-                rendered_frames++;
-            }
-            int (*actions)[2] = (int(*)[2])env.actions;
             forward(net, env.observations, (int*)env.actions);
             c_step(&env);
         }
@@ -373,9 +322,6 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
 
     if (render_topdown) {
         CloseVideo(&topdown_recorder);
-    }
-    if (render_agent) {
-        CloseVideo(&agent_recorder);
     }
     CloseWindow();
 

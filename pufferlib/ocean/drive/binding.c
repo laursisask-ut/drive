@@ -184,13 +184,66 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->deterministic_agent_selection = unpack(kwargs, "deterministic_agent_selection");
     env->dt = conf.dt;
     env->control_non_vehicles = (int)unpack(kwargs, "control_non_vehicles");
-    int map_id = unpack(kwargs, "map_id");
+
     int max_agents = unpack(kwargs, "max_agents");
-    int init_steps = unpack(kwargs, "init_steps");
-    char map_file[100];
-    sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
     env->num_agents = max_agents;
-    env->map_name = strdup(map_file);
+
+    PyObject* dynamic = PyDict_GetItemString(kwargs, "dynamic_map_generator");
+    if (dynamic && !Py_IsNone(dynamic)) {
+        env->map_name = "(dynamically-generated)";
+        env->dynamic_map_generation = 1;
+
+        PyObject* map = PyObject_CallNoArgs(dynamic);
+        if (map == NULL) return 1;
+        PyObject* object_count = PyTuple_GetItem(map, 0);
+        if (object_count == NULL) {
+            PyErr_SetString(PyExc_TypeError, "object_count is not present");
+            return 1;
+        }
+        env->num_objects = PyLong_AsLong(object_count);
+        if (env->num_objects < 1) {
+            PyErr_SetString(PyExc_TypeError, "expected at least one object");
+            return 1;
+        }
+
+        PyObject* road_count = PyTuple_GetItem(map, 1);
+        if (road_count == NULL) {
+            PyErr_SetString(PyExc_TypeError, "road_count is not present");
+            return 1;
+        }
+        env->num_roads = PyLong_AsLong(road_count);
+        if (env->num_roads < 1) {
+            PyErr_SetString(PyExc_TypeError, "expected at least one road");
+            return 1;
+        }
+
+        env->num_entities = env->num_objects + env->num_roads;
+
+        PyObject* entity_ptr = PyTuple_GetItem(map, 2);
+        if (entity_ptr == NULL) {
+            PyErr_SetString(PyExc_TypeError, "entity_ptr is not present");
+            return 1;
+        }
+        env->entities = (Entity*)PyLong_AsVoidPtr(entity_ptr);
+        if (env->entities == NULL) {
+            PyErr_SetString(PyExc_TypeError, "entity pointer is null");
+            return 1;
+        }
+    } else {
+        env->dynamic_map_generation = 0;
+        int map_id = unpack(kwargs, "map_id");
+        char map_file[100];
+        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+        env->map_name = strdup(map_file);
+    }
+
+    PyObject* export_replay = PyDict_GetItemString(kwargs, "export_replay");
+    if (export_replay && Py_IsTrue(export_replay)) {
+        env->export_replay_enabled = 1;
+        env->replay_dir = unpack_str(kwargs, "replay_dir");
+    }
+
+    int init_steps = unpack(kwargs, "init_steps");
     env->init_steps = init_steps;
     env->timestep = init_steps;
     init(env);
@@ -214,5 +267,8 @@ static int my_log(PyObject* dict, Log* log) {
     // assign_to_dict(dict, "static_car_count", log->static_car_count);
     assign_to_dict(dict, "avg_offroad_per_agent", log->avg_offroad_per_agent);
     assign_to_dict(dict, "avg_collisions_per_agent", log->avg_collisions_per_agent);
+    assign_to_dict(dict, "close_to_lane", log->close_to_lane);
+    assign_to_dict(dict, "lane_heading_angle_diff", log->lane_heading_angle_diff);
+    assign_to_dict(dict, "lane_lateral_offset", log->lane_lateral_offset);
     return 0;
 }

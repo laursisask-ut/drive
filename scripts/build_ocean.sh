@@ -6,7 +6,7 @@ ENV=$1
 MODE=${2:-local}
 PLATFORM="$(uname -s)"
 
-if [ "$ENV" = "visualize" ]; then
+if [ "$ENV" = "visualize" ] || [ "$ENV" = "evaluate" ]; then
     SRC_DIR="pufferlib/ocean/drive"
 else
     SRC_DIR="pufferlib/ocean/$ENV"
@@ -92,6 +92,7 @@ FLAGS=(
     $LINK_ARCHIVES
     -lm
     -lpthread
+    -llz4
     $ERROR_LIMIT_FLAG
     -DPLATFORM_DESKTOP
 )

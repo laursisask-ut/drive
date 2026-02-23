@@ -1075,6 +1075,15 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         torch.cuda.set_device(local_rank)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
+    if args["neptune"]:
+        logger = NeptuneLogger(args)
+    elif args["wandb"]:
+        logger = WandbLogger(args)
+    else:
+        logger = NoLogger(args)
+
+    args["env"]["artifact_dir"] = os.path.join(args["train"]["data_dir"], logger.run_id)
+
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv, env_name)
 
@@ -1089,11 +1098,6 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
         model.forward_eval = policy.forward_eval
         policy = model.to(local_rank)
-
-    if args["neptune"]:
-        logger = NeptuneLogger(args)
-    elif args["wandb"]:
-        logger = WandbLogger(args)
 
     train_config = dict(**args["train"], env=env_name)
     pufferl = PuffeRL(train_config, vecenv, policy, logger)

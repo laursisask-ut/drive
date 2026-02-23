@@ -3,8 +3,11 @@ import gymnasium
 import json
 import struct
 import os
+import random
+import time
 import pufferlib
 from pufferlib.ocean.drive import binding
+from pufferlib.ocean.drive.mapgen import generate_map, agents_per_generated_map
 
 
 class Drive(pufferlib.PufferEnv):
@@ -28,6 +31,7 @@ class Drive(pufferlib.PufferEnv):
         num_agents=512,
         action_type="discrete",
         dynamics_model="classic",
+        dynamic_map_generation=True,
         control_all_agents=False,
         num_policy_controlled_agents=-1,
         deterministic_agent_selection=False,
@@ -36,6 +40,7 @@ class Drive(pufferlib.PufferEnv):
         buf=None,
         seed=1,
         init_steps=0,
+        artifact_dir=None,
     ):
         # env
         self.dt = dt
@@ -57,9 +62,9 @@ class Drive(pufferlib.PufferEnv):
 
         # Observation space calculation
         if dynamics_model == "classic":
-            ego_features = 7
+            ego_features = 19
         elif dynamics_model == "jerk":
-            ego_features = 10
+            ego_features = 22
         else:
             raise ValueError(f"dynamics_model must be 'classic' or 'jerk'. Got: {dynamics_model}")
 
@@ -72,6 +77,8 @@ class Drive(pufferlib.PufferEnv):
 
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
         self.init_steps = init_steps
+        self.artifact_dir = artifact_dir
+        self.start_time = time.monotonic()
 
         # Action space depends on both action_type and dynamics_model
         if action_type == "discrete":
@@ -104,21 +111,36 @@ class Drive(pufferlib.PufferEnv):
         self.control_all_agents = bool(control_all_agents)
         self.num_policy_controlled_agents = int(num_policy_controlled_agents)
         self.deterministic_agent_selection = bool(deterministic_agent_selection)
+        self.dynamic_map_generation = dynamic_map_generation
 
-        agent_offsets, map_ids, num_envs = binding.shared(
-            num_agents=num_agents,
-            num_maps=num_maps,
-            num_policy_controlled_agents=self.num_policy_controlled_agents,
-            control_all_agents=1 if self.control_all_agents else 0,
-            deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
-        )
+        if self.dynamic_map_generation:
+            assert num_agents % agents_per_generated_map == 0
+            num_envs = num_agents // agents_per_generated_map
+            map_ids = [0] * num_envs
+            agent_offsets = list(range(0, num_agents+agents_per_generated_map, agents_per_generated_map))
+        else:
+            agent_offsets, map_ids, num_envs = binding.shared(
+                num_agents=num_agents,
+                num_maps=num_maps,
+                num_policy_controlled_agents=self.num_policy_controlled_agents,
+                control_all_agents=1 if self.control_all_agents else 0,
+                deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+            )
         self.num_agents = num_agents
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
         super().__init__(buf=buf)
         env_ids = []
+        export_replay = artifact_dir is not None
+        if export_replay:
+            replays_dir = os.path.join(artifact_dir, "replays", "0")
         for i in range(num_envs):
+            if export_replay:
+                replay_dir = os.path.join(replays_dir, f"{os.getpid():05}-{i:02}")
+                os.makedirs(replay_dir, exist_ok=True)
+            else:
+                replay_dir = None
             cur = agent_offsets[i]
             nxt = agent_offsets[i + 1]
             env_id = binding.env_init(
@@ -142,10 +164,13 @@ class Drive(pufferlib.PufferEnv):
                 num_policy_controlled_agents=self.num_policy_controlled_agents,
                 deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
                 map_id=map_ids[i],
+                dynamic_map_generator=generate_map if self.dynamic_map_generation else None,
                 max_agents=nxt - cur,
                 ini_file="pufferlib/config/ocean/drive.ini",
                 control_non_vehicles=int(control_non_vehicles),
                 init_steps=init_steps,
+                export_replay=export_replay,
+                replay_dir=replay_dir,
             )
             env_ids.append(env_id)
 
@@ -172,16 +197,31 @@ class Drive(pufferlib.PufferEnv):
             will_resample = 1
             if will_resample:
                 binding.vec_close(self.c_envs)
-                agent_offsets, map_ids, num_envs = binding.shared(
-                    num_agents=self.num_agents,
-                    num_maps=self.num_maps,
-                    num_policy_controlled_agents=self.num_policy_controlled_agents,
-                    control_all_agents=1 if self.control_all_agents else 0,
-                    deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
-                )
+                if self.dynamic_map_generation:
+                    assert self.num_agents % agents_per_generated_map == 0
+                    num_envs = self.num_agents // agents_per_generated_map
+                    map_ids = [0] * num_envs
+                    agent_offsets = list(range(0, self.num_agents+agents_per_generated_map, agents_per_generated_map))
+                else:
+                    agent_offsets, map_ids, num_envs = binding.shared(
+                        num_agents=self.num_agents,
+                        num_maps=self.num_maps,
+                        num_policy_controlled_agents=self.num_policy_controlled_agents,
+                        control_all_agents=1 if self.control_all_agents else 0,
+                        deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                    )
                 env_ids = []
                 seed = np.random.randint(0, 2**32 - 1)
+                export_replay = [self.artifact_dir is not None and random.random() < 0.002 for _ in range(num_envs)]
+                if any(export_replay):
+                    wall_time = int(time.monotonic() - self.start_time)
+                    replays_dir = os.path.join(self.artifact_dir, "replays", str(wall_time))
                 for i in range(num_envs):
+                    if export_replay[i]:
+                        replay_dir = os.path.join(replays_dir, f"{os.getpid():05}-{i:02}")
+                        os.makedirs(replay_dir, exist_ok=True)
+                    else:
+                        replay_dir = None
                     cur = agent_offsets[i]
                     nxt = agent_offsets[i + 1]
                     env_id = binding.env_init(
@@ -205,10 +245,13 @@ class Drive(pufferlib.PufferEnv):
                         num_policy_controlled_agents=self.num_policy_controlled_agents,
                         deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
                         map_id=map_ids[i],
+                        dynamic_map_generator=generate_map if self.dynamic_map_generation else None,
                         max_agents=nxt - cur,
                         ini_file="pufferlib/config/ocean/drive.ini",
                         control_non_vehicles=int(self.control_non_vehicles),
                         init_steps=self.init_steps,
+                        export_replay=export_replay[i],
+                        replay_dir=replay_dir
                     )
                     env_ids.append(env_id)
                 self.c_envs = binding.vectorize(*env_ids)

@@ -6,12 +6,15 @@ from setuptools import find_packages, find_namespace_packages, setup, Extension
 import numpy
 import os
 import glob
+import json
 import urllib.request
 import zipfile
 import tarfile
 import platform
 import shutil
+import shlex
 import sys
+from pathlib import Path
 
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
@@ -109,6 +112,44 @@ def download_box2d(platform):
 if not NO_OCEAN:
     download_box2d("box2d-web")
 
+COMPILE_COMMANDS = []
+COMPILE_SOURCES = (".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh")
+
+
+def record_compile_command(cmd):
+    source = next((part for part in cmd if part.endswith(COMPILE_SOURCES)), None)
+    if source is None:
+        return
+
+    COMPILE_COMMANDS.append(
+        {
+            "directory": os.getcwd(),
+            "command": " ".join(shlex.quote(part) for part in cmd),
+            "file": os.path.abspath(source),
+        }
+    )
+
+
+def write_compile_commands(path):
+    if not COMPILE_COMMANDS:
+        print("No compile commands captured; skipping compile_commands.json")
+        return
+
+    entries = []
+    seen = set()
+    for entry in COMPILE_COMMANDS:
+        key = (entry["file"], entry["command"])
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(entry)
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(entries, handle, indent=2)
+    print(f"Wrote {len(entries)} commands to {output_path}")
+
 # Shared compile args for all platforms
 extra_compile_args = [
     "-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION",
@@ -200,8 +241,49 @@ if not NO_OCEAN:
 
 
 # Extensions
-class BuildExt(build_ext):
+class CompileCommandsMixin:
+    compile_commands_user_options = [
+        ("generate-compile-commands", None, "Generate compile_commands.json from the build"),
+        ("compile-commands-path=", None, "Output path for compile_commands.json (default: compile_commands.json)"),
+    ]
+    compile_commands_boolean_options = ["generate-compile-commands"]
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.generate_compile_commands = False
+        self.compile_commands_path = None
+
+    def finalize_options(self):
+        super().finalize_options()
+        if self.compile_commands_path is None:
+            self.compile_commands_path = os.path.abspath("compile_commands.json")
+
+    def _enable_compile_commands_capture(self):
+        if not getattr(self, "generate_compile_commands", False):
+            return
+
+        compiler = getattr(self, "compiler", None)
+        if compiler is None or getattr(compiler, "_compile_commands_wrapped", False):
+            return
+
+        original_spawn = compiler.spawn
+
+        def capture(cmd, **kwargs):
+            record_compile_command(cmd)
+            return original_spawn(cmd, **kwargs)
+
+        compiler.spawn = capture
+        compiler._compile_commands_wrapped = True
+
+
+class BuildExt(CompileCommandsMixin, build_ext):
+    user_options = build_ext.user_options + CompileCommandsMixin.compile_commands_user_options
+    boolean_options = build_ext.boolean_options + CompileCommandsMixin.compile_commands_boolean_options
+
     def run(self):
+        if self.generate_compile_commands:
+            COMPILE_COMMANDS.clear()
+
         # Propagate any build_ext options (e.g., --inplace, --force) to subcommands
         build_ext_opts = self.distribution.command_options.get("build_ext", {})
         if build_ext_opts:
@@ -213,17 +295,34 @@ class BuildExt(build_ext):
         self.run_command("build_torch")
         self.run_command("build_c")
 
+        if self.generate_compile_commands:
+            write_compile_commands(self.compile_commands_path)
 
-class CBuildExt(build_ext):
+
+class CBuildExt(CompileCommandsMixin, build_ext):
+    user_options = build_ext.user_options + CompileCommandsMixin.compile_commands_user_options
+    boolean_options = build_ext.boolean_options + CompileCommandsMixin.compile_commands_boolean_options
+
     def run(self, *args, **kwargs):
         self.extensions = [e for e in self.extensions if e.name != "pufferlib._C"]
         super().run(*args, **kwargs)
 
+    def build_extensions(self):
+        self._enable_compile_commands_capture()
+        super().build_extensions()
 
-class TorchBuildExt(cpp_extension.BuildExtension):
+
+class TorchBuildExt(CompileCommandsMixin, cpp_extension.BuildExtension):
+    user_options = cpp_extension.BuildExtension.user_options + CompileCommandsMixin.compile_commands_user_options
+    boolean_options = cpp_extension.BuildExtension.boolean_options + CompileCommandsMixin.compile_commands_boolean_options
+
     def run(self):
         self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
         super().run()
+
+    def build_extensions(self):
+        self._enable_compile_commands_capture()
+        super().build_extensions()
 
 
 RAYLIB_A = f"{RAYLIB_NAME}/lib/libraylib.a"
@@ -233,6 +332,7 @@ extension_kwargs = dict(
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
     extra_objects=[RAYLIB_A],
+    libraries=["lz4"],
 )
 
 # Find C extensions
@@ -312,6 +412,8 @@ install_requires = [
     "gym==0.23",
     "gymnasium==0.29.1",
     "pettingzoo==1.24.1",
+    "lanelet2==1.2.2",
+    "matplotlib",
 ]
 
 if not NO_TRAIN:
