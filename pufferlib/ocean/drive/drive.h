@@ -2105,7 +2105,7 @@ void compute_observations(Drive* env) {
             obs[6] = fminf(ego_entity->max_speed / MAX_SPEED, 1.0f);
         }
 
-        obs[7] = ego_entity->lane_center_reward_coefficient / 2.5e-4f;
+        obs[7] = ego_entity->lane_center_reward_coefficient / 7.5e-4f;
         obs[8] = ego_entity->comfort_reward_coefficient / 0.1f;
         obs[9] = ego_entity->lane_align_reward_coefficient / 2.5e-2f;
         obs[10] = ego_entity->collision_reward_coefficient;
@@ -2390,7 +2390,7 @@ int subsample_scenario() {
 }
 
 void c_reset(Drive* env){
-    if (env->export_replay_enabled) {
+    if (env->export_replay_enabled && env->export_log.traj_x == NULL) {
         env->export_log.traj_x = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
         env->export_log.traj_y = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
         env->export_log.traj_z = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));

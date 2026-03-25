@@ -20,7 +20,7 @@ from ctypes import (
 
 from lanelet2.io import Origin, load
 from lanelet2.projection import UtmProjector
-from lanelet2.core import LaneletMap, LineString3d, Point3d, BasicPoint2d, BoundingBox2d, GPSPoint
+from lanelet2.core import LaneletMap, LineString3d, Point3d, BasicPoint2d, BasicPoint3d, BoundingBox2d, GPSPoint
 from lanelet2.geometry import length, fromArcCoordinates, ArcCoordinates, to2D, interpolatedPointAtDistance, findWithin2d, toArcCoordinates, distance
 from lanelet2.routing import RoutingGraph
 import lanelet2.traffic_rules
@@ -100,51 +100,10 @@ class Entity(Structure):
         ("wheelbase", c_float),
     ]
 
-def load_road_area_map(path):
-    with open(path, "r") as geojson_file:
-        data = json.load(geojson_file)
-
-    if data.get("type") == "FeatureCollection":
-        features = data.get("features") or []
-        if not features:
-            return []
-        geometry = features[0].get("geometry") or {}
-    elif data.get("type") == "Feature":
-        geometry = data.get("geometry") or {}
-    else:
-        geometry = data
-
-    if geometry.get("type") != "MultiPolygon":
-        raise ValueError("Road area GeoJSON must contain a MultiPolygon geometry.")
-    
-    road_area_map = LaneletMap()
-
-    idx = 1
-    for polygon in geometry.get("coordinates", []):
-        for ring in polygon:
-            ring_points = []
-            d = 0
-            for point in ring:
-                if d > 500:
-                    road_area_map.add(LineString3d(points=ring_points))
-                    ring_points = ring_points[-1:]
-                    d = 0
-
-                ring_points.append(Point3d(idx, point[0], point[1], 0.0))
-                if len(ring_points) >= 2:
-                    d += distance(ring_points[-1], ring_points[-2])
-                idx += 1
-
-            if ring_points:
-                road_area_map.add(LineString3d(points=ring_points))
-
-    return road_area_map
-
-road_area_map = load_road_area_map("road_area_local_coords.geojson")
 utm_origin_lat = 58.385345
 utm_origin_lon = 26.726272
 projector = UtmProjector(Origin(utm_origin_lat, utm_origin_lon), True, False)
-lanelet2_map = load("tartu_large.osm", projector)
+lanelet2_map = load("tartu_large_processed.osm", projector)
 map_points = list(lanelet2_map.pointLayer)
 
 VEHICLE_PROFILES = [
@@ -170,6 +129,28 @@ stationary_object_weights = [w for w, _, _ in STATIONARY_OBJECT_PROFILES]
 traffic_rules = lanelet2.traffic_rules.create(lanelet2.traffic_rules.Locations.Germany, lanelet2.traffic_rules.Participants.VehicleTaxi)
 
 routing_graph = RoutingGraph(lanelet2_map, traffic_rules)
+
+def iter_linestring_points_with_spacing(linestring):
+    max_linestring_point_spacing = 25.0
+
+    if not linestring:
+        return
+
+    prev = linestring[0].basicPoint()
+    yield prev
+
+    for i in range(1, len(linestring)):
+        point = linestring[i].basicPoint()
+        segment_length = distance(prev, point)
+
+        if segment_length > max_linestring_point_spacing:
+            num_segments = math.ceil(segment_length / max_linestring_point_spacing)
+            for segment_idx in range(1, num_segments):
+                frac = segment_idx / num_segments
+                yield prev + (point - prev) * frac
+
+        yield point
+        prev = point
 
 
 def linear_interpolate(p1, p2, speed, sample_rate=0.1):
@@ -285,9 +266,10 @@ def get_pedestrian_crossing_route(lanelet):
         walked_lanelets.append(following_lanelets[0])
         end_pos = BasicPoint2d(following_lanelets[0].centerline[-1].x, following_lanelets[0].centerline[-1].y)
 
-    origins = findWithin2d(road_area_map.lineStringLayer, start_pos, 3.0)
+    origins = findWithin2d(lanelet2_map.lineStringLayer, start_pos, 3.0)
+    origins = [origin for _, origin in origins if origin.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
     if origins:
-        origin_road_edge = to2D(origins[0][1])
+        origin_road_edge = to2D(origins[0])
         connector = toArcCoordinates(origin_road_edge, start_pos)
 
         origin_option1 = sample_points_along_line(origin_road_edge, max(connector.length - 20, 0), connector.length, speed=1.4)
@@ -298,9 +280,11 @@ def get_pedestrian_crossing_route(lanelet):
     else:
         origin_choices = [[start_pos]]
 
-    destinations = findWithin2d(road_area_map.lineStringLayer, end_pos, 3.0)
+    destinations = findWithin2d(lanelet2_map.lineStringLayer, end_pos, 3.0)
+    destinations = [dest for _, dest in destinations if dest.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
+
     if destinations:
-        dest_road_edge = to2D(destinations[0][1])
+        dest_road_edge = to2D(destinations[0])
         connector = toArcCoordinates(dest_road_edge, end_pos)
 
         dest_option1 = sample_points_along_line(dest_road_edge, connector.length, connector.length + 20, speed=1.4)
@@ -441,10 +425,10 @@ def generate_map():
         # If another vehicle is too close, make up to 5 
         # attempts to choose another spawn position
         vehicle_length = vehicle_samples[i][2][1]
-        for _ in range(5):
+        for _ in range(10):
             any_vehicle_near = False
             for other_offset, other_length in used_spawn_positions[lanelet]:
-                if abs(s-other_offset) < (vehicle_length+other_length)/2:
+                if abs(s-other_offset) < (vehicle_length+other_length)/2 + 5:
                     any_vehicle_near = True
                     break
             if any_vehicle_near:
@@ -472,6 +456,7 @@ def generate_map():
             initial_speed_fraction = 0
         else:
             initial_speed_fraction = random.uniform(0.2, 1.0)
+        initial_speed = speed_limit*initial_speed_fraction/3.6
 
         current_lanelet = lanelet
         current_lanelet_offset = s
@@ -520,8 +505,8 @@ def generate_map():
         used_spawn_positions[lanelet].append((s, vehicle_length))
         spawn_positions.append(spawn_pos)
         spawn_headings.append(heading)
-        spawn_vy.append(math.sin(heading)*speed_limit*initial_speed_fraction/3.6)
-        spawn_vx.append(math.cos(heading)*speed_limit*initial_speed_fraction/3.6)
+        spawn_vy.append(math.sin(heading)*initial_speed)
+        spawn_vx.append(math.cos(heading)*initial_speed)
         goal_positions.append(agent_goal_positions)
         i += 1
 
@@ -544,7 +529,7 @@ def generate_map():
         x = []
         y = []
         z = []
-        for p in linestring:
+        for p in iter_linestring_points_with_spacing(linestring):
             if p.x < render_box.min.x or p.y < render_box.min.y or p.x > render_box.max.x or p.y > render_box.max.y:
                 if x:
                     roads.append((entity_type, x, y, z))
@@ -581,8 +566,9 @@ def generate_map():
         if reg_el.attributes["subtype"] == "traffic_light":
             add_linestring_segments_in_box(11, reg_el.parameters["ref_line"][0])
 
-    for linestring in road_area_map.lineStringLayer.search(render_box):
-        add_linestring_segments_in_box(6, linestring)
+    for linestring in lanelet2_map.lineStringLayer.search(render_box):
+        if linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
+            add_linestring_segments_in_box(6, linestring)
 
     num_objects = num_agents + num_stationary_objects + num_walking_pedestrians
     assert num_objects <= 64
@@ -644,7 +630,7 @@ def generate_map():
             for _ in range(5):
                 any_vehicle_near = False
                 for other_offset, other_length in used_spawn_positions[lanelet]:
-                    if abs(s-other_offset) < (vehicle_length+other_length)/2:
+                    if abs(s-other_offset) < (vehicle_length+other_length)/2 + 5:
                         any_vehicle_near = True
                         break
                 if any_vehicle_near:
