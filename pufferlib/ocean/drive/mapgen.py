@@ -267,7 +267,7 @@ def get_pedestrian_crossing_route(lanelet):
         end_pos = BasicPoint2d(following_lanelets[0].centerline[-1].x, following_lanelets[0].centerline[-1].y)
 
     origins = findWithin2d(lanelet2_map.lineStringLayer, start_pos, 3.0)
-    origins = [origin for _, origin in origins if origin.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
+    origins = [origin for _, origin in origins if "type" in origin.attributes and origin.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
     if origins:
         origin_road_edge = to2D(origins[0])
         connector = toArcCoordinates(origin_road_edge, start_pos)
@@ -281,7 +281,7 @@ def get_pedestrian_crossing_route(lanelet):
         origin_choices = [[start_pos]]
 
     destinations = findWithin2d(lanelet2_map.lineStringLayer, end_pos, 3.0)
-    destinations = [dest for _, dest in destinations if dest.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
+    destinations = [dest for _, dest in destinations if "type" in dest.attributes and dest.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
 
     if destinations:
         dest_road_edge = to2D(destinations[0])
@@ -567,7 +567,7 @@ def generate_map():
             add_linestring_segments_in_box(11, reg_el.parameters["ref_line"][0])
 
     for linestring in lanelet2_map.lineStringLayer.search(render_box):
-        if linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
+        if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
             add_linestring_segments_in_box(6, linestring)
 
     num_objects = num_agents + num_stationary_objects + num_walking_pedestrians

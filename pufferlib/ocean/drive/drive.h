@@ -76,6 +76,19 @@
 #define MAX_ROAD_SEGMENT_LENGTH 100.0f
 
 #define MAX_EXPORT_STEPS 1000
+#define REPLAY_ACTION_COMPONENT_COUNT 2
+#define REPLAY_ACTION_ACCELERATION_IDX 0
+#define REPLAY_ACTION_STEERING_IDX 1
+
+#define REWARD_COMPONENT_GOAL 0
+#define REWARD_COMPONENT_LANE_CENTER 1
+#define REWARD_COMPONENT_COMFORT 2
+#define REWARD_COMPONENT_LANE_ALIGNMENT 3
+#define REWARD_COMPONENT_COLLISION 4
+#define REWARD_COMPONENT_OFFROAD 5
+#define REPLAY_REWARD_COMPONENT_COUNT 6
+#define REWARD_COMPONENT_VELOCITY 6
+#define REWARD_COMPONENT_ADE 7
 
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
@@ -111,6 +124,14 @@ typedef struct ReplayExportLog ReplayExportLog;
 
 struct Log {
     float episode_return;
+    float goal_reward;
+    float lane_center_reward;
+    float comfort_reward;
+    float lane_alignment_reward;
+    float collision_reward;
+    float offroad_reward;
+    float velocity_reward;
+    float ade_reward;
     float episode_length;
     float score;
     float offroad_rate;
@@ -295,6 +316,8 @@ struct ReplayExportLog {
     float* traj_vz;
     float* heading;
     float* observations;
+    float* reward_components;
+    int* action_indices;
 };
 
 struct Drive {
@@ -450,12 +473,84 @@ void add_log(Drive* env) {
         env->log.close_to_lane += env->logs[i].close_to_lane;
         env->log.episode_length += env->logs[i].episode_length;
         env->log.episode_return += env->logs[i].episode_return;
+        env->log.goal_reward += env->logs[i].goal_reward;
+        env->log.lane_center_reward += env->logs[i].lane_center_reward;
+        env->log.comfort_reward += env->logs[i].comfort_reward;
+        env->log.lane_alignment_reward += env->logs[i].lane_alignment_reward;
+        env->log.collision_reward += env->logs[i].collision_reward;
+        env->log.offroad_reward += env->logs[i].offroad_reward;
+        env->log.velocity_reward += env->logs[i].velocity_reward;
+        env->log.ade_reward += env->logs[i].ade_reward;
         // Log composition counts per agent so vec_log averaging recovers the per-env value
         env->log.active_agent_count += env->active_agent_count;
         env->log.expert_static_car_count += env->expert_static_car_count;
         env->log.static_car_count += env->static_car_count;
         env->log.n += 1;
     }
+}
+
+static inline void accumulate_reward_component(Log* log, int component, float reward) {
+    switch (component) {
+    case REWARD_COMPONENT_GOAL:
+        log->goal_reward += reward;
+        break;
+    case REWARD_COMPONENT_LANE_CENTER:
+        log->lane_center_reward += reward;
+        break;
+    case REWARD_COMPONENT_COMFORT:
+        log->comfort_reward += reward;
+        break;
+    case REWARD_COMPONENT_LANE_ALIGNMENT:
+        log->lane_alignment_reward += reward;
+        break;
+    case REWARD_COMPONENT_COLLISION:
+        log->collision_reward += reward;
+        break;
+    case REWARD_COMPONENT_OFFROAD:
+        log->offroad_reward += reward;
+        break;
+    case REWARD_COMPONENT_VELOCITY:
+        log->velocity_reward += reward;
+        break;
+    case REWARD_COMPONENT_ADE:
+        log->ade_reward += reward;
+        break;
+    default:
+        break;
+    }
+}
+
+static inline void record_reward_component(Drive* env, int agent_slot, int component, float reward) {
+    if (reward == 0.0f) {
+        return;
+    }
+
+    env->logs[agent_slot].episode_return += reward;
+    accumulate_reward_component(&env->logs[agent_slot], component, reward);
+
+    if (env->export_replay_enabled &&
+        env->export_log.reward_components != NULL &&
+        env->timestep < MAX_EXPORT_STEPS &&
+        component < REPLAY_REWARD_COMPONENT_COUNT) {
+        size_t export_idx =
+            ((size_t)agent_slot * MAX_EXPORT_STEPS + (size_t)env->timestep) * REPLAY_REWARD_COMPONENT_COUNT +
+            (size_t)component;
+        env->export_log.reward_components[export_idx] += reward;
+    }
+}
+
+static inline void record_discrete_classic_action(
+    Drive* env, int agent_slot, int acceleration_index, int steering_index) {
+    if (!env->export_replay_enabled ||
+        env->export_log.action_indices == NULL ||
+        env->timestep >= MAX_EXPORT_STEPS) {
+        return;
+    }
+
+    size_t export_idx =
+        ((size_t)agent_slot * MAX_EXPORT_STEPS + (size_t)env->timestep) * REPLAY_ACTION_COMPONENT_COUNT;
+    env->export_log.action_indices[export_idx + REPLAY_ACTION_ACCELERATION_IDX] = acceleration_index;
+    env->export_log.action_indices[export_idx + REPLAY_ACTION_STEERING_IDX] = steering_index;
 }
 
 
@@ -1705,6 +1800,10 @@ static void saveAgentObservationsReplayToFile(Drive* env) {
     int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
 
     float (*obs)[MAX_EXPORT_STEPS][max_obs] = (float(*)[MAX_EXPORT_STEPS][max_obs]) env->export_log.observations;
+    float (*reward_components)[MAX_EXPORT_STEPS][REPLAY_REWARD_COMPONENT_COUNT] =
+        (float(*)[MAX_EXPORT_STEPS][REPLAY_REWARD_COMPONENT_COUNT]) env->export_log.reward_components;
+    int (*action_indices)[MAX_EXPORT_STEPS][REPLAY_ACTION_COMPONENT_COUNT] =
+        (int(*)[MAX_EXPORT_STEPS][REPLAY_ACTION_COMPONENT_COUNT]) env->export_log.action_indices;
     int exported_steps = fmin(env->timestep+1, MAX_EXPORT_STEPS);
     size_t obs_count = (size_t)exported_steps * (size_t)max_obs;
     size_t uncompressed_bytes = obs_count * sizeof(float);
@@ -1719,9 +1818,29 @@ static void saveAgentObservationsReplayToFile(Drive* env) {
         return;
     }
 
+    size_t reward_count = (size_t)exported_steps * REPLAY_REWARD_COMPONENT_COUNT;
+    size_t reward_uncompressed_bytes = reward_count * sizeof(float);
+    if (reward_uncompressed_bytes > INT_MAX) {
+        fprintf(stderr, "reward buffer too large to compress\n");
+        return;
+    }
+    int reward_src_size = (int)reward_uncompressed_bytes;
+    int reward_max_compressed = LZ4_compressBound(reward_src_size);
+    if (reward_max_compressed <= 0) {
+        fprintf(stderr, "failed to compute reward compression bound\n");
+        return;
+    }
+
     char* compressed = (char*)malloc((size_t)max_compressed);
     if (compressed == NULL) {
         fprintf(stderr, "failed to allocate compression buffer\n");
+        return;
+    }
+
+    char* reward_compressed = (char*)malloc((size_t)reward_max_compressed);
+    if (reward_compressed == NULL) {
+        fprintf(stderr, "failed to allocate reward compression buffer\n");
+        free(compressed);
         return;
     }
 
@@ -1733,6 +1852,7 @@ static void saveAgentObservationsReplayToFile(Drive* env) {
         if (file == NULL) {
             fprintf(stderr, "failed to open replay file for writing\n");
             free(compressed);
+            free(reward_compressed);
             return;
         }
 
@@ -1742,22 +1862,46 @@ static void saveAgentObservationsReplayToFile(Drive* env) {
             fprintf(stderr, "failed to compress agent obs\n");
             fclose(file);
             free(compressed);
+            free(reward_compressed);
             return;
         }
 
-        // File format: max_obs (int), exported_steps (int), compressed_size (int), LZ4 data
+        const char* reward_src = (const char*)&reward_components[i][0][0];
+        int reward_compressed_size = LZ4_compress_default(
+            reward_src, reward_compressed, reward_src_size, reward_max_compressed);
+        if (reward_compressed_size <= 0) {
+            fprintf(stderr, "failed to compress agent rewards\n");
+            fclose(file);
+            free(compressed);
+            free(reward_compressed);
+            return;
+        }
+
+        // File format:
+        //   max_obs (int), exported_steps (int), compressed_size (int), obs LZ4 data,
+        //   reward_component_count (int), reward_compressed_size (int), reward LZ4 data,
+        //   action_component_count (int), action index data
         if (fwrite(&max_obs, sizeof(int), 1, file) != 1 ||
             fwrite(&exported_steps, sizeof(int), 1, file) != 1 ||
             fwrite(&compressed_size, sizeof(int), 1, file) != 1 ||
-            fwrite(compressed, 1, (size_t)compressed_size, file) != (size_t)compressed_size) {
+            fwrite(compressed, 1, (size_t)compressed_size, file) != (size_t)compressed_size ||
+            fwrite(&(int){REPLAY_REWARD_COMPONENT_COUNT}, sizeof(int), 1, file) != 1 ||
+            fwrite(&reward_compressed_size, sizeof(int), 1, file) != 1 ||
+            fwrite(reward_compressed, 1, (size_t)reward_compressed_size, file) != (size_t)reward_compressed_size ||
+            fwrite(&(int){REPLAY_ACTION_COMPONENT_COUNT}, sizeof(int), 1, file) != 1 ||
+            fwrite(&action_indices[i][0][0], sizeof(int),
+                (size_t)exported_steps * REPLAY_ACTION_COMPONENT_COUNT, file) !=
+                (size_t)exported_steps * REPLAY_ACTION_COMPONENT_COUNT) {
             fprintf(stderr, "failed to write compressed replay file\n");
             fclose(file);
             free(compressed);
+            free(reward_compressed);
             return;
         }
         fclose(file);
     }
     free(compressed);
+    free(reward_compressed);
 };
 
 static void saveReplayToFile(Drive* env) {
@@ -1857,6 +2001,8 @@ void c_close(Drive* env){
     free(env->export_log.traj_vz);
     free(env->export_log.heading);
     free(env->export_log.observations);
+    free(env->export_log.reward_components);
+    free(env->export_log.action_indices);
     free(env->replay_dir);
 }
 
@@ -1923,6 +2069,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
             int acceleration_index = action_array[action_idx][0];
             int steering_index = action_array[action_idx][1];
 
+            record_discrete_classic_action(env, action_idx, acceleration_index, steering_index);
             acceleration = ACCELERATION_VALUES[acceleration_index];
             steering = STEERING_VALUES[steering_index];
         }
@@ -1969,7 +2116,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 
         float comfort_reward = -agent->comfort_reward_coefficient * ((fabsf(acceleration) > 3.0f) + (fabsf(a_lat) > 3.0f));
         env->rewards[action_idx] += comfort_reward;
-        env->logs[action_idx].episode_return += comfort_reward;
+        record_reward_component(env, action_idx, REWARD_COMPONENT_COMFORT, comfort_reward);
     } else {
         // JERK dynamics model
         // Extract action components
@@ -2402,6 +2549,22 @@ void c_reset(Drive* env){
         int ego_dim = (env->dynamics_model == JERK) ? 22 : 19;
         int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
         env->export_log.observations = calloc(env->active_agent_count * max_obs * MAX_EXPORT_STEPS, sizeof(float));
+        env->export_log.reward_components =
+            calloc(env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_REWARD_COMPONENT_COUNT, sizeof(float));
+        env->export_log.action_indices =
+            malloc(env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_ACTION_COMPONENT_COUNT * sizeof(int));
+    }
+    if (env->export_replay_enabled && env->export_log.reward_components != NULL) {
+        memset(
+            env->export_log.reward_components,
+            0,
+            env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_REWARD_COMPONENT_COUNT * sizeof(float));
+    }
+    if (env->export_replay_enabled && env->export_log.action_indices != NULL) {
+        size_t action_count = (size_t)env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_ACTION_COMPONENT_COUNT;
+        for (size_t i = 0; i < action_count; i++) {
+            env->export_log.action_indices[i] = -1;
+        }
     }
     if (subsample_scenario() && env->scenario_length > 91) {
         env->init_steps = time(NULL) % (env->scenario_length - 91);
@@ -2506,14 +2669,15 @@ void c_step(Drive* env){
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float collision_reward = -e->collision_reward_coefficient - 0.1 * speed;
                 env->rewards[i] = collision_reward;
-                env->logs[i].episode_return += collision_reward;
+                record_reward_component(env, i, REWARD_COMPONENT_COLLISION, collision_reward);
                 env->logs[i].collision_rate = 1.0f;
                 env->logs[i].avg_collisions_per_agent += 1.0f;
             }
             else if(collision_state == OFFROAD){
-                env->rewards[i] = -e->offroad_reward_coefficient;
+                float offroad_reward = -e->offroad_reward_coefficient;
+                env->rewards[i] = offroad_reward;
                 env->logs[i].offroad_rate = 1.0f;
-                env->logs[i].episode_return += -e->offroad_reward_coefficient;
+                record_reward_component(env, i, REWARD_COMPONENT_OFFROAD, offroad_reward);
                 env->logs[i].avg_offroad_per_agent += 1.0f;
             }
             if(!env->entities[agent_idx].reached_goal_this_episode){
@@ -2530,7 +2694,7 @@ void c_step(Drive* env){
         if (lateral_offset >= 0.0f && lane_heading_angle_diff < M_PI/3.0f) {
             float lane_center_reward = e->lane_center_reward_coefficient * (-fabsf(e->lane_center_bias - lateral_offset) + 0.05f / expf(fabsf(lateral_offset - e->lane_center_bias) - 0.5f));
             env->rewards[i] += lane_center_reward;
-            env->logs[i].episode_return += lane_center_reward;
+            record_reward_component(env, i, REWARD_COMPONENT_LANE_CENTER, lane_center_reward);
         }
 
         if (lateral_offset >= 0.0f) {
@@ -2540,13 +2704,13 @@ void c_step(Drive* env){
 
             float lane_align_reward = e->lane_align_reward_coefficient * (fminf(cosf(lane_heading_angle_diff), 0.0f) + 0.0025f * (1 - lane_heading_angle_diff / M_PI * 2.0f));
             env->rewards[i] += lane_align_reward;
-            env->logs[i].episode_return += lane_align_reward;
+            record_reward_component(env, i, REWARD_COMPONENT_LANE_ALIGNMENT, lane_align_reward);
 
             float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
             if (speed > 2.5f) {
                 float velocity_reward = 2.5e-4f * fmax(cosf(lane_heading_angle_diff), 0.0f);
                 env->rewards[i] += velocity_reward;
-                env->logs[i].episode_return += velocity_reward;
+                record_reward_component(env, i, REWARD_COMPONENT_VELOCITY, velocity_reward);
             }
         }
 
@@ -2560,7 +2724,7 @@ void c_step(Drive* env){
         if (!env->entities[agent_idx].reached_final_goal && distance_to_goal < env->entities[agent_idx].goal_radius) {
             if (short_term_goals()) {
                 env->rewards[i] += env->reward_goal;
-                env->logs[i].episode_return += env->reward_goal;
+                record_reward_component(env, i, REWARD_COMPONENT_GOAL, env->reward_goal);
                 env->logs[i].num_goals_reached += 1;
                 env->entities[agent_idx].reached_goal_this_episode = 1;
                 env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
@@ -2576,7 +2740,7 @@ void c_step(Drive* env){
                 }
             } else if (env->entities[agent_idx].multi_goal_count > 0) {
                 env->rewards[i] += env->reward_goal;
-                env->logs[i].episode_return += env->reward_goal;
+                record_reward_component(env, i, REWARD_COMPONENT_GOAL, env->reward_goal);
                 env->entities[agent_idx].sampled_new_goal = 1;
                 env->logs[i].num_goals_reached += 1;
                 env->entities[agent_idx].reached_goal_this_episode = 1;
@@ -2592,7 +2756,7 @@ void c_step(Drive* env){
                 }
             } else {
                 env->rewards[i] += env->reward_goal;
-                env->logs[i].episode_return += env->reward_goal;
+                record_reward_component(env, i, REWARD_COMPONENT_GOAL, env->reward_goal);
                 env->entities[agent_idx].sampled_new_goal = 1;
                 env->logs[i].num_goals_reached += 1;
                 env->entities[agent_idx].reached_goal_this_episode = 1;
@@ -2611,7 +2775,7 @@ void c_step(Drive* env){
         if(current_ade > 0.0f && env->reward_ade != 0.0f) {
             float ade_reward = env->reward_ade * current_ade;
             env->rewards[i] += ade_reward;
-            env->logs[i].episode_return += ade_reward;
+            record_reward_component(env, i, REWARD_COMPONENT_ADE, ade_reward);
         }
         env->logs[i].avg_displacement_error = current_ade;
     }

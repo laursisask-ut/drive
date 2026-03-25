@@ -15,6 +15,27 @@
 #include <rlgl.h>
 #include <lz4.h>
 
+#define DISPLAY_REWARD_COMPONENT_COUNT 6
+#define DISPLAY_ACTION_COMPONENT_COUNT 2
+
+static const char *DISPLAY_REWARD_LABELS[DISPLAY_REWARD_COMPONENT_COUNT] = {
+    "Goal",
+    "Lane center",
+    "Comfort",
+    "Lane alignment",
+    "Collision",
+    "Offroad",
+};
+
+static const float DISPLAY_ACCELERATION_VALUES[7] = {
+    -4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f,
+};
+
+static const float DISPLAY_STEERING_VALUES[13] = {
+    -1.000f, -0.833f, -0.667f, -0.500f, -0.333f, -0.167f, 0.000f,
+    0.167f, 0.333f, 0.500f, 0.667f, 0.833f, 1.000f,
+};
+
 static int write_all(int fd, const unsigned char *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -96,8 +117,15 @@ int main(int argc, char *argv[]) {
     int max_obs = 0;
     int exported_steps = 0;
     int compressed_size = 0;
+    int reward_component_count = 0;
+    int reward_compressed_size = 0;
+    int action_component_count = 0;
     char* compressed = NULL;
     float* obs_buf = NULL;
+    char* reward_compressed = NULL;
+    float* reward_values = NULL;
+    float* reward_cumulative = NULL;
+    int* action_values = NULL;
 
     if (fread(&max_obs, sizeof(max_obs), 1, file) != 1) {
         fprintf(stderr, "failed to read max_obs\n");
@@ -148,11 +176,11 @@ int main(int argc, char *argv[]) {
         free(compressed);
         return 1;
     }
-    fclose(file);
 
     obs_buf = (float*)malloc(uncompressed_bytes);
     if (obs_buf == NULL) {
         fprintf(stderr, "failed to allocate obs buffer\n");
+        fclose(file);
         free(compressed);
         return 1;
     }
@@ -163,21 +191,195 @@ int main(int argc, char *argv[]) {
     free(compressed);
     if (decoded != (int)uncompressed_bytes) {
         fprintf(stderr, "failed to decompress obs data\n");
+        fclose(file);
         free(obs_buf);
         return 1;
     }
 
+    size_t total_display_rewards = (size_t)exported_steps * DISPLAY_REWARD_COMPONENT_COUNT;
+    reward_values = (float*)malloc(total_display_rewards * sizeof(float));
+    reward_cumulative = (float*)calloc(total_display_rewards, sizeof(float));
+    if (reward_values == NULL || reward_cumulative == NULL) {
+        fprintf(stderr, "failed to allocate reward buffers\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    if (fread(&reward_component_count, sizeof(reward_component_count), 1, file) != 1) {
+        fprintf(stderr, "failed to read reward_component_count\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    if (reward_component_count != DISPLAY_REWARD_COMPONENT_COUNT) {
+        fprintf(stderr, "unexpected reward_component_count=%d\n", reward_component_count);
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    if (fread(&reward_compressed_size, sizeof(reward_compressed_size), 1, file) != 1) {
+        fprintf(stderr, "failed to read reward_compressed_size\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+    if (reward_compressed_size <= 0) {
+        fprintf(stderr, "invalid reward_compressed_size=%d\n", reward_compressed_size);
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    size_t reward_uncompressed_bytes = total_display_rewards * sizeof(float);
+    if (reward_uncompressed_bytes > INT_MAX) {
+        fprintf(stderr, "reward buffer too large for LZ4\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    reward_compressed = (char*)malloc((size_t)reward_compressed_size);
+    if (reward_compressed == NULL) {
+        fprintf(stderr, "failed to allocate compressed reward buffer\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+    if (fread(reward_compressed, 1, (size_t)reward_compressed_size, file) != (size_t)reward_compressed_size) {
+        fprintf(stderr, "failed to read compressed reward data\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_compressed);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    int decoded_rewards = LZ4_decompress_safe(
+        reward_compressed,
+        (char*)reward_values,
+        reward_compressed_size,
+        (int)reward_uncompressed_bytes);
+    free(reward_compressed);
+    reward_compressed = NULL;
+    if (decoded_rewards != (int)reward_uncompressed_bytes) {
+        fprintf(stderr, "failed to decompress reward data\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    if (fread(&action_component_count, sizeof(action_component_count), 1, file) != 1) {
+        fprintf(stderr, "failed to read action_component_count\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    if (action_component_count != DISPLAY_ACTION_COMPONENT_COUNT) {
+        fprintf(stderr, "unexpected action_component_count=%d\n", action_component_count);
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    size_t total_actions = (size_t)exported_steps * DISPLAY_ACTION_COMPONENT_COUNT;
+    if (total_actions > (SIZE_MAX / sizeof(int))) {
+        fprintf(stderr, "action buffer too large\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    action_values = (int*)malloc(total_actions * sizeof(int));
+    if (action_values == NULL) {
+        fprintf(stderr, "failed to allocate action buffer\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        return 1;
+    }
+
+    if (fread(action_values, sizeof(int), total_actions, file) != total_actions) {
+        fprintf(stderr, "failed to read action data\n");
+        fclose(file);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        free(action_values);
+        return 1;
+    }
+
+    fclose(file);
+
+    for (int t = 0; t < exported_steps; t++) {
+        for (int reward_idx = 0; reward_idx < DISPLAY_REWARD_COMPONENT_COUNT; reward_idx++) {
+            float previous = (t > 0)
+                ? reward_cumulative[(t - 1) * DISPLAY_REWARD_COMPONENT_COUNT + reward_idx]
+                : 0.0f;
+            reward_cumulative[t * DISPLAY_REWARD_COMPONENT_COUNT + reward_idx] =
+                previous + reward_values[t * DISPLAY_REWARD_COMPONENT_COUNT + reward_idx];
+        }
+    }
+
     float (*obs)[max_obs] = (float (*)[max_obs]) obs_buf;
+    const int other_agent_count = 63;
+    const int road_segment_count = 200;
+    int ego_dim = max_obs - other_agent_count * 7 - road_segment_count * 7;
+    if (ego_dim < 19) {
+        fprintf(stderr, "invalid replay layout: max_obs=%d inferred ego_dim=%d\n", max_obs, ego_dim);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        free(action_values);
+        return 1;
+    }
 
     int pipefd[2];
     if (pipe(pipefd)) {
         fprintf(stderr, "failed to create pipe\n");
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        free(action_values);
         return 1;
     }
 
     __pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "failed to fork\n");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        free(obs_buf);
+        free(reward_values);
+        free(reward_cumulative);
+        free(action_values);
         return 1;
     }
     if (pid == 0) {
@@ -210,7 +412,6 @@ int main(int argc, char *argv[]) {
     camera.offset = (Vector2){ 400.0f, 400.0f };
     camera.zoom = camera_zoom;
 
-    int ego_dim = 19;
     const float base_line_thickness = 0.2f;
     const float base_zoom = 8.0f;
 
@@ -231,12 +432,6 @@ int main(int argc, char *argv[]) {
         float speed = obs[t][2] * 27.7f;
         float width = obs[t][3] * 15.0f;
         float length = obs[t][4] * 30.0f;
-        float lane_center_reward_coefficient = obs[t][7];
-        float comfort_reward_coefficient = obs[t][8];
-        float lane_align_reward_coefficient = obs[t][9];
-        float collision_reward_coefficient = obs[t][10];
-        float offroad_reward_coefficient = obs[t][11];
-        float lane_center_bias = obs[t][12] * 0.5f;
         float lane_heading_angle_diff = obs[t][13];
         float lane_lateral_offset = obs[t][14] * 4.0f;
         float next_goal_x = obs[t][16] / 0.005f;
@@ -251,7 +446,7 @@ int main(int argc, char *argv[]) {
         DrawLineEx((Vector2){length / 2, -width / 2}, (Vector2){length / 2, width / 2}, line_thickness, RED);
         DrawLineEx((Vector2){0, 0}, (Vector2){length * 0.625f, 0}, line_thickness, RED);
 
-        for (int car_idx = 0; car_idx < 63; car_idx++) {
+        for (int car_idx = 0; car_idx < other_agent_count; car_idx++) {
             float* other_car_obs = &obs[t][ego_dim + car_idx * 7];
             
             float rel_x = other_car_obs[0] / 0.02f;
@@ -280,8 +475,8 @@ int main(int argc, char *argv[]) {
         }
 
         int valid_road_points = 0;
-        for (int road_idx = 0; road_idx < 200; road_idx++) {
-            float *road_obs = &obs[t][ego_dim + 63 * 7 + road_idx * 7];
+        for (int road_idx = 0; road_idx < road_segment_count; road_idx++) {
+            float *road_obs = &obs[t][ego_dim + other_agent_count * 7 + road_idx * 7];
 
             float rel_x = road_obs[0] / 0.02f;
             float rel_y = road_obs[1] / 0.02f;
@@ -322,15 +517,49 @@ int main(int argc, char *argv[]) {
         DrawText(TextFormat("Lane angle diff: %04.1f degrees", lane_heading_angle_diff / PI * 180.0f), 10, 10, 18, WHITE);
         DrawText(TextFormat("Lane lateral offset: %04.2f m", lane_lateral_offset), 10, 33, 18, WHITE);
         DrawText(TextFormat("Speed: %04.2f km/h", speed * 3.6), 10, 56, 18, WHITE);
+        int acceleration_index = -1;
+        int steering_index = -1;
+        if (action_values != NULL) {
+            acceleration_index = action_values[t * action_component_count];
+            steering_index = action_values[t * action_component_count + 1];
+        }
 
-        DrawText(TextFormat("Road points: %d", valid_road_points), 10, 102, 18, WHITE);
+        if (steering_index >= 0 && steering_index < (int)(sizeof(DISPLAY_STEERING_VALUES) / sizeof(DISPLAY_STEERING_VALUES[0]))) {
+            float steering_degrees = DISPLAY_STEERING_VALUES[steering_index] * 180.0f / PI;
+            DrawText(TextFormat("Steering action: %+05.1f deg", steering_degrees), 10, 79, 18, WHITE);
+        } else {
+            DrawText("Steering action: N/A", 10, 79, 18, WHITE);
+        }
 
-        DrawText(TextFormat("Lane center bias: %04.2f m", lane_center_bias), 550, 10, 18, WHITE);
-        DrawText(TextFormat("Lane center reward: %04.2f%%", lane_center_reward_coefficient * 100), 550, 33, 18, WHITE);
-        DrawText(TextFormat("Lane align reward: %04.2f%%", lane_align_reward_coefficient * 100), 550, 56, 18, WHITE);
-        DrawText(TextFormat("Comfort reward: %04.2f%%", comfort_reward_coefficient * 100), 550, 79, 18, WHITE);
-        DrawText(TextFormat("Collision reward: %04.2f%%", collision_reward_coefficient * 100), 550, 102, 18, WHITE);
-        DrawText(TextFormat("Offroad reward: %04.2f%%", offroad_reward_coefficient * 100), 550, 125, 18, WHITE);
+        if (acceleration_index >= 0 && acceleration_index < (int)(sizeof(DISPLAY_ACCELERATION_VALUES) / sizeof(DISPLAY_ACCELERATION_VALUES[0]))) {
+            float acceleration_g = DISPLAY_ACCELERATION_VALUES[acceleration_index] / 9.81f;
+            DrawText(TextFormat("Acceleration action: %+0.2f g", acceleration_g), 10, 102, 18, WHITE);
+        } else {
+            DrawText("Acceleration action: N/A", 10, 102, 18, WHITE);
+        }
+
+        DrawText(TextFormat("Road points: %d", valid_road_points), 10, 125, 18, WHITE);
+
+        const int table_x = 420;
+        const int table_y = 8;
+        const int label_x = table_x + 12;
+        const int step_x = table_x + 165;
+        const int episode_x = table_x + 255;
+        const int row_height = 23;
+
+        DrawText("Reward", label_x, table_y + 4, 18, WHITE);
+        DrawText("Step", step_x, table_y + 4, 18, WHITE);
+        DrawText("Episode", episode_x, table_y + 4, 18, WHITE);
+        DrawLine(table_x + 10, table_y + 26, table_x + 360, table_y + 26, GRAY);
+
+        for (int reward_idx = 0; reward_idx < DISPLAY_REWARD_COMPONENT_COUNT; reward_idx++) {
+            int row_y = table_y + 34 + reward_idx * row_height;
+            float step_reward = reward_values[t * DISPLAY_REWARD_COMPONENT_COUNT + reward_idx];
+            float episode_reward = reward_cumulative[t * DISPLAY_REWARD_COMPONENT_COUNT + reward_idx];
+            DrawText(DISPLAY_REWARD_LABELS[reward_idx], label_x, row_y, 18, WHITE);
+            DrawText(TextFormat("%+.4f", step_reward), step_x, row_y, 18, WHITE);
+            DrawText(TextFormat("%+.4f", episode_reward), episode_x, row_y, 18, WHITE);
+        }
 
         EndDrawing();
 
@@ -348,6 +577,9 @@ int main(int argc, char *argv[]) {
     close(pipefd[1]);
     CloseWindow();
     free(obs_buf);
+    free(reward_values);
+    free(reward_cumulative);
+    free(action_values);
 
     return status;
 }

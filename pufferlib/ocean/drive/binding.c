@@ -256,6 +256,14 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "episode_length", log->episode_length);
     assign_to_dict(dict, "collision_rate", log->collision_rate);
     assign_to_dict(dict, "episode_return", log->episode_return);
+    assign_to_dict(dict, "goal_reward", log->goal_reward);
+    assign_to_dict(dict, "lane_center_reward", log->lane_center_reward);
+    assign_to_dict(dict, "comfort_reward", log->comfort_reward);
+    assign_to_dict(dict, "lane_alignment_reward", log->lane_alignment_reward);
+    assign_to_dict(dict, "collision_reward", log->collision_reward);
+    assign_to_dict(dict, "offroad_reward", log->offroad_reward);
+    assign_to_dict(dict, "velocity_reward", log->velocity_reward);
+    assign_to_dict(dict, "ade_reward", log->ade_reward);
     assign_to_dict(dict, "dnf_rate", log->dnf_rate);
     assign_to_dict(dict, "avg_displacement_error", log->avg_displacement_error);
     //assign_to_dict(dict, "num_goals_reached", log->num_goals_reached);
