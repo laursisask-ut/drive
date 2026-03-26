@@ -62,9 +62,9 @@ class Drive(pufferlib.PufferEnv):
 
         # Observation space calculation
         if dynamics_model == "classic":
-            ego_features = 19
+            ego_features = 20
         elif dynamics_model == "jerk":
-            ego_features = 22
+            ego_features = 23
         else:
             raise ValueError(f"dynamics_model must be 'classic' or 'jerk'. Got: {dynamics_model}")
 
@@ -212,7 +212,7 @@ class Drive(pufferlib.PufferEnv):
                     )
                 env_ids = []
                 seed = np.random.randint(0, 2**32 - 1)
-                export_replay = [self.artifact_dir is not None and random.random() < 0.002 for _ in range(num_envs)]
+                export_replay = [self.artifact_dir is not None and random.random() < 0.0004 for _ in range(num_envs)]
                 if any(export_replay):
                     wall_time = int(time.monotonic() - self.start_time)
                     replays_dir = os.path.join(self.artifact_dir, "replays", str(wall_time))

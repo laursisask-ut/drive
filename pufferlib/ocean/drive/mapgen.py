@@ -60,6 +60,8 @@ class Entity(Structure):
         ("mark_as_expert", c_int),
         ("collision_state", c_int),
         ("metrics_array", c_float * 6),
+        ("prev_x", c_float),
+        ("prev_y", c_float),
         ("x", c_float),
         ("y", c_float),
         ("z", c_float),
@@ -599,13 +601,13 @@ def generate_map():
         ent.multi_goal_position_y = alloc_float_array([-pos.y for pos in goal_positions[i]])
         ent.multi_goal_position_z = alloc_float_array([0 for _pos in goal_positions[i]]) # TODO: Height dimension
         ent.max_speed = max_speed/3.6
-        ent.lane_center_reward_coefficient = random.uniform(2.5e-5, 7.5e-4)
-        ent.comfort_reward_coefficient = random.uniform(0, 0.1)
+        ent.lane_center_reward_coefficient = random.uniform(2.5e-5, 2.5e-4)
+        ent.comfort_reward_coefficient = random.uniform(0, 0.02)
         ent.lane_align_reward_coefficient = random.uniform(2.5e-5, 2.5e-3)
-        ent.collision_reward_coefficient = random.uniform(0, 1)
-        ent.offroad_reward_coefficient = random.uniform(0, 1)
-        ent.lane_center_bias = random.uniform(-0.5, 0.5)
-        ent.goal_radius = random.uniform(0.5, 3)
+        ent.collision_reward_coefficient = random.uniform(0, 0.5)
+        ent.offroad_reward_coefficient = random.uniform(0, 0.5)
+        ent.lane_center_bias = random.uniform(-0.3, 0.3)
+        ent.goal_radius = random.uniform(1, 3)
         ent.mark_as_expert = 0
 
         allowed_spawn_lanelets = [

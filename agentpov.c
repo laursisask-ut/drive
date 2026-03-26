@@ -352,7 +352,7 @@ int main(int argc, char *argv[]) {
     const int other_agent_count = 63;
     const int road_segment_count = 200;
     int ego_dim = max_obs - other_agent_count * 7 - road_segment_count * 7;
-    if (ego_dim < 19) {
+    if (ego_dim != 19 && ego_dim != 20 && ego_dim != 22 && ego_dim != 23) {
         fprintf(stderr, "invalid replay layout: max_obs=%d inferred ego_dim=%d\n", max_obs, ego_dim);
         free(obs_buf);
         free(reward_values);
@@ -439,7 +439,7 @@ int main(int argc, char *argv[]) {
         float goal_radius = obs[t][18] * 3.0f;
 
         DrawCircleLines(goal_x, goal_y, goal_radius, DARKGREEN);
-        DrawCircleLines(next_goal_x, next_goal_y, goal_radius, LIME);
+        DrawCircleLines(next_goal_x, next_goal_y, goal_radius, ORANGE);
         DrawLineEx((Vector2){-length / 2, -width / 2}, (Vector2){length / 2, -width / 2}, line_thickness, RED);
         DrawLineEx((Vector2){-length / 2, width / 2}, (Vector2){length / 2, width / 2}, line_thickness, RED);
         DrawLineEx((Vector2){-length / 2, -width / 2}, (Vector2){-length / 2, width / 2}, line_thickness, RED);

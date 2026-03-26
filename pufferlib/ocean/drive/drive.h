@@ -180,6 +180,8 @@ struct Entity {
     int mark_as_expert;
     int collision_state;
     float metrics_array[6]; // metrics_array: [collision, offroad, reached_goal, lane_aligned, avg_displacement_error, lane_lateral_offset]
+    float prev_x;
+    float prev_y;
     float x;
     float y;
     float z;
@@ -1380,6 +1382,12 @@ float point_to_segment_distance_2d(float px, float py, float x1, float y1, float
     return sqrtf((px - closestX) * (px - closestX) + (py - closestY) * (py - closestY));
 }
 
+float normalize_heading(float heading){
+    if(heading > M_PI) heading -= 2*M_PI;
+    if(heading < -M_PI) heading += 2*M_PI;
+    return heading;
+}
+
 void compute_agent_metrics(Drive* env, int agent_idx) {
     Entity* agent = &env->entities[agent_idx];
 
@@ -1424,7 +1432,7 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
         entity = &env->entities[entity_list[i].entity_idx];
 
         // Check for offroad collision with road edges
-        if(entity->type == ROAD_EDGE) {
+        if(entity->type == ROAD_EDGE && collided != OFFROAD) {
             int geometry_idx = entity_list[i].geometry_idx;
             float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
@@ -1434,6 +1442,38 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
                     collided = OFFROAD;
                     break;
                 }
+            }
+
+            if (collided == OFFROAD) {
+                float road_x = entity->traj_x[geometry_idx + 1] - entity->traj_x[geometry_idx];
+                float road_y = entity->traj_y[geometry_idx + 1] - entity->traj_y[geometry_idx];
+                float road_len = sqrtf(road_x * road_x + road_y * road_y);
+
+                road_x /= road_len;
+                road_y /= road_len;
+
+                float road_agent_dot = road_x * agent->heading_x + road_y * agent->heading_y;
+                if (road_agent_dot < 0) {
+                    road_x *= -1;
+                    road_y *= -1;
+                }
+
+                float road_normal_x = road_y;
+                float road_normal_y = -road_x;
+                if (road_normal_x * agent->heading_x + road_normal_y * agent->heading_y > 0) {
+                    road_normal_x *= -1;
+                    road_normal_y *= -1;
+                }
+
+                agent->x = agent->prev_x + road_normal_x * 0.2f;
+                agent->y = agent->prev_y + road_normal_y * 0.2f;
+
+                agent->heading_x = road_x;
+                agent->heading_y = road_y;
+                agent->heading = normalize_heading(atan2f(road_y, road_x));
+                float speed = sqrtf(agent->vx * agent->vx + agent->vy * agent->vy);
+                agent->vx = speed * agent->heading_x;
+                agent->vy = speed * agent->heading_y;
             }
         }
 
@@ -1796,7 +1836,7 @@ void init(Drive* env){
 }
 
 static void saveAgentObservationsReplayToFile(Drive* env) {
-    int ego_dim = (env->dynamics_model == JERK) ? 22 : 19;
+    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
     int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
 
     float (*obs)[MAX_EXPORT_STEPS][max_obs] = (float(*)[MAX_EXPORT_STEPS][max_obs]) env->export_log.observations;
@@ -2008,7 +2048,7 @@ void c_close(Drive* env){
 
 void allocate(Drive* env){
     init(env);
-    int ego_dim = (env->dynamics_model == JERK) ? 22 : 19;
+    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
     int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
     env->actions = (float*)calloc(env->active_agent_count*2, sizeof(float));
@@ -2033,12 +2073,6 @@ float clipSpeed(float speed, Entity* agent) {
     if (speed > maxSpeed) return maxSpeed;
     if (speed < -maxSpeed) return -maxSpeed;
     return speed;
-}
-
-float normalize_heading(float heading){
-    if(heading > M_PI) heading -= 2*M_PI;
-    if(heading < -M_PI) heading += 2*M_PI;
-    return heading;
 }
 
 float normalize_value(float value, float min, float max){
@@ -2081,22 +2115,30 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         float vx = agent->vx;
         float vy = agent->vy;
 
-        // Calculate current speed
-        float speed = sqrtf(vx*vx + vy*vy);
+        agent->prev_x = x;
+        agent->prev_y = y;
 
-        // Update speed with acceleration
-        speed = speed + 0.5f*acceleration*env->dt;
-        speed = clipSpeed(speed, agent);
+        // Track signed longitudinal speed so negative acceleration can produce reverse motion.
+        float speed = sqrtf(vx*vx + vy*vy);
+        float v_dot_heading = vx * agent->heading_x + vy * agent->heading_y;
+        float signed_speed = copysignf(speed, v_dot_heading);
+        float new_speed = signed_speed + 0.5f * acceleration * env->dt;
+
+        if (signed_speed * new_speed < 0.0f) {
+            new_speed = 0.0f;
+        } else {
+            new_speed = clipSpeed(new_speed, agent);
+        }
 
         // Compute yaw rate
         float beta = tanh(.5*tanf(steering));
 
         // New heading
-        float yaw_rate = (speed*cosf(beta)*tanf(steering)) / agent->length;
+        float yaw_rate = (new_speed*cosf(beta)*tanf(steering)) / agent->length;
 
         // New velocity
-        float new_vx = speed*cosf(heading + beta);
-        float new_vy = speed*sinf(heading + beta);
+        float new_vx = new_speed * cosf(heading + beta);
+        float new_vy = new_speed * sinf(heading + beta);
 
         // Update position
         x = x + (new_vx*env->dt);
@@ -2112,7 +2154,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         agent->vx = new_vx;
         agent->vy = new_vy;
 
-        float a_lat = speed * speed * cosf(beta)*tanf(steering) / agent->length;
+        float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
 
         float comfort_reward = -agent->comfort_reward_coefficient * ((fabsf(acceleration) > 3.0f) + (fabsf(a_lat) > 3.0f));
         env->rewards[action_idx] += comfort_reward;
@@ -2218,7 +2260,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 }
 
 void compute_observations(Drive* env) {
-    int ego_dim = (env->dynamics_model == JERK) ? 22 : 19;
+    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
     int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs*env->active_agent_count*sizeof(float));
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
@@ -2277,11 +2319,17 @@ void compute_observations(Drive* env) {
 
         obs[18] = ego_entity->goal_radius / 3.0f;
 
+        int remaining_goals = 2;
+        if (ego_entity->multi_goal_count > 0) {
+            remaining_goals = ego_entity->multi_goal_count - ego_entity->multi_goal_idx;
+        }
+        obs[19] = remaining_goals / 10.0f;
+
         if (env->dynamics_model == JERK) {
-            obs[19] = ego_entity->steering_angle / M_PI;
+            obs[20] = ego_entity->steering_angle / M_PI;
             // Asymmetric normalization for a_long to match action space
-            obs[20] = (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
-            obs[21] = ego_entity->a_lat / JERK_LAT[2];
+            obs[21] = (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
+            obs[22] = ego_entity->a_lat / JERK_LAT[2];
         }
 
         // Relative Pos of other cars
@@ -2546,7 +2594,7 @@ void c_reset(Drive* env){
         env->export_log.traj_vz = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
         env->export_log.heading = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
 
-        int ego_dim = (env->dynamics_model == JERK) ? 22 : 19;
+        int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
         int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
         env->export_log.observations = calloc(env->active_agent_count * max_obs * MAX_EXPORT_STEPS, sizeof(float));
         env->export_log.reward_components =
@@ -2955,7 +3003,7 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
         return;
     }
 
-    int ego_dim = (env->dynamics_model == JERK) ? 22 : 19;
+    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
     int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
     float* agent_obs = &observations[agent_index][0];

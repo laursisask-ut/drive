@@ -1082,7 +1082,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     else:
         logger = NoLogger(args)
 
-    args["env"]["artifact_dir"] = os.path.join(args["train"]["data_dir"], logger.run_id)
+    args["env"]["artifact_dir"] = f"/tmp/puffer_drive_{logger.run_id}"
 
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv, env_name)
