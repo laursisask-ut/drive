@@ -602,7 +602,7 @@ def generate_map():
         ent.multi_goal_position_z = alloc_float_array([0 for _pos in goal_positions[i]]) # TODO: Height dimension
         ent.max_speed = max_speed/3.6
         ent.lane_center_reward_coefficient = random.uniform(2.5e-5, 2.5e-4)
-        ent.comfort_reward_coefficient = random.uniform(0, 0.02)
+        ent.comfort_reward_coefficient = random.uniform(0, 0.01)
         ent.lane_align_reward_coefficient = random.uniform(2.5e-5, 2.5e-3)
         ent.collision_reward_coefficient = random.uniform(0, 0.5)
         ent.offroad_reward_coefficient = random.uniform(0, 0.5)
