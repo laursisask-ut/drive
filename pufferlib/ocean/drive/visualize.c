@@ -77,7 +77,7 @@ void CloseVideo(VideoRecorder *recorder) {
     waitpid(recorder->pid, NULL, 0);
 }
 
-void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int lasers, int trajectories, int frame_count, float* path, int log_trajectories, int show_grid) {
+void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int lasers, int trajectories, int frame_count, float* path, int log_trajectories, int show_grid, float* reward_log) {
 
     BeginDrawing();
     AgentLabel labels[MAX_AGENTS] = {0};
@@ -95,7 +95,7 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
     if (follow_agent && strcmp(follow_agent, "1") == 0 && env->active_agent_count >= 1) {
         int idx = env->active_agent_indices[0];
         Entity* e = &env->entities[idx];
-        if (e->reached_goal_this_episode) {
+        if (e->reached_final_goal) {
             camera.position = (Vector3){e->goal_position_x, e->goal_position_y, 500.0f};
             camera.target = (Vector3){e->goal_position_x, e->goal_position_y, 0.0f};
             camera.fovy = 150;
@@ -104,7 +104,6 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
             camera.target = (Vector3){e->x, e->y, 0.0f};
             camera.fovy = 150;
         }
-
     }
 
     Color road = (Color){35, 35, 37, 255};
@@ -162,6 +161,51 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
             RED
         );
     }
+
+    const char* visualize_reward = getenv("VISUALIZE_REWARD");
+    if (visualize_reward && strcmp(visualize_reward, "1") == 0 && env->active_agent_count >= 1) {
+        reward_log[env->timestep] = env->rewards[0];
+
+        for (int i = 0; i <= env->timestep / 10; i++) {
+            float reward = 0;
+            for (int j = 0; j < 10; j++) {
+                reward += reward_log[i * 10 + j];
+            }
+
+            if (reward > 0) {
+                DrawRectangle(80 + i * 4, fmax(170 - sqrtf(reward) * 100, 0), 4, sqrtf(reward) * 100, GREEN);
+            } else if (reward < 0) {
+                DrawRectangle(80 + i * 4, 170, 4, sqrtf(-reward) * 100, RED);
+            }
+        }
+        DrawLineEx((Vector2){75, 170}, (Vector2){80 + ceilf(env->timestep / 10.0f) * 4, 170}, 3, WHITE);
+        DrawLineEx((Vector2){75, 20}, (Vector2){75, 320}, 3, WHITE);
+
+        DrawLineEx((Vector2){65, 170 - sqrtf(2) * 100}, (Vector2){80, 170 - sqrtf(2) * 100}, 3, WHITE);
+        DrawText("+2", 35, 158 - sqrtf(2) * 100, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 70}, (Vector2){80, 70}, 3, WHITE);
+        DrawText("+1", 35, 58, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 170 - sqrtf(0.5) * 100}, (Vector2){80, 170 - sqrtf(0.5) * 100}, 3, WHITE);
+        DrawText("+0.5", 20, 158 - sqrtf(0.5) * 100, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 170 - sqrtf(0.1) * 100}, (Vector2){80, 170 - sqrtf(0.1) * 100}, 3, WHITE);
+        DrawText("+0.1", 20, 158 - sqrtf(0.1) * 100, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 170 + sqrtf(2) * 100}, (Vector2){80, 170 + sqrtf(2) * 100}, 3, WHITE);
+        DrawText("-2", 35, 158 + sqrtf(2) * 100, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 270}, (Vector2){80, 270}, 3, WHITE);
+        DrawText("-1", 35, 258, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 170 + sqrtf(0.5) * 100}, (Vector2){80, 170 + sqrtf(0.5) * 100}, 3, WHITE);
+        DrawText("-0.5", 20, 158 + sqrtf(0.5) * 100, 24, WHITE);
+
+        DrawLineEx((Vector2){65, 170 + sqrtf(0.1) * 100}, (Vector2){80, 170 + sqrtf(0.1) * 100}, 3, WHITE);
+        DrawText("-0.1", 20, 158 + sqrtf(0.1) * 100, 24, WHITE);
+    }
+
     EndDrawing();
 }
 
@@ -213,19 +257,22 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         .init_steps = conf.init_steps,
         .control_all_agents = conf.control_all_agents,
         .policy_agents_per_env = conf.num_policy_controlled_agents,
-        .deterministic_agent_selection = conf.deterministic_agent_selection
+        .deterministic_agent_selection = conf.deterministic_agent_selection,
+        .export_replay_enabled = true,
+        .replay_dir = strdup("replays")
     };
     allocate(&env);
-    
+
     for (int i = 0; i < env.active_agent_count; i++) {
         Entity* e = &env.entities[env.active_agent_indices[i]];
         e->max_speed = 90/3.6f;
-        e->lane_center_reward_coefficient = 3.8e-4f;
-        e->comfort_reward_coefficient = 0.05f;
-        e->lane_align_reward_coefficient = 2.5e-4f;
-        e->collision_reward_coefficient = 1.0f;
-        e->offroad_reward_coefficient = 1.0f;
+        e->lane_center_reward_coefficient = 2.5e-5;
+        e->comfort_reward_coefficient = 0.00f;
+        e->lane_align_reward_coefficient = 2.5e-5f;
+        e->collision_reward_coefficient = 0.5f;
+        e->offroad_reward_coefficient = 0.5f;
         e->lane_center_bias = 0.0f;
+        e->goal_radius = goal_radius;
     }
     
     if (scenario_length_override != -1) {
@@ -242,10 +289,6 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     Client* client = (Client*)calloc(1, sizeof(Client));
     env.client = client;
 
-    SetConfigFlags(FLAG_WINDOW_HIDDEN);
-
-    SetTargetFPS(6000);
-
     float map_width = env.grid_map->bottom_right_x - env.grid_map->top_left_x;
     float map_height = env.grid_map->top_left_y - env.grid_map->bottom_right_y;
 
@@ -256,7 +299,8 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     int img_width = (int)roundf(map_width * scale / 2.0f) * 2;
     int img_height = (int)roundf(map_height * scale / 2.0f) * 2;
     InitWindow(img_width, img_height, "Puffer Drive");
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
+    SetTargetFPS(6000);
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_HIDDEN);
 
     Weights* weights = load_weights(policy_name);
     printf("Active agents in map: %d\n", env.active_agent_count);
@@ -267,7 +311,7 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     frame_count -= 1;
     char filename_topdown[1024];
 
-    if (output_topdown != NULL && output_agent != NULL) {
+    if (output_topdown != NULL) {
         strcpy(filename_topdown, output_topdown);
     } else {
         char policy_base[256];
@@ -294,6 +338,8 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     double startTime = GetTime();
 
     VideoRecorder topdown_recorder;
+    float reward_log[65536];
+    memset(reward_log, 0, 65536 * sizeof(float));
 
     if (render_topdown) {
         if (!OpenVideo(&topdown_recorder, filename_topdown, img_width, img_height)) {
@@ -302,10 +348,10 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         }
 
         printf("Recording topdown view...\n");
-        for (int i = 0; i < frame_count; i++) {
+        for (int i = 0; i <= frame_count; i++) {
             if (i % frame_skip == 0) {
-                renderTopDownView(&env, client, map_height, 0, 0, 0, frame_count, NULL, log_trajectories, show_grid);
-                WriteFrame(&topdown_recorder, img_width, img_height);
+                //renderTopDownView(&env, client, map_height, 0, 0, 0, frame_count, NULL, log_trajectories, show_grid, reward_log);
+                //WriteFrame(&topdown_recorder, img_width, img_height);
                 rendered_frames++;
             }
             forward(net, env.observations, (int*)env.actions);
