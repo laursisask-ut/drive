@@ -96,7 +96,7 @@ static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 
 // Classic action space (for CLASSIC dynamics model)
 static const float ACCELERATION_VALUES[7] = {-4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f};
-static const float STEERING_VALUES[13] = {-1.000f, -0.833f, -0.667f, -0.500f, -0.333f, -0.167f, 0.000f, 0.167f, 0.333f, 0.500f, 0.667f, 0.833f, 1.000f};
+static const float STEERING_VALUES[13] = {-0.833f, -0.667f, -0.500f, -0.333f, -0.167f, -0.035f, 0.000f, 0.035f, 0.167f, 0.333f, 0.500f, 0.667f, 0.833f};
 
 static const float offsets[4][2] = {
         {-1, 1},  // top-left
@@ -2082,10 +2082,6 @@ float normalize_value(float value, float min, float max){
 void move_dynamics(Drive* env, int action_idx, int agent_idx){
     Entity* agent = &env->entities[agent_idx];
 
-    if (agent->collision_state != 0) {
-        return;
-    }
-
     if (env->dynamics_model == CLASSIC) {
         // Classic dynamics model
         float acceleration = 0.0f;
@@ -2700,33 +2696,41 @@ void c_step(Drive* env){
         env->logs[i].score = 0.0f;
 	    env->logs[i].episode_length += 1;
         int agent_idx = env->active_agent_indices[i];
-        env->entities[agent_idx].collision_state = 0;
         move_dynamics(env, i, agent_idx);
-        // move_expert(env, env->actions, agent_idx);
     }
     for(int i = 0; i < env->active_agent_count; i++){
         int agent_idx = env->active_agent_indices[i];
         Entity* e = &env->entities[agent_idx];
-        env->entities[agent_idx].collision_state = 0;
+        int prev_collision_state = env->entities[agent_idx].collision_state;
         //if(env->entities[agent_idx].respawn_timestep != -1) continue;
         compute_agent_metrics(env, agent_idx);
         int collision_state = env->entities[agent_idx].collision_state;
 
         if(collision_state > 0){
-            if(collision_state == VEHICLE_COLLISION){
+            if (collision_state == VEHICLE_COLLISION && prev_collision_state != VEHICLE_COLLISION) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
-                float collision_reward = -e->collision_reward_coefficient - 0.1 * speed;
+                float collision_reward = -e->collision_reward_coefficient * (1 + 0.1 * speed);
                 env->rewards[i] = collision_reward;
                 record_reward_component(env, i, REWARD_COMPONENT_COLLISION, collision_reward);
                 env->logs[i].collision_rate = 1.0f;
                 env->logs[i].avg_collisions_per_agent += 1.0f;
-            }
-            else if(collision_state == OFFROAD){
-                float offroad_reward = -e->offroad_reward_coefficient;
+                
+                // With high coefficient the episode will end and any future
+                // reward will not be counted to make it harder for the agent
+                // to reward hack.
+                if (e->collision_reward_coefficient >= 1.0f) {
+                    env->terminals[i] = 1;
+                }
+            } else if (collision_state == OFFROAD && prev_collision_state != OFFROAD) {
+                float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
+                float offroad_reward = -e->offroad_reward_coefficient * (1 + 0.1 * speed);
                 env->rewards[i] = offroad_reward;
                 env->logs[i].offroad_rate = 1.0f;
                 record_reward_component(env, i, REWARD_COMPONENT_OFFROAD, offroad_reward);
                 env->logs[i].avg_offroad_per_agent += 1.0f;
+                if (e->offroad_reward_coefficient >= 1.0f) {
+                    env->terminals[i] = 1;
+                }
             }
             if(!env->entities[agent_idx].reached_goal_this_episode){
                 env->entities[agent_idx].collided_before_goal = 1;
