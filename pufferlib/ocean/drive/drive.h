@@ -667,6 +667,16 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             fread(entities[i].traj_vz, sizeof(float), size, file);
             fread(entities[i].traj_heading, sizeof(float), size, file);
             fread(entities[i].traj_valid, sizeof(int), size, file);
+
+            // Reasonable defaults, needed for validation runs
+            entities[i].max_speed = 90/3.6f;
+            entities[i].lane_center_reward_coefficient = 2.5e-5;
+            entities[i].comfort_reward_coefficient = 0.005f;
+            entities[i].lane_align_reward_coefficient = 2.5e-4f;
+            entities[i].collision_reward_coefficient = 1.0f;
+            entities[i].offroad_reward_coefficient = 1.0f;
+            entities[i].lane_center_bias = 0.0f;
+            entities[i].goal_radius = 2.0f;
         }
         // Read remaining scalar fields
         fread(&entities[i].width, sizeof(float), 1, file);
@@ -2152,7 +2162,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 
         float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
 
-        float comfort_reward = -agent->comfort_reward_coefficient * ((fabsf(acceleration) > 3.0f) + (fabsf(a_lat) > 3.0f));
+        float comfort_reward = -agent->comfort_reward_coefficient * ((acceleration > 3.0f) + (fabsf(a_lat) > 3.0f));
         env->rewards[action_idx] += comfort_reward;
         record_reward_component(env, action_idx, REWARD_COMPONENT_COMFORT, comfort_reward);
     } else {
@@ -2315,9 +2325,13 @@ void compute_observations(Drive* env) {
 
         obs[18] = ego_entity->goal_radius / 3.0f;
 
-        int remaining_goals = 2;
+        int remaining_goals;
         if (ego_entity->multi_goal_count > 0) {
             remaining_goals = ego_entity->multi_goal_count - ego_entity->multi_goal_idx;
+        } else if (ego_entity->reached_final_goal) {
+            remaining_goals = 0;
+        } else {
+            remaining_goals = 1;
         }
         obs[19] = remaining_goals / 10.0f;
 
@@ -2791,8 +2805,9 @@ void c_step(Drive* env){
                     env->entities[agent_idx].reached_final_goal = 1;
                 }
             } else if (env->entities[agent_idx].multi_goal_count > 0) {
-                env->rewards[i] += env->reward_goal;
-                record_reward_component(env, i, REWARD_COMPONENT_GOAL, env->reward_goal);
+                float reward = env->reward_goal * fmaxf(1.0f - 0.2f * env->entities[agent_idx].multi_goal_idx, 0.1f);
+                env->rewards[i] += reward;
+                record_reward_component(env, i, REWARD_COMPONENT_GOAL, reward);
                 env->entities[agent_idx].sampled_new_goal = 1;
                 env->logs[i].num_goals_reached += 1;
                 env->entities[agent_idx].reached_goal_this_episode = 1;

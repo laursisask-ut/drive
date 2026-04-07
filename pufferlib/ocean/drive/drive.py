@@ -15,8 +15,6 @@ class Drive(pufferlib.PufferEnv):
         self,
         render_mode=None,
         report_interval=1,
-        width=1280,
-        height=1024,
         human_agent_idx=0,
         reward_vehicle_collision=-0.1,
         reward_offroad_collision=-0.1,
@@ -27,11 +25,13 @@ class Drive(pufferlib.PufferEnv):
         dt=0.1,
         scenario_length=None,
         resample_frequency=91,
+        map_dir="resources/drive/binaries",
         num_maps=100,
         num_agents=512,
         action_type="discrete",
         dynamics_model="classic",
         dynamic_map_generation=True,
+        all_maps_exactly_once=False,
         control_all_agents=False,
         num_policy_controlled_agents=-1,
         deterministic_agent_selection=False,
@@ -96,22 +96,27 @@ class Drive(pufferlib.PufferEnv):
         self._action_type_flag = 0 if action_type == "discrete" else 1
 
         # Check if resources directory exists
-        binary_path = "resources/drive/binaries/map_000.bin"
+        binary_path = f"{map_dir}/map_000.bin"
         if not os.path.exists(binary_path):
             raise FileNotFoundError(
                 f"Required directory {binary_path} not found. Please ensure the Drive maps are downloaded and installed correctly per docs."
             )
 
         # Check maps availability
-        available_maps = len([name for name in os.listdir("resources/drive/binaries") if name.endswith(".bin")])
+        available_maps = len([name for name in os.listdir(map_dir) if name.endswith(".bin")])
         if num_maps > available_maps:
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
+        elif num_maps == -1:
+            num_maps = available_maps
+
         self.control_all_agents = bool(control_all_agents)
         self.num_policy_controlled_agents = int(num_policy_controlled_agents)
         self.deterministic_agent_selection = bool(deterministic_agent_selection)
         self.dynamic_map_generation = dynamic_map_generation
+        self.map_dir = map_dir
+        self.all_maps_exactly_once = all_maps_exactly_once
 
         if self.dynamic_map_generation:
             assert num_agents % agents_per_generated_map == 0
@@ -120,22 +125,26 @@ class Drive(pufferlib.PufferEnv):
             agent_offsets = list(range(0, num_agents+agents_per_generated_map, agents_per_generated_map))
         else:
             agent_offsets, map_ids, num_envs = binding.shared(
+                map_dir=map_dir,
                 num_agents=num_agents,
                 num_maps=num_maps,
                 num_policy_controlled_agents=self.num_policy_controlled_agents,
                 control_all_agents=1 if self.control_all_agents else 0,
                 deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                all_maps_exactly_once=all_maps_exactly_once
             )
+        if all_maps_exactly_once:
+            num_agents = agent_offsets[-1]
         self.num_agents = num_agents
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
         super().__init__(buf=buf)
         env_ids = []
-        export_replay = artifact_dir is not None
-        if export_replay:
+        if artifact_dir is not None:
             replays_dir = os.path.join(artifact_dir, "replays", "0")
         for i in range(num_envs):
+            export_replay = artifact_dir is not None and i == 0
             if export_replay:
                 replay_dir = os.path.join(replays_dir, f"{os.getpid():05}-{i:02}")
                 os.makedirs(replay_dir, exist_ok=True)
@@ -163,6 +172,7 @@ class Drive(pufferlib.PufferEnv):
                 control_all_agents=1 if self.control_all_agents else 0,
                 num_policy_controlled_agents=self.num_policy_controlled_agents,
                 deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                map_dir=map_dir,
                 map_id=map_ids[i],
                 dynamic_map_generator=generate_map if self.dynamic_map_generation else None,
                 max_agents=nxt - cur,
@@ -204,11 +214,13 @@ class Drive(pufferlib.PufferEnv):
                     agent_offsets = list(range(0, self.num_agents+agents_per_generated_map, agents_per_generated_map))
                 else:
                     agent_offsets, map_ids, num_envs = binding.shared(
+                        map_dir=self.map_dir,
                         num_agents=self.num_agents,
                         num_maps=self.num_maps,
                         num_policy_controlled_agents=self.num_policy_controlled_agents,
                         control_all_agents=1 if self.control_all_agents else 0,
                         deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                        all_maps_exactly_once=self.all_maps_exactly_once
                     )
                 env_ids = []
                 seed = np.random.randint(0, 2**32 - 1)
@@ -244,6 +256,7 @@ class Drive(pufferlib.PufferEnv):
                         control_all_agents=1 if self.control_all_agents else 0,
                         num_policy_controlled_agents=self.num_policy_controlled_agents,
                         deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                        map_dir=self.map_dir,
                         map_id=map_ids[i],
                         dynamic_map_generator=generate_map if self.dynamic_map_generation else None,
                         max_agents=nxt - cur,

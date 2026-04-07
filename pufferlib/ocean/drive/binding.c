@@ -70,19 +70,36 @@ static int my_put(Env* env, PyObject* args, PyObject* kwargs) {
 static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     int num_agents = unpack(kwargs, "num_agents");
     int num_maps = unpack(kwargs, "num_maps");
+
+    PyObject* map_dir = kwargs ? PyDict_GetItemString(kwargs, "map_dir") : NULL;
+    if (!map_dir) {
+        PyErr_SetString(PyExc_TypeError, "map_dir is not set");
+        return NULL;
+    }
+
+    if (!PyUnicode_Check(map_dir)) {
+        PyErr_SetString(PyExc_TypeError, "map_dir is not string");
+        return NULL;
+    }
+
+    const char* map_dir_str = PyUnicode_AsUTF8(map_dir);
+
+    PyObject* all_maps_exactly_once_obj = PyDict_GetItemString(kwargs, "all_maps_exactly_once");
+    int all_maps_exactly_once = all_maps_exactly_once_obj && Py_IsTrue(all_maps_exactly_once_obj);
+
     clock_gettime(CLOCK_REALTIME, &ts);
     srand(ts.tv_nsec);
     int total_agent_count = 0;
     int env_count = 0;
-    int max_envs = num_agents;
+    int max_envs = all_maps_exactly_once ? num_maps : num_agents;
     PyObject* agent_offsets = PyList_New(max_envs+1);
     PyObject* map_ids = PyList_New(max_envs);
     // getting env count
     while(total_agent_count < num_agents && env_count < max_envs){
-        char map_file[100];
-        int map_id = rand() % num_maps;
+        char map_file[256];
+        int map_id = all_maps_exactly_once ? env_count : rand() % num_maps;
         Drive* env = calloc(1, sizeof(Drive));
-        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+        sprintf(map_file, "%s/map_%03d.bin", map_dir_str, map_id);
         env->entities = load_map_binary(map_file, env);
         PyObject* obj = NULL;
         obj = kwargs ? PyDict_GetItemString(kwargs, "num_policy_controlled_agents") : NULL;
@@ -188,6 +205,19 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     int max_agents = unpack(kwargs, "max_agents");
     env->num_agents = max_agents;
 
+    PyObject* map_dir = kwargs ? PyDict_GetItemString(kwargs, "map_dir") : NULL;
+    if (!map_dir) {
+        PyErr_SetString(PyExc_TypeError, "map_dir is not set");
+        return 1;
+    }
+
+    if (!PyUnicode_Check(map_dir)) {
+        PyErr_SetString(PyExc_TypeError, "map_dir is not string");
+        return 1;
+    }
+
+    const char* map_dir_str = PyUnicode_AsUTF8(map_dir);
+
     PyObject* dynamic = PyDict_GetItemString(kwargs, "dynamic_map_generator");
     if (dynamic && !Py_IsNone(dynamic)) {
         env->map_name = "(dynamically-generated)";
@@ -232,8 +262,8 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     } else {
         env->dynamic_map_generation = 0;
         int map_id = unpack(kwargs, "map_id");
-        char map_file[100];
-        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+        char map_file[256];
+        sprintf(map_file, "%s/map_%03d.bin", map_dir_str, map_id);
         env->map_name = strdup(map_file);
     }
 

@@ -33,6 +33,7 @@ import pufferlib
 import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
+from pufferlib.ocean.drive.drive import Drive
 
 try:
     from pufferlib import _C
@@ -216,8 +217,20 @@ class PuffeRL:
         self.utilization = Utilization()
         self.profile = Profile()
         self.stats = defaultdict(list)
+        self.val_stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.losses = {}
+
+        self.validation_env = Drive(
+            resample_frequency=-1,
+            num_maps=-1,
+            map_dir="validation-maps",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            scenario_length=620
+        )
+
+        self.run_validation()
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -483,9 +496,15 @@ class PuffeRL:
             self.losses = losses
             self.print_dashboard()
             self.stats = defaultdict(list)
+            self.val_stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
             profile.clear()
+
+        if self.epoch % config["validation_interval"] == 0 or done_training:
+            profile("validation", epoch)
+            self.run_validation()
+            profile.pop()
 
         if self.epoch % config["checkpoint_interval"] == 0 or done_training:
             self.save_checkpoint()
@@ -640,6 +659,14 @@ class PuffeRL:
                 del self.stats[k]
 
             self.stats[k] = v
+        for k in list(self.val_stats.keys()):
+            v = self.val_stats[k]
+            try:
+                v = np.mean(v)
+            except:
+                del self.val_stats[k]
+
+            self.val_stats[k] = v
 
         device = config["device"]
         agent_steps = int(dist_sum(self.global_step, device))
@@ -650,6 +677,7 @@ class PuffeRL:
             "epoch": int(dist_sum(self.epoch, device)),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
             **{f"environment/{k}": v for k, v in self.stats.items()},
+            **{f"validation/{k}": v for k, v in self.val_stats.items()},
             **{f"losses/{k}": v for k, v in self.losses.items()},
             **{f"performance/{k}": v["elapsed"] for k, v in self.profile},
             # **{f'environment/{k}': dist_mean(v, device) for k, v in self.stats.items()},
@@ -705,6 +733,32 @@ class PuffeRL:
         torch.save(state, state_path + ".tmp")
         os.rename(state_path + ".tmp", state_path)
         return model_path
+
+    @torch.no_grad()
+    def run_validation(self):
+        observations, _ = self.validation_env.reset()
+        num_agents = observations.shape[0]
+
+        device = self.config["device"]
+
+        state = dict(
+            lstm_h=torch.zeros(num_agents, self.policy.hidden_size, device=device),
+            lstm_c=torch.zeros(num_agents, self.policy.hidden_size, device=device),
+        )
+
+        for _ in range(self.validation_env.scenario_length):
+            logits, _value = self.policy.forward_eval(torch.as_tensor(observations).to(device), state)
+            actions, _, _ = pufferlib.pytorch.sample_logits(logits)
+            observations, _rewards, _terminals, _truncations, info = self.validation_env.step(actions.cpu())
+
+            for i in info:
+                for k, v in pufferlib.unroll_nested_dict(i):
+                    if isinstance(v, np.ndarray):
+                        v = v.tolist()
+                    elif isinstance(v, (list, tuple)):
+                        self.val_stats[k].extend(v)
+                    else:
+                        self.val_stats[k].append(v)
 
     def print_dashboard(self, clear=False, idx=[0], c1="[cyan]", c2="[white]", b1="[bright_cyan]", b2="[bright_white]"):
         config = self.config
