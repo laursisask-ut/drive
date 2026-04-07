@@ -502,9 +502,7 @@ class PuffeRL:
             profile.clear()
 
         if self.epoch % config["validation_interval"] == 0 or done_training:
-            profile("validation", epoch)
             self.run_validation()
-            profile.pop()
 
         if self.epoch % config["checkpoint_interval"] == 0 or done_training:
             self.save_checkpoint()
