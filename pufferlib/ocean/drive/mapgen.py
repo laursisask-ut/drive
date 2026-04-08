@@ -466,8 +466,8 @@ def generate_map():
 
         for _ in range(goals_per_agent):
             can_add_more_goals = True
-            # 5 seconds away
-            goal_distance = speed_limit/3.6*5
+            # 3-6 seconds away
+            goal_distance = speed_limit / 3.6 * random.uniform(3, 6)
             while True:
                 line = to2D(current_lanelet.centerline)
                 following_lanelets = routing_graph.following(current_lanelet, withLaneChanges=True)
