@@ -24,9 +24,7 @@
 #define ROAD_EDGE 6
 #define STOP_SIGN 7
 #define CROSSWALK 8
-#define SPEED_BUMP 9
-#define DRIVEWAY 10
-#define TRAFFIC_LIGHT_STOP_LINE 11
+#define TRAFFIC_LIGHT_STOP_LINE 9
 
 #define INVALID_POSITION -10000.0f
 
@@ -3491,27 +3489,24 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                 }
 
                 // --- Draw the car  ---
-
-                if (!is_active_agent || !env->entities[i].reached_goal_this_episode || env->entities[i].multi_goal_idx < env->entities[i].multi_goal_count) {
-                    Color car_color = GRAY;              // default for static
-                    if (is_expert) car_color = GOLD;      // expert replay
-                    if (is_active_agent) car_color = BLUE; // policy-controlled
-                    if (is_active_agent && env->entities[i].collision_state > 0) car_color = RED;
-                    rlSetLineWidth(3.0f);
-                    for (int j = 0; j < 4; j++) {
-                        DrawLine3D(corners[j], corners[(j+1)%4], car_color);
-                    }
-                    // --- Draw a heading arrow pointing forward ---
-                    Vector3 arrowStart = position;
-                    Vector3 arrowEnd = {
-                        position.x + cos_heading * half_len * 1.5f, // extend arrow beyond car
-                        position.y + sin_heading * half_len * 1.5f,
-                        position.z
-                    };
-
-                    DrawLine3D(arrowStart, arrowEnd, car_color);
-                    DrawSphere(arrowEnd, 0.2f, car_color);  // arrow tip
+                Color car_color = GRAY;              // default for static
+                if (is_expert) car_color = GOLD;      // expert replay
+                if (is_active_agent) car_color = BLUE; // policy-controlled
+                if (is_active_agent && env->entities[i].collision_state > 0) car_color = RED;
+                rlSetLineWidth(3.0f);
+                for (int j = 0; j < 4; j++) {
+                    DrawLine3D(corners[j], corners[(j+1)%4], car_color);
                 }
+                // --- Draw a heading arrow pointing forward ---
+                Vector3 arrowStart = position;
+                Vector3 arrowEnd = {
+                    position.x + cos_heading * half_len * 1.5f, // extend arrow beyond car
+                    position.y + sin_heading * half_len * 1.5f,
+                    position.z
+                };
+
+                DrawLine3D(arrowStart, arrowEnd, car_color);
+                DrawSphere(arrowEnd, 0.2f, car_color);  // arrow tip
             }
             else {
                 rlPushMatrix();

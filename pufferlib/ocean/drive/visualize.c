@@ -269,8 +269,8 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         e->lane_center_reward_coefficient = 2.5e-5;
         e->comfort_reward_coefficient = 0.00f;
         e->lane_align_reward_coefficient = 2.5e-5f;
-        e->collision_reward_coefficient = 0.5f;
-        e->offroad_reward_coefficient = 0.5f;
+        e->collision_reward_coefficient = 1.0f;
+        e->offroad_reward_coefficient = 1.0f;
         e->lane_center_bias = 0.0f;
         e->goal_radius = goal_radius;
     }

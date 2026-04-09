@@ -566,7 +566,7 @@ def generate_map():
     
     for reg_el in lanelet2_map.regulatoryElementLayer.search(render_box):
         if reg_el.attributes["subtype"] == "traffic_light":
-            add_linestring_segments_in_box(11, reg_el.parameters["ref_line"][0])
+            add_linestring_segments_in_box(9, reg_el.parameters["ref_line"][0])
 
     for linestring in lanelet2_map.lineStringLayer.search(render_box):
         if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
