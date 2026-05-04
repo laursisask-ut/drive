@@ -177,6 +177,7 @@ struct Entity {
     float* multi_goal_position_z;
     int mark_as_expert;
     int collision_state;
+    int collided_with_agent_idx;
     float metrics_array[6]; // metrics_array: [collision, offroad, reached_goal, lane_aligned, avg_displacement_error, lane_lateral_offset]
     float prev_x;
     float prev_y;
@@ -328,6 +329,7 @@ struct Drive {
     unsigned char* terminals;
     Log log;
     Log* logs;
+    int* collision_counts;
     int num_agents;
     int active_agent_count;
     int* active_agent_indices;
@@ -1528,7 +1530,10 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
 
     // Check for vehicle collisions
     int car_collided_with_index = collision_check(env, agent_idx);
-    if (car_collided_with_index != -1) collided = VEHICLE_COLLISION;
+    if (car_collided_with_index != -1) {
+        collided = VEHICLE_COLLISION;
+        agent->collided_with_agent_idx = car_collided_with_index;
+    }
 
     agent->collision_state = collided;
 
@@ -1841,6 +1846,8 @@ void init(Drive* env){
     set_start_position(env);
     init_goal_positions(env);
     env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
+    int collision_buckets = 5151;
+    env->collision_counts = (int*)calloc(collision_buckets, sizeof(int));
 }
 
 static void saveAgentObservationsReplayToFile(Drive* env) {
@@ -2021,6 +2028,7 @@ void c_close(Drive* env){
     free(env->entities);
     free(env->active_agent_indices);
     free(env->logs);
+    free(env->collision_counts);
     // GridMap cleanup
     int grid_cell_count = env->grid_map->grid_cols*env->grid_map->grid_rows;
     for(int grid_index = 0; grid_index < grid_cell_count; grid_index++){
@@ -2325,11 +2333,14 @@ void compute_observations(Drive* env) {
 
         int remaining_goals;
         if (ego_entity->multi_goal_count > 0) {
-            remaining_goals = min(ego_entity->multi_goal_count - ego_entity->multi_goal_idx, 3);
+            remaining_goals = ego_entity->multi_goal_count - ego_entity->multi_goal_idx;
         } else if (ego_entity->reached_final_goal) {
             remaining_goals = 0;
         } else {
             remaining_goals = 1;
+        }
+        if (remaining_goals > 3) {
+            remaining_goals = 3;
         }
         obs[19] = (remaining_goals - 1) / 2.0f;
 
@@ -2730,9 +2741,19 @@ void c_step(Drive* env){
                 // With high coefficient the episode will end and any future
                 // reward will not be counted to make it harder for the agent
                 // to reward hack.
-                if (e->collision_reward_coefficient >= 1.0f) {
+                if (e->collision_reward_coefficient >= 0.5f) {
                     env->terminals[i] = 1;
                 }
+
+                float coef1 = fminf(e->collision_reward_coefficient, env->entities[e->collided_with_agent_idx].collision_reward_coefficient);
+                float coef2 = fmaxf(e->collision_reward_coefficient, env->entities[e->collided_with_agent_idx].collision_reward_coefficient);
+
+                // Bins are 0, 0.01, 0.02, ..., 1.00
+                int coef1_bin = (int) (coef1 * 100);
+                int coef2_bin = (int) (coef2 * 100);
+                int joint_bin_idx = coef1_bin * 101 + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
+                env->collision_counts[joint_bin_idx]++;
+
             } else if (collision_state == OFFROAD && prev_collision_state != OFFROAD) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float offroad_reward = -e->offroad_reward_coefficient * (1 + 0.1 * speed);

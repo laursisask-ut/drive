@@ -36,6 +36,8 @@ static const float DISPLAY_STEERING_VALUES[13] = {
     0.08f, 0.035f, 0.167f, 0.333f, 0.500f, 0.667f,
 };
 
+static const int EGO_OBS_COLLISION_REWARD_COEFFICIENT_IDX = 10;
+
 static int write_all(int fd, const unsigned char *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -437,6 +439,7 @@ int main(int argc, char *argv[]) {
         float next_goal_x = obs[t][16] / 0.005f;
         float next_goal_y = obs[t][17] / 0.005f;
         float goal_radius = obs[t][18] * 3.0f;
+        float collision_reward_coefficient = obs[t][EGO_OBS_COLLISION_REWARD_COEFFICIENT_IDX];
 
         DrawCircleLines(goal_x, goal_y, goal_radius, DARKGREEN);
         DrawCircleLines(next_goal_x, next_goal_y, goal_radius, ORANGE);
@@ -560,6 +563,14 @@ int main(int argc, char *argv[]) {
             DrawText(TextFormat("%+.4f", step_reward), step_x, row_y, 18, WHITE);
             DrawText(TextFormat("%+.4f", episode_reward), episode_x, row_y, 18, WHITE);
         }
+
+        int coeff_y = table_y + 34 + DISPLAY_REWARD_COMPONENT_COUNT * row_height + 6;
+        DrawLine(table_x + 10, coeff_y - 8, table_x + 360, coeff_y - 8, GRAY);
+        DrawText(TextFormat("Collision reward coeff: %+.4f", collision_reward_coefficient),
+                 label_x,
+                 coeff_y,
+                 18,
+                 WHITE);
 
         EndDrawing();
 

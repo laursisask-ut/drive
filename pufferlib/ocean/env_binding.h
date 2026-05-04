@@ -3,7 +3,7 @@
 #include <numpy/arrayobject.h>
 
 // Forward declarations for env-specific functions supplied by user
-static int my_log(PyObject* dict, Log* log);
+static int my_log(PyObject* dict, Log* log, int* collision_counts);
 static int my_init(Env* env, PyObject* args, PyObject* kwargs);
 
 static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs);
@@ -572,11 +572,16 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     // horribly if Log has non-float data.
     Log aggregate = {0};
     int num_keys = sizeof(Log) / sizeof(float);
+    int collision_counts[5151];
+    memset(collision_counts, 0, sizeof(int)*5151);
     for (int i = 0; i < vec->num_envs; i++) {
         Env* env = vec->envs[i];
         for (int j = 0; j < num_keys; j++) {
             ((float*)&aggregate)[j] += ((float*)&env->log)[j];
             ((float*)&env->log)[j] = 0.0f;
+        }
+        for (int j = 0; j < 5151; j++) {
+            collision_counts[j] += env->collision_counts[j];
         }
     }
 
@@ -592,7 +597,7 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     }
 
     // User populates dict
-    my_log(dict, &aggregate);
+    my_log(dict, &aggregate, collision_counts);
     assign_to_dict(dict, "n", n);
 
     return dict;

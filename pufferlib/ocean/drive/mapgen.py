@@ -59,6 +59,7 @@ class Entity(Structure):
         ("multi_goal_position_z", POINTER(c_float)),
         ("mark_as_expert", c_int),
         ("collision_state", c_int),
+        ("collided_with_agent_idx", c_int),
         ("metrics_array", c_float * 6),
         ("prev_x", c_float),
         ("prev_y", c_float),
@@ -604,7 +605,7 @@ def generate_map():
         ent.lane_center_reward_coefficient = random.uniform(2.5e-5, 2.5e-4)
         ent.comfort_reward_coefficient = random.uniform(0, 0.01)
         ent.lane_align_reward_coefficient = random.uniform(2.5e-5, 2.5e-3)
-        ent.collision_reward_coefficient = random.uniform(0, 0.5) if random.random() < 0.5 else 1.0
+        ent.collision_reward_coefficient = random.uniform(0, 1.0)
         ent.offroad_reward_coefficient = random.uniform(0, 0.5) if random.random() < 0.5 else 1.0
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)

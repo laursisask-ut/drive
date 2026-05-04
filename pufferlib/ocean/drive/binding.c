@@ -280,7 +280,7 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     return 0;
 }
 
-static int my_log(PyObject* dict, Log* log) {
+static int my_log(PyObject* dict, Log* log, int* collision_counts) {
     assign_to_dict(dict, "n", log->n);
     assign_to_dict(dict, "offroad_rate", log->offroad_rate);
     assign_to_dict(dict, "episode_length", log->episode_length);
@@ -308,5 +308,19 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "close_to_lane", log->close_to_lane);
     assign_to_dict(dict, "lane_heading_angle_diff", log->lane_heading_angle_diff);
     assign_to_dict(dict, "lane_lateral_offset", log->lane_lateral_offset);
+
+    npy_intp dims = 5151;
+    PyObject* arr = PyArray_ZEROS(1, &dims, NPY_INT, 0);
+    if (arr == NULL) {
+        return 1;
+    }
+
+    memcpy(PyArray_DATA((PyArrayObject*)arr), collision_counts, sizeof(int)*5151);
+
+    if (PyDict_SetItemString(dict, "collision_counts", arr) == -1) {
+        PyErr_SetString(PyExc_RuntimeError, "failed to set collision counts in dictionary");
+        return 1;
+    }
+
     return 0;
 }

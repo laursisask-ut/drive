@@ -28,6 +28,7 @@ import torch
 import torch.distributed
 from torch.distributed.elastic.multiprocessing.errors import record
 import torch.utils.cpp_extension
+import wandb
 
 import pufferlib
 import pufferlib.sweep
@@ -219,6 +220,7 @@ class PuffeRL:
         self.stats = defaultdict(list)
         self.val_stats = defaultdict(list)
         self.last_stats = defaultdict(list)
+        self.collision_counts = np.zeros((5151,), np.int32)
         self.losses = {}
 
         self.validation_env = Drive(
@@ -332,8 +334,9 @@ class PuffeRL:
             profile("eval_misc", epoch)
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
-                    if isinstance(v, np.ndarray):
-                        v = v.tolist()
+                    if k == "collision_counts":
+                        self.collision_counts += v
+                        print(self.collision_counts)
                     elif isinstance(v, (list, tuple)):
                         self.stats[k].extend(v)
                     else:
@@ -683,6 +686,9 @@ class PuffeRL:
             # **{f'performance/{k}': dist_sum(v['elapsed'], device) for k, v in self.profile},
         }
 
+        if self.epoch % config["table_metrics_interval"] == 0:
+            logs["collision_counts"] = self.create_collision_counts_table()
+
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 self.logger.log(logs, agent_steps)
@@ -692,6 +698,17 @@ class PuffeRL:
 
         self.logger.log(logs, agent_steps)
         return logs
+
+    def create_collision_counts_table(self):
+        data = []
+        i = 0
+        for coef1 in range(0, 101):
+            for coef2 in range(coef1, 101):
+                data.append([coef1/100, coef2/100, self.collision_counts[i]])
+                i += 1
+        self.collision_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["collision_coef1", "collision_coef2", "n"], log_mode="MUTABLE")
 
     def close(self):
         self.vecenv.close()
@@ -751,8 +768,8 @@ class PuffeRL:
 
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
-                    if isinstance(v, np.ndarray):
-                        v = v.tolist()
+                    if k == "collision_counts":
+                        continue
                     elif isinstance(v, (list, tuple)):
                         self.val_stats[k].extend(v)
                     else:
