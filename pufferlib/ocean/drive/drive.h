@@ -94,7 +94,7 @@ static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 
 // Classic action space (for CLASSIC dynamics model)
 static const float ACCELERATION_VALUES[7] = {-4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f};
-static const float STEERING_VALUES[13] = {-0.833f, -0.667f, -0.500f, -0.333f, -0.167f, -0.035f, 0.000f, 0.035f, 0.167f, 0.333f, 0.500f, 0.667f, 0.833f};
+static const float STEERING_VALUES[13] = {-0.667f, -0.500f, -0.333f, -0.167f, -0.08f, -0.035f, 0.000f, 0.035f, 0.08f, 0.167f, 0.333f, 0.500f, 0.667f};
 
 static const float offsets[4][2] = {
         {-1, 1},  // top-left
@@ -2325,13 +2325,13 @@ void compute_observations(Drive* env) {
 
         int remaining_goals;
         if (ego_entity->multi_goal_count > 0) {
-            remaining_goals = ego_entity->multi_goal_count - ego_entity->multi_goal_idx;
+            remaining_goals = min(ego_entity->multi_goal_count - ego_entity->multi_goal_idx, 3);
         } else if (ego_entity->reached_final_goal) {
             remaining_goals = 0;
         } else {
             remaining_goals = 1;
         }
-        obs[19] = remaining_goals / 10.0f;
+        obs[19] = (remaining_goals - 1) / 2.0f;
 
         if (env->dynamics_model == JERK) {
             obs[20] = ego_entity->steering_angle / M_PI;

@@ -32,8 +32,8 @@ static const float DISPLAY_ACCELERATION_VALUES[7] = {
 };
 
 static const float DISPLAY_STEERING_VALUES[13] = {
-    -0.833f, -0.667f, -0.500f, -0.333f, -0.167f, -0.035f, 0.000f,
-    0.035f, 0.167f, 0.333f, 0.500f, 0.667f, 0.833f,
+    -0.667f, -0.500f, -0.333f, -0.167f, -0.035f, -0.08f, 0.000f,
+    0.08f, 0.035f, 0.167f, 0.333f, 0.500f, 0.667f,
 };
 
 static int write_all(int fd, const unsigned char *buf, size_t len) {
