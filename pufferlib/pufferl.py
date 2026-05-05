@@ -58,6 +58,22 @@ signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 # Assume advantage kernel has been built if CUDA compiler is available
 ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
+TABLE_METRIC_KEYS = {
+    "collision_counts",
+    "offroad_counts",
+    "comfort_violation_counts",
+    "lane_center_offset_counts",
+    "acceleration_action_counts",
+    "steering_action_counts",
+    "speed_counts",
+}
+
+DRIVE_CLASSIC_ACCELERATION_VALUES = [-4.0, -2.667, -1.333, 0.0, 1.333, 2.667, 4.0]
+DRIVE_CLASSIC_STEERING_VALUES = [
+    -0.667, -0.5, -0.333, -0.167, -0.08, -0.035, 0.0,
+    0.035, 0.08, 0.167, 0.333, 0.5, 0.667,
+]
+
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
@@ -220,7 +236,14 @@ class PuffeRL:
         self.stats = defaultdict(list)
         self.val_stats = defaultdict(list)
         self.last_stats = defaultdict(list)
-        self.collision_counts = np.zeros((5151,), np.int32)
+        self.collision_counts = np.zeros((5151,), np.int64)
+        self.offroad_counts = np.zeros((100,), np.int64)
+        self.comfort_violation_counts = np.zeros((100,), np.int64)
+        self.lane_center_offset_counts = np.zeros((10000,), np.int64)
+        self.acceleration_action_counts = np.zeros((7,), np.int64)
+        self.steering_action_counts = np.zeros((13,), np.int64)
+        self.speed_counts = np.zeros((100,), np.int64)
+        self.last_table_metrics_sent_epoch = 0
         self.losses = {}
 
         self.validation_env = Drive(
@@ -248,6 +271,30 @@ class PuffeRL:
             return 0
 
         return (self.global_step - self.last_log_step) / (time.time() - self.last_log_time)
+
+    def accumulate_table_metric(self, key, value):
+        if key == "collision_counts":
+            self.collision_counts += value
+            return True
+        if key == "offroad_counts":
+            self.offroad_counts += value
+            return True
+        if key == "comfort_violation_counts":
+            self.comfort_violation_counts += value
+            return True
+        if key == "lane_center_offset_counts":
+            self.lane_center_offset_counts += value
+            return True
+        if key == "acceleration_action_counts":
+            self.acceleration_action_counts += value
+            return True
+        if key == "steering_action_counts":
+            self.steering_action_counts += value
+            return True
+        if key == "speed_counts":
+            self.speed_counts += value
+            return True
+        return False
 
     def evaluate(self):
         profile = self.profile
@@ -334,9 +381,8 @@ class PuffeRL:
             profile("eval_misc", epoch)
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
-                    if k == "collision_counts":
-                        self.collision_counts += v
-                        print(self.collision_counts)
+                    if self.accumulate_table_metric(k, v):
+                        continue
                     elif isinstance(v, (list, tuple)):
                         self.stats[k].extend(v)
                     else:
@@ -686,8 +732,15 @@ class PuffeRL:
             # **{f'performance/{k}': dist_sum(v['elapsed'], device) for k, v in self.profile},
         }
 
-        if self.epoch % config["table_metrics_interval"] == 0:
+        if self.epoch - self.last_table_metrics_sent_epoch >= config["table_metrics_interval"]:
             logs["collision_counts"] = self.create_collision_counts_table()
+            logs["offroad_counts"] = self.create_offroad_counts_table()
+            logs["comfort_violation_counts"] = self.create_comfort_violation_counts_table()
+            logs["lane_center_offset_counts"] = self.create_lane_center_offset_counts_table()
+            logs["acceleration_action_counts"] = self.create_acceleration_action_counts_table()
+            logs["steering_action_counts"] = self.create_steering_action_counts_table()
+            logs["speed_counts"] = self.create_speed_counts_table()
+            self.last_table_metrics_sent_epoch = self.epoch
 
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
@@ -709,6 +762,59 @@ class PuffeRL:
         self.collision_counts[:] = 0
 
         return wandb.Table(data=data, columns=["collision_coef1", "collision_coef2", "n"], log_mode="MUTABLE")
+
+    def create_offroad_counts_table(self):
+        data = []
+        for coef_bin in range(100):
+            data.append([coef_bin / 100, self.offroad_counts[coef_bin]])
+        self.offroad_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["offroad_coefficient", "n"], log_mode="MUTABLE")
+
+    def create_comfort_violation_counts_table(self):
+        data = []
+        for coef_bin in range(100):
+            data.append([coef_bin / 10000, self.comfort_violation_counts[coef_bin]])
+        self.comfort_violation_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["comfort_coefficient", "n"], log_mode="MUTABLE")
+
+    def create_lane_center_offset_counts_table(self):
+        data = []
+        i = 0
+        for lateral_offset_bin in range(100):
+            lateral_offset = -2.0 + lateral_offset_bin * 4.0 / 100
+            for lane_center_bias_bin in range(100):
+                lane_center_bias = -0.3 + lane_center_bias_bin * 0.6 / 100
+                data.append([lateral_offset, lane_center_bias, self.lane_center_offset_counts[i]])
+                i += 1
+        self.lane_center_offset_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["lateral_offset", "lane_center_bias", "n"], log_mode="MUTABLE")
+
+    def create_acceleration_action_counts_table(self):
+        data = []
+        for action, acceleration in enumerate(DRIVE_CLASSIC_ACCELERATION_VALUES):
+            data.append([action, acceleration, self.acceleration_action_counts[action]])
+        self.acceleration_action_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["action", "acceleration", "n"], log_mode="MUTABLE")
+
+    def create_steering_action_counts_table(self):
+        data = []
+        for action, steering in enumerate(DRIVE_CLASSIC_STEERING_VALUES):
+            data.append([action, steering, self.steering_action_counts[action]])
+        self.steering_action_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["action", "steering", "n"], log_mode="MUTABLE")
+
+    def create_speed_counts_table(self):
+        data = []
+        for speed_bin in range(100):
+            data.append([speed_bin / 100, self.speed_counts[speed_bin]])
+        self.speed_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["speed_fraction", "n"], log_mode="MUTABLE")
 
     def close(self):
         self.vecenv.close()
@@ -768,7 +874,7 @@ class PuffeRL:
 
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
-                    if k == "collision_counts":
+                    if k in TABLE_METRIC_KEYS:
                         continue
                     elif isinstance(v, (list, tuple)):
                         self.val_stats[k].extend(v)

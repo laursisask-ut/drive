@@ -280,7 +280,34 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     return 0;
 }
 
-static int my_log(PyObject* dict, Log* log, int* collision_counts) {
+static int assign_int_array_to_dict(PyObject* dict, const char* key, int* values, npy_intp size) {
+    PyObject* arr = PyArray_ZEROS(1, &size, NPY_INT, 0);
+    if (arr == NULL) {
+        return 1;
+    }
+
+    memcpy(PyArray_DATA((PyArrayObject*)arr), values, sizeof(int)*size);
+
+    if (PyDict_SetItemString(dict, key, arr) == -1) {
+        Py_DECREF(arr);
+        PyErr_Format(PyExc_RuntimeError, "failed to set %s in dictionary", key);
+        return 1;
+    }
+
+    Py_DECREF(arr);
+    return 0;
+}
+
+static int my_log(
+    PyObject* dict,
+    Log* log,
+    int* collision_counts,
+    int* offroad_counts,
+    int* comfort_violation_counts,
+    int* lane_center_offset_counts,
+    int* acceleration_action_counts,
+    int* steering_action_counts,
+    int* speed_counts) {
     assign_to_dict(dict, "n", log->n);
     assign_to_dict(dict, "offroad_rate", log->offroad_rate);
     assign_to_dict(dict, "episode_length", log->episode_length);
@@ -309,16 +336,25 @@ static int my_log(PyObject* dict, Log* log, int* collision_counts) {
     assign_to_dict(dict, "lane_heading_angle_diff", log->lane_heading_angle_diff);
     assign_to_dict(dict, "lane_lateral_offset", log->lane_lateral_offset);
 
-    npy_intp dims = 5151;
-    PyObject* arr = PyArray_ZEROS(1, &dims, NPY_INT, 0);
-    if (arr == NULL) {
+    if (assign_int_array_to_dict(dict, "collision_counts", collision_counts, COLLISION_COUNT_BUCKETS)) {
         return 1;
     }
-
-    memcpy(PyArray_DATA((PyArrayObject*)arr), collision_counts, sizeof(int)*5151);
-
-    if (PyDict_SetItemString(dict, "collision_counts", arr) == -1) {
-        PyErr_SetString(PyExc_RuntimeError, "failed to set collision counts in dictionary");
+    if (assign_int_array_to_dict(dict, "offroad_counts", offroad_counts, COEFFICIENT_COUNT_BINS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "comfort_violation_counts", comfort_violation_counts, COEFFICIENT_COUNT_BINS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "lane_center_offset_counts", lane_center_offset_counts, LANE_CENTER_OFFSET_BUCKETS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "acceleration_action_counts", acceleration_action_counts, CLASSIC_ACCELERATION_ACTION_BINS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "steering_action_counts", steering_action_counts, CLASSIC_STEERING_ACTION_BINS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "speed_counts", speed_counts, SPEED_COUNT_BINS)) {
         return 1;
     }
 

@@ -606,7 +606,7 @@ def generate_map():
         ent.comfort_reward_coefficient = random.uniform(0, 0.01)
         ent.lane_align_reward_coefficient = random.uniform(2.5e-5, 2.5e-3)
         ent.collision_reward_coefficient = random.uniform(0, 1.0)
-        ent.offroad_reward_coefficient = random.uniform(0, 0.5) if random.random() < 0.5 else 1.0
+        ent.offroad_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
         ent.mark_as_expert = 0

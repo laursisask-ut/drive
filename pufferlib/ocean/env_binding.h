@@ -3,7 +3,16 @@
 #include <numpy/arrayobject.h>
 
 // Forward declarations for env-specific functions supplied by user
-static int my_log(PyObject* dict, Log* log, int* collision_counts);
+static int my_log(
+    PyObject* dict,
+    Log* log,
+    int* collision_counts,
+    int* offroad_counts,
+    int* comfort_violation_counts,
+    int* lane_center_offset_counts,
+    int* acceleration_action_counts,
+    int* steering_action_counts,
+    int* speed_counts);
 static int my_init(Env* env, PyObject* args, PyObject* kwargs);
 
 static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs);
@@ -572,22 +581,61 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     // horribly if Log has non-float data.
     Log aggregate = {0};
     int num_keys = sizeof(Log) / sizeof(float);
-    int collision_counts[5151];
-    memset(collision_counts, 0, sizeof(int)*5151);
+    int collision_counts[COLLISION_COUNT_BUCKETS];
+    int offroad_counts[COEFFICIENT_COUNT_BINS];
+    int comfort_violation_counts[COEFFICIENT_COUNT_BINS];
+    int lane_center_offset_counts[LANE_CENTER_OFFSET_BUCKETS];
+    int acceleration_action_counts[CLASSIC_ACCELERATION_ACTION_BINS];
+    int steering_action_counts[CLASSIC_STEERING_ACTION_BINS];
+    int speed_counts[SPEED_COUNT_BINS];
+    memset(collision_counts, 0, sizeof(int)*COLLISION_COUNT_BUCKETS);
+    memset(offroad_counts, 0, sizeof(int)*COEFFICIENT_COUNT_BINS);
+    memset(comfort_violation_counts, 0, sizeof(int)*COEFFICIENT_COUNT_BINS);
+    memset(lane_center_offset_counts, 0, sizeof(int)*LANE_CENTER_OFFSET_BUCKETS);
+    memset(acceleration_action_counts, 0, sizeof(int)*CLASSIC_ACCELERATION_ACTION_BINS);
+    memset(steering_action_counts, 0, sizeof(int)*CLASSIC_STEERING_ACTION_BINS);
+    memset(speed_counts, 0, sizeof(int)*SPEED_COUNT_BINS);
     for (int i = 0; i < vec->num_envs; i++) {
         Env* env = vec->envs[i];
         for (int j = 0; j < num_keys; j++) {
             ((float*)&aggregate)[j] += ((float*)&env->log)[j];
             ((float*)&env->log)[j] = 0.0f;
         }
-        for (int j = 0; j < 5151; j++) {
-            collision_counts[j] += env->collision_counts[j];
-        }
     }
 
     PyObject* dict = PyDict_New();
     if (aggregate.n == 0.0f) {
         return dict;
+    }
+
+    for (int i = 0; i < vec->num_envs; i++) {
+        Env* env = vec->envs[i];
+        for (int j = 0; j < COLLISION_COUNT_BUCKETS; j++) {
+            collision_counts[j] += env->collision_counts[j];
+            env->collision_counts[j] = 0;
+        }
+        for (int j = 0; j < COEFFICIENT_COUNT_BINS; j++) {
+            offroad_counts[j] += env->offroad_counts[j];
+            comfort_violation_counts[j] += env->comfort_violation_counts[j];
+            env->offroad_counts[j] = 0;
+            env->comfort_violation_counts[j] = 0;
+        }
+        for (int j = 0; j < SPEED_COUNT_BINS; j++) {
+            speed_counts[j] += env->speed_counts[j];
+            env->speed_counts[j] = 0;
+        }
+        for (int j = 0; j < LANE_CENTER_OFFSET_BUCKETS; j++) {
+            lane_center_offset_counts[j] += env->lane_center_offset_counts[j];
+            env->lane_center_offset_counts[j] = 0;
+        }
+        for (int j = 0; j < CLASSIC_ACCELERATION_ACTION_BINS; j++) {
+            acceleration_action_counts[j] += env->acceleration_action_counts[j];
+            env->acceleration_action_counts[j] = 0;
+        }
+        for (int j = 0; j < CLASSIC_STEERING_ACTION_BINS; j++) {
+            steering_action_counts[j] += env->steering_action_counts[j];
+            env->steering_action_counts[j] = 0;
+        }
     }
 
     // Average
@@ -597,7 +645,16 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     }
 
     // User populates dict
-    my_log(dict, &aggregate, collision_counts);
+    my_log(
+        dict,
+        &aggregate,
+        collision_counts,
+        offroad_counts,
+        comfort_violation_counts,
+        lane_center_offset_counts,
+        acceleration_action_counts,
+        steering_action_counts,
+        speed_counts);
     assign_to_dict(dict, "n", n);
 
     return dict;

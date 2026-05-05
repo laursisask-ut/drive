@@ -88,6 +88,16 @@
 #define REWARD_COMPONENT_VELOCITY 6
 #define REWARD_COMPONENT_ADE 7
 
+#define COLLISION_COUNT_BINS 101
+#define COLLISION_COUNT_BUCKETS 5151
+#define COEFFICIENT_COUNT_BINS 100
+#define LANE_CENTER_BIAS_BINS 100
+#define LATERAL_OFFSET_BINS 100
+#define LANE_CENTER_OFFSET_BUCKETS (LANE_CENTER_BIAS_BINS * LATERAL_OFFSET_BINS)
+#define CLASSIC_ACCELERATION_ACTION_BINS 7
+#define CLASSIC_STEERING_ACTION_BINS 13
+#define SPEED_COUNT_BINS 100
+
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
@@ -330,6 +340,12 @@ struct Drive {
     Log log;
     Log* logs;
     int* collision_counts;
+    int* offroad_counts;
+    int* comfort_violation_counts;
+    int* lane_center_offset_counts;
+    int* acceleration_action_counts;
+    int* steering_action_counts;
+    int* speed_counts;
     int num_agents;
     int active_agent_count;
     int* active_agent_indices;
@@ -541,8 +557,67 @@ static inline void record_reward_component(Drive* env, int agent_slot, int compo
     }
 }
 
+static inline int clipped_scaled_bin(float value, float scale, int bin_count) {
+    if (!isfinite(value)) {
+        return 0;
+    }
+
+    int bin = (int)(value * scale);
+    if (bin < 0) {
+        return 0;
+    }
+    if (bin >= bin_count) {
+        return bin_count - 1;
+    }
+    return bin;
+}
+
+static inline int clipped_range_bin(float value, float min_value, float max_value, int bin_count) {
+    if (!isfinite(value) || value <= min_value) {
+        return 0;
+    }
+    if (value >= max_value) {
+        return bin_count - 1;
+    }
+
+    float scale = (float)bin_count / (max_value - min_value);
+    int bin = (int)((value - min_value) * scale);
+    if (bin < 0) {
+        return 0;
+    }
+    if (bin >= bin_count) {
+        return bin_count - 1;
+    }
+    return bin;
+}
+
+static inline void record_lane_center_offset_count(Drive* env, float lateral_offset, float lane_center_bias) {
+    int lateral_offset_bin = clipped_range_bin(lateral_offset, -2.0f, 2.0f, LATERAL_OFFSET_BINS);
+    int lane_center_bias_bin = clipped_range_bin(lane_center_bias, -0.3f, 0.3f, LANE_CENTER_BIAS_BINS);
+    int joint_bin_idx = lateral_offset_bin * LANE_CENTER_BIAS_BINS + lane_center_bias_bin;
+    env->lane_center_offset_counts[joint_bin_idx]++;
+}
+
+static inline void record_speed_count(Drive* env, Entity* agent) {
+    float max_speed = MAX_SPEED;
+    if (agent->max_speed > 0.0f && agent->max_speed < MAX_SPEED) {
+        max_speed = agent->max_speed;
+    }
+
+    float speed = sqrtf(agent->vx*agent->vx + agent->vy*agent->vy);
+    int speed_bin = clipped_scaled_bin(speed / max_speed, 100.0f, SPEED_COUNT_BINS);
+    env->speed_counts[speed_bin]++;
+}
+
 static inline void record_discrete_classic_action(
     Drive* env, int agent_slot, int acceleration_index, int steering_index) {
+    if (acceleration_index >= 0 && acceleration_index < CLASSIC_ACCELERATION_ACTION_BINS) {
+        env->acceleration_action_counts[acceleration_index]++;
+    }
+    if (steering_index >= 0 && steering_index < CLASSIC_STEERING_ACTION_BINS) {
+        env->steering_action_counts[steering_index]++;
+    }
+
     if (!env->export_replay_enabled ||
         env->export_log.action_indices == NULL ||
         env->timestep >= MAX_EXPORT_STEPS) {
@@ -747,7 +822,7 @@ void set_start_position(Drive* env){
         e->metrics_array[REACHED_GOAL_IDX] = 0.0f; // reached goal
         e->metrics_array[LANE_ALIGNED_IDX] = 0.0f; // lane aligned
         e->metrics_array[AVG_DISPLACEMENT_ERROR_IDX] = 0.0f; // avg displacement error
-        e->metrics_array[LANE_LATERAL_OFFSET_IDX] = -1.0f;
+        e->metrics_array[LANE_LATERAL_OFFSET_IDX] = -100.0f;
         e->cumulative_displacement = 0.0f;
         e->displacement_sample_count = 0;
         e->respawn_timestep = -1;
@@ -1339,7 +1414,7 @@ int check_lane_aligned(Entity* car, Entity* lane, int geometry_idx) {
 }
 
 float compute_lane_lateral_offset(Entity* car, Entity* lane, int geometry_idx) {
-    if (lane->array_size < 3) return -1.0f;
+    if (lane->array_size < 3) return -100.0f;
 
     if (geometry_idx == 0) {
         geometry_idx++;
@@ -1350,12 +1425,12 @@ float compute_lane_lateral_offset(Entity* car, Entity* lane, int geometry_idx) {
     float lane_dx = lane->traj_x[geometry_idx + 1] - lane->traj_x[geometry_idx - 1];
     float lane_dy = lane->traj_y[geometry_idx + 1] - lane->traj_y[geometry_idx - 1];
     float lane_len = sqrtf(lane_dx * lane_dx + lane_dy * lane_dy);
-    if (lane_len < 1e-9f) return -1.0f;
+    if (lane_len < 1e-9f) return -100.0f;
 
     float car_dx = car->x - lane->traj_x[geometry_idx - 1];
     float car_dy = car->y - lane->traj_y[geometry_idx - 1];
 
-    return fabsf(car_dx * lane_dy - car_dy * lane_dx) / lane_len;
+    return (car_dx * lane_dy - car_dy * lane_dx) / lane_len;
 }
 
 void reset_agent_metrics(Drive* env, int agent_idx){
@@ -1364,7 +1439,7 @@ void reset_agent_metrics(Drive* env, int agent_idx){
     agent->metrics_array[OFFROAD_IDX] = 0.0f; // offroad
     agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f; // lane aligned
     agent->metrics_array[AVG_DISPLACEMENT_ERROR_IDX] = 0.0f;
-    agent->metrics_array[LANE_LATERAL_OFFSET_IDX] = -1.0f;
+    agent->metrics_array[LANE_LATERAL_OFFSET_IDX] = -100.0f;
     agent->collision_state = 0;
 }
 
@@ -1518,7 +1593,7 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
     // 4.0m threshold: agents more than 4 meters from any lane are considered off-road
     if (min_distance > 4.0f || closest_lane_entity_idx == -1) {
         agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f;
-        agent->metrics_array[LANE_LATERAL_OFFSET_IDX] = -1.0f;
+        agent->metrics_array[LANE_LATERAL_OFFSET_IDX] = -100.0f;
         agent->current_lane_idx = -1;
     } else {
         agent->current_lane_idx = closest_lane_entity_idx;
@@ -1846,8 +1921,13 @@ void init(Drive* env){
     set_start_position(env);
     init_goal_positions(env);
     env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
-    int collision_buckets = 5151;
-    env->collision_counts = (int*)calloc(collision_buckets, sizeof(int));
+    env->collision_counts = (int*)calloc(COLLISION_COUNT_BUCKETS, sizeof(int));
+    env->offroad_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
+    env->comfort_violation_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
+    env->lane_center_offset_counts = (int*)calloc(LANE_CENTER_OFFSET_BUCKETS, sizeof(int));
+    env->acceleration_action_counts = (int*)calloc(CLASSIC_ACCELERATION_ACTION_BINS, sizeof(int));
+    env->steering_action_counts = (int*)calloc(CLASSIC_STEERING_ACTION_BINS, sizeof(int));
+    env->speed_counts = (int*)calloc(SPEED_COUNT_BINS, sizeof(int));
 }
 
 static void saveAgentObservationsReplayToFile(Drive* env) {
@@ -2029,6 +2109,12 @@ void c_close(Drive* env){
     free(env->active_agent_indices);
     free(env->logs);
     free(env->collision_counts);
+    free(env->offroad_counts);
+    free(env->comfort_violation_counts);
+    free(env->lane_center_offset_counts);
+    free(env->acceleration_action_counts);
+    free(env->steering_action_counts);
+    free(env->speed_counts);
     // GridMap cleanup
     int grid_cell_count = env->grid_map->grid_cols*env->grid_map->grid_rows;
     for(int grid_index = 0; grid_index < grid_cell_count; grid_index++){
@@ -2168,7 +2254,13 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 
         float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
 
-        float comfort_reward = -agent->comfort_reward_coefficient * ((acceleration > 3.0f) + (fabsf(a_lat) > 3.0f));
+        int comfort_violations = (acceleration > 3.0f) + (fabsf(a_lat) > 3.0f);
+        if (comfort_violations > 0) {
+            int comfort_bin = clipped_scaled_bin(agent->comfort_reward_coefficient, 10000.0f, COEFFICIENT_COUNT_BINS);
+            env->comfort_violation_counts[comfort_bin] += comfort_violations;
+        }
+
+        float comfort_reward = -agent->comfort_reward_coefficient * comfort_violations;
         env->rewards[action_idx] += comfort_reward;
         record_reward_component(env, action_idx, REWARD_COMPONENT_COMFORT, comfort_reward);
     } else {
@@ -2314,7 +2406,11 @@ void compute_observations(Drive* env) {
         obs[12] = ego_entity->lane_center_bias / 0.5f;
 
         obs[13] = ego_entity->lane_heading_angle_diff;
-        obs[14] = ego_entity->metrics_array[LANE_LATERAL_OFFSET_IDX] / 4.0f;
+        if (ego_entity->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f) {
+            obs[14] = ego_entity->metrics_array[LANE_LATERAL_OFFSET_IDX] / 4.0f;
+        } else {
+            obs[14] = 0.0f;
+        }
         obs[15] = ego_entity->height / MAX_VEH_HEIGHT;
 
         int next_goal_idx = ego_entity->multi_goal_idx + 1;
@@ -2717,9 +2813,10 @@ void c_step(Drive* env){
     // Process actions for all active agents
     for(int i = 0; i < env->active_agent_count; i++){
         env->logs[i].score = 0.0f;
-	    env->logs[i].episode_length += 1;
+        env->logs[i].episode_length += 1;
         int agent_idx = env->active_agent_indices[i];
         move_dynamics(env, i, agent_idx);
+        record_speed_count(env, &env->entities[agent_idx]);
     }
     for(int i = 0; i < env->active_agent_count; i++){
         int agent_idx = env->active_agent_indices[i];
@@ -2748,10 +2845,9 @@ void c_step(Drive* env){
                 float coef1 = fminf(e->collision_reward_coefficient, env->entities[e->collided_with_agent_idx].collision_reward_coefficient);
                 float coef2 = fmaxf(e->collision_reward_coefficient, env->entities[e->collided_with_agent_idx].collision_reward_coefficient);
 
-                // Bins are 0, 0.01, 0.02, ..., 1.00
-                int coef1_bin = (int) (coef1 * 100);
-                int coef2_bin = (int) (coef2 * 100);
-                int joint_bin_idx = coef1_bin * 101 + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
+                int coef1_bin = clipped_scaled_bin(coef1, 100.0f, COLLISION_COUNT_BINS);
+                int coef2_bin = clipped_scaled_bin(coef2, 100.0f, COLLISION_COUNT_BINS);
+                int joint_bin_idx = coef1_bin * COLLISION_COUNT_BINS + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
                 env->collision_counts[joint_bin_idx]++;
 
             } else if (collision_state == OFFROAD && prev_collision_state != OFFROAD) {
@@ -2761,7 +2857,9 @@ void c_step(Drive* env){
                 env->logs[i].offroad_rate = 1.0f;
                 record_reward_component(env, i, REWARD_COMPONENT_OFFROAD, offroad_reward);
                 env->logs[i].avg_offroad_per_agent += 1.0f;
-                if (e->offroad_reward_coefficient >= 1.0f) {
+                int offroad_bin = clipped_scaled_bin(e->offroad_reward_coefficient, 100.0f, COEFFICIENT_COUNT_BINS);
+                env->offroad_counts[offroad_bin]++;
+                if (e->offroad_reward_coefficient >= 0.5f) {
                     env->terminals[i] = 1;
                 }
             }
@@ -2776,14 +2874,17 @@ void c_step(Drive* env){
 
         env->logs[i].lane_alignment_rate += lane_aligned;
 
-        if (lateral_offset >= 0.0f && lane_heading_angle_diff < M_PI/3.0f) {
+        if (lateral_offset > -100.0f && lane_heading_angle_diff < M_PI/3.0f) {
             float lane_center_reward = e->lane_center_reward_coefficient * (-fabsf(e->lane_center_bias - lateral_offset) + 0.05f / expf(fabsf(lateral_offset - e->lane_center_bias) - 0.5f));
             env->rewards[i] += lane_center_reward;
             record_reward_component(env, i, REWARD_COMPONENT_LANE_CENTER, lane_center_reward);
+            if (e->lane_center_reward_coefficient > 0.0f) {
+                record_lane_center_offset_count(env, lateral_offset, e->lane_center_bias);
+            }
         }
 
-        if (lateral_offset >= 0.0f) {
-            env->logs[i].lane_lateral_offset += lateral_offset;
+        if (lateral_offset > -100.0f) {
+            env->logs[i].lane_lateral_offset += fabsf(lateral_offset);
             env->logs[i].lane_heading_angle_diff += lane_heading_angle_diff;
             env->logs[i].close_to_lane += 1.0f;
 
