@@ -7,6 +7,8 @@ static int my_log(
     PyObject* dict,
     Log* log,
     int* collision_counts,
+    int* expert_collision_counts,
+    int* blind_vehicle_collision_counts,
     int* offroad_counts,
     int* comfort_violation_counts,
     int* lane_center_offset_counts,
@@ -582,6 +584,8 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     Log aggregate = {0};
     int num_keys = sizeof(Log) / sizeof(float);
     int collision_counts[COLLISION_COUNT_BUCKETS];
+    int expert_collision_counts[COEFFICIENT_COUNT_BINS];
+    int blind_vehicle_collision_counts[COEFFICIENT_COUNT_BINS];
     int offroad_counts[COEFFICIENT_COUNT_BINS];
     int comfort_violation_counts[COEFFICIENT_COUNT_BINS];
     int lane_center_offset_counts[LANE_CENTER_OFFSET_BUCKETS];
@@ -589,6 +593,8 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
     int steering_action_counts[CLASSIC_STEERING_ACTION_BINS];
     int speed_counts[SPEED_COUNT_BINS];
     memset(collision_counts, 0, sizeof(int)*COLLISION_COUNT_BUCKETS);
+    memset(expert_collision_counts, 0, sizeof(int)*COEFFICIENT_COUNT_BINS);
+    memset(blind_vehicle_collision_counts, 0, sizeof(int)*COEFFICIENT_COUNT_BINS);
     memset(offroad_counts, 0, sizeof(int)*COEFFICIENT_COUNT_BINS);
     memset(comfort_violation_counts, 0, sizeof(int)*COEFFICIENT_COUNT_BINS);
     memset(lane_center_offset_counts, 0, sizeof(int)*LANE_CENTER_OFFSET_BUCKETS);
@@ -615,8 +621,12 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
             env->collision_counts[j] = 0;
         }
         for (int j = 0; j < COEFFICIENT_COUNT_BINS; j++) {
+            expert_collision_counts[j] += env->expert_collision_counts[j];
+            blind_vehicle_collision_counts[j] += env->blind_vehicle_collision_counts[j];
             offroad_counts[j] += env->offroad_counts[j];
             comfort_violation_counts[j] += env->comfort_violation_counts[j];
+            env->expert_collision_counts[j] = 0;
+            env->blind_vehicle_collision_counts[j] = 0;
             env->offroad_counts[j] = 0;
             env->comfort_violation_counts[j] = 0;
         }
@@ -649,6 +659,8 @@ static PyObject* vec_log(PyObject* self, PyObject* args) {
         dict,
         &aggregate,
         collision_counts,
+        expert_collision_counts,
+        blind_vehicle_collision_counts,
         offroad_counts,
         comfort_violation_counts,
         lane_center_offset_counts,

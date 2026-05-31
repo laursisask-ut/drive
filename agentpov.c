@@ -354,7 +354,7 @@ int main(int argc, char *argv[]) {
     const int other_agent_count = 63;
     const int road_segment_count = 200;
     int ego_dim = max_obs - other_agent_count * 7 - road_segment_count * 7;
-    if (ego_dim != 19 && ego_dim != 20 && ego_dim != 22 && ego_dim != 23) {
+    if (ego_dim != 20 && ego_dim != 23) {
         fprintf(stderr, "invalid replay layout: max_obs=%d inferred ego_dim=%d\n", max_obs, ego_dim);
         free(obs_buf);
         free(reward_values);
@@ -440,6 +440,7 @@ int main(int argc, char *argv[]) {
         float next_goal_y = obs[t][17] / 0.005f;
         float goal_radius = obs[t][18] * 3.0f;
         float collision_reward_coefficient = obs[t][EGO_OBS_COLLISION_REWARD_COEFFICIENT_IDX];
+        int remaining_goals = (int)roundf(obs[t][19] * 2.0f + 1.0f);
 
         DrawCircleLines(goal_x, goal_y, goal_radius, DARKGREEN);
         DrawCircleLines(next_goal_x, next_goal_y, goal_radius, ORANGE);
@@ -541,7 +542,13 @@ int main(int argc, char *argv[]) {
             DrawText("Acceleration action: N/A", 10, 102, 18, WHITE);
         }
 
-        DrawText(TextFormat("Road points: %d", valid_road_points), 10, 125, 18, WHITE);
+        if (remaining_goals >= 3) {
+            DrawText("Goals remaining: 3+", 10, 125, 18, WHITE);
+        } else {
+            DrawText(TextFormat("Goals remaining: %d", remaining_goals), 10, 125, 18, WHITE);
+        }
+
+        DrawText(TextFormat("Road points: %d", valid_road_points), 10, 148, 18, WHITE);
 
         const int table_x = 420;
         const int table_y = 8;

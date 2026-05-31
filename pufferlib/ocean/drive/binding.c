@@ -302,6 +302,8 @@ static int my_log(
     PyObject* dict,
     Log* log,
     int* collision_counts,
+    int* expert_collision_counts,
+    int* blind_vehicle_collision_counts,
     int* offroad_counts,
     int* comfort_violation_counts,
     int* lane_center_offset_counts,
@@ -337,6 +339,12 @@ static int my_log(
     assign_to_dict(dict, "lane_lateral_offset", log->lane_lateral_offset);
 
     if (assign_int_array_to_dict(dict, "collision_counts", collision_counts, COLLISION_COUNT_BUCKETS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "expert_collision_counts", expert_collision_counts, COEFFICIENT_COUNT_BINS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "blind_vehicle_collision_counts", blind_vehicle_collision_counts, COEFFICIENT_COUNT_BINS)) {
         return 1;
     }
     if (assign_int_array_to_dict(dict, "offroad_counts", offroad_counts, COEFFICIENT_COUNT_BINS)) {

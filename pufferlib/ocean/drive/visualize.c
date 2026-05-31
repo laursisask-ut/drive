@@ -266,9 +266,9 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     for (int i = 0; i < env.active_agent_count; i++) {
         Entity* e = &env.entities[env.active_agent_indices[i]];
         e->max_speed = 90/3.6f;
-        e->lane_center_reward_coefficient = 2.5e-5;
-        e->comfort_reward_coefficient = 0.00f;
-        e->lane_align_reward_coefficient = 2.5e-5f;
+        e->lane_center_reward_coefficient = 2.5e-4;
+        e->comfort_reward_coefficient = 0.01f;
+        e->lane_align_reward_coefficient = 2.5e-3f;
         e->collision_reward_coefficient = 1.0f;
         e->offroad_reward_coefficient = 1.0f;
         e->lane_center_bias = 0.0f;

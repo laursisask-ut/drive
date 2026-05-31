@@ -57,7 +57,8 @@
 
 // Max road segment observation entities
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 200
-#define MAX_AGENTS 64
+#define MAX_AGENTS 128
+#define MAX_VISIBLE_AGENTS 64
 // Observation Space Constants
 #define MAX_SPEED 27.7f
 #define MAX_VEH_LEN 30.0f
@@ -222,6 +223,7 @@ struct Entity {
     float collision_reward_coefficient;
     float offroad_reward_coefficient;
     float lane_center_bias;
+    int hide_other_vehicles;
 
     // Jerk dynamics
     float a_long;
@@ -340,6 +342,8 @@ struct Drive {
     Log log;
     Log* logs;
     int* collision_counts;
+    int* expert_collision_counts;
+    int* blind_vehicle_collision_counts;
     int* offroad_counts;
     int* comfort_violation_counts;
     int* lane_center_offset_counts;
@@ -955,7 +959,7 @@ void init_grid_map(Drive* env){
     float bottom_right_y;
     int first_valid_point = 0;
     for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type > 3 && env->entities[i].type < 7){
+        if(env->entities[i].type > 3 && env->entities[i].type <= 8){
             // Check all points in the trajectory for road elements
             Entity* e = &env->entities[i];
             for(int j = 0; j < e->array_size; j++){
@@ -993,7 +997,7 @@ void init_grid_map(Drive* env){
 
     // Calculate number of entities in each grid cell
     for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type > 3 && env->entities[i].type < 7){
+        if(env->entities[i].type > 3 && env->entities[i].type <= 8){
             for(int j = 0; j < env->entities[i].array_size - 1; j++){
                 float x_center = (env->entities[i].traj_x[j] + env->entities[i].traj_x[j+1]) / 2;
                 float y_center = (env->entities[i].traj_y[j] + env->entities[i].traj_y[j+1]) / 2;
@@ -1018,7 +1022,7 @@ void init_grid_map(Drive* env){
 
     // Populate grid cells
     for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type > 3 && env->entities[i].type < 7){         // NOTE: Only Road Edges, Lines, and Lanes in grid map
+        if(env->entities[i].type > 3 && env->entities[i].type <= 8){         // NOTE: Only Road Edges, Lines, and Lanes in grid map
             for(int j = 0; j < env->entities[i].array_size - 1; j++){
                 float x_center = (env->entities[i].traj_x[j] + env->entities[i].traj_x[j+1]) / 2;
                 float y_center = (env->entities[i].traj_y[j] + env->entities[i].traj_y[j+1]) / 2;
@@ -1616,6 +1620,7 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
 }
 
 int valid_active_agent(Drive* env, int agent_idx){
+    if (env->entities[agent_idx].traj_valid[env->init_steps] != 1) return 0;
     float cos_heading = cosf(env->entities[agent_idx].traj_heading[0]);
     float sin_heading = sinf(env->entities[agent_idx].traj_heading[0]);
     float goal_x = env->entities[agent_idx].goal_position_x - env->entities[agent_idx].traj_x[0];
@@ -1803,9 +1808,6 @@ legacy_select:
 
         if(!is_type_controllable) continue;
 
-        // Check if agent has valid trajectory point at the initial timestep
-        if(env->entities[i].traj_valid[env->init_steps] != 1) continue;
-
         env->num_controllable_agents++;
 
         // Return current distance to goal if agent meets other conditions
@@ -1851,50 +1853,6 @@ finalize:
     return;
 }
 
-void remove_bad_trajectories(Drive* env){
-    set_start_position(env);
-    int collided_agents[env->active_agent_count];
-    int collided_with_indices[env->active_agent_count];
-    memset(collided_agents, 0, env->active_agent_count * sizeof(int));
-    for (int i = 0; i < env->active_agent_count; ++i) {
-        collided_with_indices[i] = -1;
-    }
-    // move experts through trajectories to check for collisions and remove as illegal agents
-    for(int t = 0; t < env->scenario_length; t++){
-        for(int i = 0; i < env->active_agent_count; i++){
-            int agent_idx = env->active_agent_indices[i];
-            move_expert(env, env->actions, agent_idx);
-        }
-        for(int i = 0; i < env->expert_static_car_count; i++){
-            int expert_idx = env->expert_static_car_indices[i];
-            if(env->entities[expert_idx].x == INVALID_POSITION) continue;
-            move_expert(env, env->actions, expert_idx);
-        }
-        // check collisions
-        for(int i = 0; i < env->active_agent_count; i++){
-            int agent_idx = env->active_agent_indices[i];
-            env->entities[agent_idx].collision_state = 0;
-            int collided_with_index = collision_check(env, agent_idx);
-            if((collided_with_index >= 0) && collided_agents[i] == 0){
-                collided_agents[i] = 1;
-                collided_with_indices[i] = collided_with_index;
-            }
-        }
-        env->timestep++;
-    }
-
-    for(int i = 0; i< env->active_agent_count; i++){
-        if(collided_with_indices[i] == -1) continue;
-        for(int j = 0; j < env->static_car_count; j++){
-            int static_car_idx = env->static_car_indices[j];
-            if(static_car_idx != collided_with_indices[i]) continue;
-            env->entities[static_car_idx].traj_x[0] = INVALID_POSITION;
-            env->entities[static_car_idx].traj_y[0] = INVALID_POSITION;
-        }
-    }
-    env->timestep = 0;
-}
-
 void init_goal_positions(Drive* env){
     for(int x = 0;x<env->active_agent_count; x++){
         int agent_idx = env->active_agent_indices[x];
@@ -1917,11 +1875,12 @@ void init(Drive* env){
     env->logs_capacity = 0;
     set_active_agents(env);
     env->logs_capacity = env->active_agent_count;
-    remove_bad_trajectories(env);
     set_start_position(env);
     init_goal_positions(env);
     env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
     env->collision_counts = (int*)calloc(COLLISION_COUNT_BUCKETS, sizeof(int));
+    env->expert_collision_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
+    env->blind_vehicle_collision_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->offroad_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->comfort_violation_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->lane_center_offset_counts = (int*)calloc(LANE_CENTER_OFFSET_BUCKETS, sizeof(int));
@@ -1932,7 +1891,7 @@ void init(Drive* env){
 
 static void saveAgentObservationsReplayToFile(Drive* env) {
     int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
-    int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
 
     float (*obs)[MAX_EXPORT_STEPS][max_obs] = (float(*)[MAX_EXPORT_STEPS][max_obs]) env->export_log.observations;
     float (*reward_components)[MAX_EXPORT_STEPS][REPLAY_REWARD_COMPONENT_COUNT] =
@@ -2109,6 +2068,8 @@ void c_close(Drive* env){
     free(env->active_agent_indices);
     free(env->logs);
     free(env->collision_counts);
+    free(env->expert_collision_counts);
+    free(env->blind_vehicle_collision_counts);
     free(env->offroad_counts);
     free(env->comfort_violation_counts);
     free(env->lane_center_offset_counts);
@@ -2151,7 +2112,7 @@ void c_close(Drive* env){
 void allocate(Drive* env){
     init(env);
     int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
-    int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
     env->actions = (float*)calloc(env->active_agent_count*2, sizeof(float));
     env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
@@ -2218,15 +2179,8 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 
         // Track signed longitudinal speed so negative acceleration can produce reverse motion.
         float speed = sqrtf(vx*vx + vy*vy);
-        float v_dot_heading = vx * agent->heading_x + vy * agent->heading_y;
-        float signed_speed = copysignf(speed, v_dot_heading);
-        float new_speed = signed_speed + 0.5f * acceleration * env->dt;
-
-        if (signed_speed * new_speed < 0.0f) {
-            new_speed = 0.0f;
-        } else {
-            new_speed = clipSpeed(new_speed, agent);
-        }
+        float new_speed = speed + 0.5f * acceleration * env->dt;
+        new_speed = clipSpeed(new_speed, agent);
 
         // Compute yaw rate
         float beta = tanh(.5*tanf(steering));
@@ -2365,7 +2319,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 
 void compute_observations(Drive* env) {
     int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
-    int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs*env->active_agent_count*sizeof(float));
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
     for(int i = 0; i < env->active_agent_count; i++) {
@@ -2450,7 +2404,7 @@ void compute_observations(Drive* env) {
         // Relative Pos of other cars
         int obs_idx = ego_dim;
         int cars_seen = 0;
-        for(int j = 0; j < MAX_AGENTS; j++) {
+        for(int j = 0; j < MAX_AGENTS && !ego_entity->hide_other_vehicles && cars_seen < MAX_VISIBLE_AGENTS - 1; j++) {
             int index = -1;
             if(j < env->active_agent_count){
                 index = env->active_agent_indices[j];
@@ -2492,7 +2446,7 @@ void compute_observations(Drive* env) {
             cars_seen++;
             obs_idx += 7;  // Move to next observation slot
         }
-        int remaining_partner_obs = (MAX_AGENTS - 1 - cars_seen) * 7;
+        int remaining_partner_obs = (MAX_VISIBLE_AGENTS - 1 - cars_seen) * 7;
         memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
         obs_idx += remaining_partner_obs;
         // map observations
@@ -2710,7 +2664,7 @@ void c_reset(Drive* env){
         env->export_log.heading = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
 
         int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
-        int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+        int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
         env->export_log.observations = calloc(env->active_agent_count * max_obs * MAX_EXPORT_STEPS, sizeof(float));
         env->export_log.reward_components =
             calloc(env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_REWARD_COMPONENT_COUNT, sizeof(float));
@@ -2807,7 +2761,6 @@ void c_step(Drive* env){
     // Move statix experts
     for (int i = 0; i < env->expert_static_car_count; i++) {
         int expert_idx = env->expert_static_car_indices[i];
-        if(env->entities[expert_idx].x == INVALID_POSITION) continue;
         move_expert(env, env->actions, expert_idx);
     }
     // Process actions for all active agents
@@ -2827,7 +2780,7 @@ void c_step(Drive* env){
         int collision_state = env->entities[agent_idx].collision_state;
 
         if(collision_state > 0){
-            if (collision_state == VEHICLE_COLLISION && prev_collision_state != VEHICLE_COLLISION) {
+            if (!e->hide_other_vehicles && collision_state == VEHICLE_COLLISION && prev_collision_state != VEHICLE_COLLISION) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float collision_reward = -e->collision_reward_coefficient * (1 + 0.1 * speed);
                 env->rewards[i] = collision_reward;
@@ -2842,14 +2795,21 @@ void c_step(Drive* env){
                     env->terminals[i] = 1;
                 }
 
-                float coef1 = fminf(e->collision_reward_coefficient, env->entities[e->collided_with_agent_idx].collision_reward_coefficient);
-                float coef2 = fmaxf(e->collision_reward_coefficient, env->entities[e->collided_with_agent_idx].collision_reward_coefficient);
-
-                int coef1_bin = clipped_scaled_bin(coef1, 100.0f, COLLISION_COUNT_BINS);
-                int coef2_bin = clipped_scaled_bin(coef2, 100.0f, COLLISION_COUNT_BINS);
-                int joint_bin_idx = coef1_bin * COLLISION_COUNT_BINS + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
-                env->collision_counts[joint_bin_idx]++;
-
+                Entity* collided_with = &env->entities[e->collided_with_agent_idx];
+                if (collided_with->mark_as_expert) {
+                    int coef_bin = clipped_scaled_bin(e->collision_reward_coefficient, 100.0f, COEFFICIENT_COUNT_BINS);
+                    env->expert_collision_counts[coef_bin]++;
+                } else if (collided_with->hide_other_vehicles) {
+                    int coef_bin = clipped_scaled_bin(e->collision_reward_coefficient, 100.0f, COEFFICIENT_COUNT_BINS);
+                    env->blind_vehicle_collision_counts[coef_bin]++;
+                } else {
+                    float coef1 = fminf(e->collision_reward_coefficient, collided_with->collision_reward_coefficient);
+                    float coef2 = fmaxf(e->collision_reward_coefficient, collided_with->collision_reward_coefficient);
+                    int coef1_bin = clipped_scaled_bin(coef1, 100.0f, COLLISION_COUNT_BINS);
+                    int coef2_bin = clipped_scaled_bin(coef2, 100.0f, COLLISION_COUNT_BINS);
+                    int joint_bin_idx = coef1_bin * COLLISION_COUNT_BINS + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
+                    env->collision_counts[joint_bin_idx]++;
+                }
             } else if (collision_state == OFFROAD && prev_collision_state != OFFROAD) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float offroad_reward = -e->offroad_reward_coefficient * (1 + 0.1 * speed);
@@ -3143,7 +3103,7 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
     }
 
     int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
-    int max_obs = ego_dim + 7*(MAX_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
     float* agent_obs = &observations[agent_index][0];
     // self
@@ -3168,7 +3128,7 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
     }
     // First draw other agent observations
     int obs_idx = ego_dim;  // Start after ego obs
-    for(int j = 0; j < MAX_AGENTS - 1; j++) {
+    for(int j = 0; j < MAX_VISIBLE_AGENTS - 1; j++) {
         if(agent_obs[obs_idx] == 0 || agent_obs[obs_idx + 1] == 0) {
             obs_idx += 7;  // Move to next agent observation
             continue;
@@ -3315,7 +3275,7 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
         obs_idx += 7;  // Move to next agent observation (7 values per agent)
     }
     // Then draw map observations
-    int map_start_idx = ego_dim + 7*(MAX_AGENTS - 1);  // Start after agent observations
+    int map_start_idx = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1);  // Start after agent observations
     for(int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {  // Loop through potential map entities
         int entity_idx = map_start_idx + k*7;
         if(agent_obs[entity_idx] == 0 && agent_obs[entity_idx + 1] == 0){
@@ -3615,6 +3575,7 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                 if (is_expert) car_color = GOLD;      // expert replay
                 if (is_active_agent) car_color = BLUE; // policy-controlled
                 if (is_active_agent && env->entities[i].collision_state > 0) car_color = RED;
+                if (is_active_agent && env->entities[i].hide_other_vehicles) car_color = PINK;
                 rlSetLineWidth(3.0f);
                 for (int j = 0; j < 4; j++) {
                     DrawLine3D(corners[j], corners[(j+1)%4], car_color);
@@ -3688,6 +3649,7 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                     if (!is_active_agent && env->entities[i].mark_as_expert == 1) wire_color = GOLD;  // expert replay
                     if (is_active_agent) wire_color = BLUE;   // policy
                     if (is_active_agent && env->entities[i].collision_state > 0) wire_color = RED;
+                    if (is_active_agent && env->entities[i].hide_other_vehicles) wire_color = PINK;
                     rlSetLineWidth(2.0f);
                     for (int j = 0; j < 4; j++) {
                         DrawLine3D(corners[j], corners[(j+1)%4], wire_color);

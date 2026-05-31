@@ -60,6 +60,8 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
 TABLE_METRIC_KEYS = {
     "collision_counts",
+    "expert_collision_counts",
+    "blind_vehicle_collision_counts",
     "offroad_counts",
     "comfort_violation_counts",
     "lane_center_offset_counts",
@@ -237,6 +239,8 @@ class PuffeRL:
         self.val_stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.collision_counts = np.zeros((5151,), np.int64)
+        self.expert_collision_counts = np.zeros((100,), np.int64)
+        self.blind_vehicle_collision_counts = np.zeros((100,), np.int64)
         self.offroad_counts = np.zeros((100,), np.int64)
         self.comfort_violation_counts = np.zeros((100,), np.int64)
         self.lane_center_offset_counts = np.zeros((10000,), np.int64)
@@ -275,6 +279,12 @@ class PuffeRL:
     def accumulate_table_metric(self, key, value):
         if key == "collision_counts":
             self.collision_counts += value
+            return True
+        if key == "expert_collision_counts":
+            self.expert_collision_counts += value
+            return True
+        if key == "blind_vehicle_collision_counts":
+            self.blind_vehicle_collision_counts += value
             return True
         if key == "offroad_counts":
             self.offroad_counts += value
@@ -734,6 +744,8 @@ class PuffeRL:
 
         if self.epoch - self.last_table_metrics_sent_epoch >= config["table_metrics_interval"]:
             logs["collision_counts"] = self.create_collision_counts_table()
+            logs["expert_collision_counts"] = self.create_expert_collision_counts_table()
+            logs["blind_vehicle_collision_counts"] = self.create_blind_vehicle_collision_counts_table()
             logs["offroad_counts"] = self.create_offroad_counts_table()
             logs["comfort_violation_counts"] = self.create_comfort_violation_counts_table()
             logs["lane_center_offset_counts"] = self.create_lane_center_offset_counts_table()
@@ -762,6 +774,22 @@ class PuffeRL:
         self.collision_counts[:] = 0
 
         return wandb.Table(data=data, columns=["collision_coef1", "collision_coef2", "n"], log_mode="MUTABLE")
+
+    def create_expert_collision_counts_table(self):
+        data = []
+        for coef_bin in range(100):
+            data.append([coef_bin / 100, self.expert_collision_counts[coef_bin]])
+        self.expert_collision_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["collision_coefficient", "n"], log_mode="MUTABLE")
+
+    def create_blind_vehicle_collision_counts_table(self):
+        data = []
+        for coef_bin in range(100):
+            data.append([coef_bin / 100, self.blind_vehicle_collision_counts[coef_bin]])
+        self.blind_vehicle_collision_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["collision_coefficient", "n"], log_mode="MUTABLE")
 
     def create_offroad_counts_table(self):
         data = []

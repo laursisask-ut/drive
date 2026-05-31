@@ -94,6 +94,7 @@ class Entity(Structure):
         ("collision_reward_coefficient", c_float),
         ("offroad_reward_coefficient", c_float),
         ("lane_center_bias", c_float),
+        ("hide_other_vehicles", c_int),
         # Jerk dynamics
         ("a_long", c_float),
         ("a_lat", c_float),
@@ -366,7 +367,7 @@ def negate(arr):
     return [-value for value in arr]
 
 
-agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "16"))
+agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "32"))
 goals_per_agent = int(os.getenv("GOALS_PER_AGENT", "8"))
 
 def generate_map():
@@ -377,7 +378,7 @@ def generate_map():
             lat = float(os.getenv("CENTER_LAT"))
             lon = float(os.getenv("CENTER_LON"))
             center = to2D(projector.forward(GPSPoint(lat, lon)))
-        spawn_distance = 75
+        spawn_distance = 100
 
         spawn_box = BoundingBox2d(
             BasicPoint2d(center.x - spawn_distance, center.y - spawn_distance),
@@ -398,8 +399,8 @@ def generate_map():
             break
 
     num_agents = agents_per_generated_map
-    num_stationary_objects = random.randint(8, 24)
-    num_walking_pedestrians = random.randint(8, 24)
+    num_stationary_objects = random.randint(16, 48)
+    num_walking_pedestrians = random.randint(16, 48)
 
     used_spawn_positions = {}
 
@@ -574,7 +575,7 @@ def generate_map():
             add_linestring_segments_in_box(6, linestring)
 
     num_objects = num_agents + num_stationary_objects + num_walking_pedestrians
-    assert num_objects <= 64
+    assert num_objects <= 128
     entities = alloc_entities(len(roads) + num_objects)
 
     for i in range(num_agents):
@@ -609,6 +610,7 @@ def generate_map():
         ent.offroad_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
+        ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.1)
         ent.mark_as_expert = 0
 
         allowed_spawn_lanelets = [
@@ -647,9 +649,9 @@ def generate_map():
         road_heading = math.atan2(near.y - spawn_pos.y, near.x - spawn_pos.x)
 
         road_normal = BasicPoint2d(math.cos(road_heading+math.pi/2), math.sin(road_heading+math.pi/2))
-        spawn_pos += road_normal * random.uniform(-2, 0.25)
+        spawn_pos += road_normal * random.uniform(-4, 0.25)
         
-        heading = road_heading + random.choice([math.pi, 0])
+        heading = road_heading + random.choice([math.pi, 0]) + random.uniform(-0.5, 0.5)
 
         ent = entities[i+num_agents]
         ent.type = 1
@@ -662,9 +664,9 @@ def generate_map():
         ent.traj_vx = alloc_float_array([0])
         ent.traj_vy = alloc_float_array([0])
         ent.traj_vz = alloc_float_array([0])
-        ent.width = obj_dims[0] * (1 + random.uniform(-0.1, 0.1))
-        ent.length = obj_dims[1] * (1 + random.uniform(-0.1, 0.1))
-        ent.height = obj_dims[2] * (1 + random.uniform(-0.1, 0.1))
+        ent.width = obj_dims[0] * (1 + random.uniform(-0.2, 0.2))
+        ent.length = obj_dims[1] * (1 + random.uniform(-0.2, 0.2))
+        ent.height = obj_dims[2] * (1 + random.uniform(-0.2, 0.2))
         #ent.goal_position_x = ent.traj_x
         #ent.goal_position_y = ent.traj_y
         #ent.goal_position_z = ent.traj_z
@@ -676,7 +678,23 @@ def generate_map():
     for i in range(num_walking_pedestrians):
         speed_multiplier = random.choice([1, 1, 1, 1, 2, 2, 3, 4])
 
-        if not crosswalk_lanelets or random.uniform(0, 1) < 0.3:
+        if random.uniform(0, 1) < 0.4:
+            lanelet = spawn_lanelets[i]
+            while routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
+                lanelet = routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet)
+            line = to2D(lanelet.rightBound)
+            start_offset = random.uniform(0, 0.5) * length(line)
+            end_offset = min(start_offset + 200, length(line))
+            s = start_offset
+            distance_from_road = random.uniform(3, 8)
+            points = []
+            speed = random.uniform(0.5, 1.4)
+            while s <= end_offset:
+                segment_start = fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))
+                s += random.uniform(1, 4)
+                segment_end = fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))
+                points.extend(linear_interpolate(segment_start, segment_end, speed=speed))
+        elif not crosswalk_lanelets or random.uniform(0, 1) < 0.3:
             lanelet = spawn_lanelets[i]
             while routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
                 lanelet = routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet)
