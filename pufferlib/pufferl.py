@@ -267,7 +267,7 @@ class PuffeRL:
             map_dir="synthetic-validation-maps",
             dynamic_map_generation=False,
             all_maps_exactly_once=True,
-            scenario_length=620
+            scenario_length=201
         )
 
         self.run_validation()
