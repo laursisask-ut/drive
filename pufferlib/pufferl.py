@@ -35,6 +35,7 @@ import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
 from pufferlib.ocean.drive.drive import Drive
+from pufferlib.ocean.drive.mapgen import agents_per_generated_map
 
 try:
     from pufferlib import _C
@@ -237,6 +238,7 @@ class PuffeRL:
         self.profile = Profile()
         self.stats = defaultdict(list)
         self.val_stats = defaultdict(list)
+        self.synthetic_val_stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.collision_counts = np.zeros((5151,), np.int64)
         self.expert_collision_counts = np.zeros((100,), np.int64)
@@ -258,8 +260,18 @@ class PuffeRL:
             all_maps_exactly_once=True,
             scenario_length=620
         )
+        self.synthetic_validation_env = Drive(
+            resample_frequency=-1,
+            num_maps=128,
+            num_agents=128 * agents_per_generated_map,
+            map_dir="synthetic-validation-maps",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            scenario_length=620
+        )
 
         self.run_validation()
+        self.run_synthetic_validation()
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -556,12 +568,14 @@ class PuffeRL:
             self.print_dashboard()
             self.stats = defaultdict(list)
             self.val_stats = defaultdict(list)
+            self.synthetic_val_stats = defaultdict(list)
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
             profile.clear()
 
         if self.epoch % config["validation_interval"] == 0 or done_training:
             self.run_validation()
+            self.run_synthetic_validation()
 
         if self.epoch % config["checkpoint_interval"] == 0 or done_training:
             self.save_checkpoint()
@@ -724,6 +738,14 @@ class PuffeRL:
                 del self.val_stats[k]
 
             self.val_stats[k] = v
+        for k in list(self.synthetic_val_stats.keys()):
+            v = self.synthetic_val_stats[k]
+            try:
+                v = np.mean(v)
+            except:
+                del self.synthetic_val_stats[k]
+
+            self.synthetic_val_stats[k] = v
 
         device = config["device"]
         agent_steps = int(dist_sum(self.global_step, device))
@@ -735,6 +757,7 @@ class PuffeRL:
             "learning_rate": self.optimizer.param_groups[0]["lr"],
             **{f"environment/{k}": v for k, v in self.stats.items()},
             **{f"validation/{k}": v for k, v in self.val_stats.items()},
+            **{f"synthetic_validation/{k}": v for k, v in self.synthetic_val_stats.items()},
             **{f"losses/{k}": v for k, v in self.losses.items()},
             **{f"performance/{k}": v["elapsed"] for k, v in self.profile},
             # **{f'environment/{k}': dist_mean(v, device) for k, v in self.stats.items()},
@@ -885,7 +908,14 @@ class PuffeRL:
 
     @torch.no_grad()
     def run_validation(self):
-        observations, _ = self.validation_env.reset()
+        self._run_validation_env(self.validation_env, self.val_stats)
+
+    @torch.no_grad()
+    def run_synthetic_validation(self):
+        self._run_validation_env(self.synthetic_validation_env, self.synthetic_val_stats)
+
+    def _run_validation_env(self, env, stats):
+        observations, _ = env.reset()
         num_agents = observations.shape[0]
 
         device = self.config["device"]
@@ -895,19 +925,19 @@ class PuffeRL:
             lstm_c=torch.zeros(num_agents, self.policy.hidden_size, device=device),
         )
 
-        for _ in range(self.validation_env.scenario_length):
+        for _ in range(env.scenario_length):
             logits, _value = self.policy.forward_eval(torch.as_tensor(observations).to(device), state)
             actions, _, _ = pufferlib.pytorch.sample_logits(logits)
-            observations, _rewards, _terminals, _truncations, info = self.validation_env.step(actions.cpu())
+            observations, _rewards, _terminals, _truncations, info = env.step(actions.cpu())
 
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
                     if k in TABLE_METRIC_KEYS:
                         continue
                     elif isinstance(v, (list, tuple)):
-                        self.val_stats[k].extend(v)
+                        stats[k].extend(v)
                     else:
-                        self.val_stats[k].append(v)
+                        stats[k].append(v)
 
     def print_dashboard(self, clear=False, idx=[0], c1="[cyan]", c2="[white]", b1="[bright_cyan]", b2="[bright_white]"):
         config = self.config
@@ -1572,6 +1602,7 @@ def load_config(env_name):
         add_help=False,
     )
     parser.add_argument("--load-model-path", type=str, default=None, help="Path to a pretrained checkpoint")
+    parser.add_argument("--config-file", type=str, default="config/ocean/drive.ini")
     parser.add_argument(
         "--load-id", type=str, default=None, help="Kickstart/eval from from a finished Wandb/Neptune run"
     )
@@ -1594,18 +1625,14 @@ def load_config(env_name):
 
     # Load defaults and config
     puffer_dir = os.path.dirname(os.path.realpath(__file__))
-    puffer_config_dir = os.path.join(puffer_dir, "config/**/*.ini")
     puffer_default_config = os.path.join(puffer_dir, "config/default.ini")
     if env_name == "default":
         p = configparser.ConfigParser()
         p.read(puffer_default_config)
     else:
-        for path in glob.glob(puffer_config_dir, recursive=True):
-            p = configparser.ConfigParser()
-            p.read([puffer_default_config, path])
-            if env_name in p["base"]["env_name"].split():
-                break
-        else:
+        p = configparser.ConfigParser()
+        p.read([puffer_default_config, args.config_file])
+        if env_name not in p["base"]["env_name"].split():
             raise pufferlib.APIUsageError("No config for env_name {}".format(env_name))
 
     # Dynamic help menu from config

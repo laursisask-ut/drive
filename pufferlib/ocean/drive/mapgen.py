@@ -687,7 +687,7 @@ def generate_map():
             end_offset = min(start_offset + 200, length(line))
             s = start_offset
             distance_from_road = random.uniform(3, 8)
-            points = []
+            points = [fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))]
             speed = random.uniform(0.5, 1.4)
             while s <= end_offset:
                 segment_start = fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))
