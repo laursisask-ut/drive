@@ -920,10 +920,13 @@ class PuffeRL:
 
         device = self.config["device"]
 
-        state = dict(
-            lstm_h=torch.zeros(num_agents, self.policy.hidden_size, device=device),
-            lstm_c=torch.zeros(num_agents, self.policy.hidden_size, device=device),
-        )
+        if self.config["use_rnn"]:
+            state = dict(
+                lstm_h=torch.zeros(num_agents, self.policy.hidden_size, device=device),
+                lstm_c=torch.zeros(num_agents, self.policy.hidden_size, device=device),
+            )
+        else:
+            state = None
 
         for _ in range(env.scenario_length):
             logits, _value = self.policy.forward_eval(torch.as_tensor(observations).to(device), state)
