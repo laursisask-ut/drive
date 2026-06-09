@@ -101,3 +101,133 @@ class Drive(nn.Module):
         value = self.value_fn(flat_hidden)
 
         return action, value
+
+class SceneEncoderBlock(torch.nn.Module):
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        self.attn = torch.nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
+        self.layer_norm1 = torch.nn.LayerNorm(hidden_dim)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, 4 * hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4 * hidden_dim, hidden_dim)
+        )
+        self.layer_norm2 = torch.nn.LayerNorm(hidden_dim)
+    
+    def forward(self, x):
+        norm_x = self.layer_norm1(x)
+        attn_out, _ = self.attn(norm_x, norm_x, norm_x)
+        x = x + attn_out
+
+        mlp_out = self.mlp(self.layer_norm2(x))
+        return x + mlp_out
+
+class SceneEncoder(torch.nn.Module):
+    def __init__(self, ego_dim=20, hidden_dim=256, num_blocks=4):
+        super().__init__()
+        self.ego_dim = ego_dim
+        self.map_proj = torch.nn.Sequential(
+            torch.nn.BatchNorm1d(13),
+            torch.nn.Linear(13, hidden_dim),
+            torch.nn.ReLU()
+        )
+        self.vehicle_proj = torch.nn.Sequential(
+            torch.nn.BatchNorm1d(7),
+            torch.nn.Linear(7, hidden_dim),
+            torch.nn.ReLU()
+        )
+        self.ego_proj = torch.nn.Sequential(
+            torch.nn.BatchNorm1d(ego_dim),
+            torch.nn.Linear(ego_dim, hidden_dim),
+            torch.nn.ReLU()
+        )
+        self.blocks = torch.nn.ModuleList([SceneEncoderBlock(hidden_dim=hidden_dim) for _ in range(num_blocks)])
+
+    def forward(self, observations):
+        B = observations.size(0)
+        V = 63
+        M = 200
+
+        ego_dim = self.ego_dim
+        partner_dim = V * 7
+        road_dim = M * 7
+
+        ego_data = observations[:, :ego_dim]
+        vehicle_data = observations[:, ego_dim : ego_dim + partner_dim].view(-1, V, 7)
+        road_obs = observations[:, ego_dim + partner_dim : ego_dim + partner_dim + road_dim].view(-1, M, 7)
+
+        road_continuous = road_obs[:, :, :6]
+        road_categorical = road_obs[:, :, 6]
+        road_onehot = F.one_hot(road_categorical.long(), num_classes=7)
+        map_data = torch.cat([road_continuous, road_onehot], dim=2)
+
+        map_tokens = self.map_proj(map_data.view(B * M, -1)).view(B, M, -1)
+        vehicle_tokens = self.vehicle_proj(vehicle_data.reshape(B * V, -1)).view(B, V, -1)
+        ego_tokens = self.ego_proj(ego_data).view(B, 1, -1)
+
+        x = torch.cat([map_tokens, vehicle_tokens, ego_tokens], dim=1)
+        for block in self.blocks:
+            x = block(x)
+
+        return x
+
+class TrajectoryDecoderBlock(torch.nn.Module):
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        self.attn = torch.nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
+        self.layer_norm1 = torch.nn.LayerNorm(hidden_dim)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, 4 * hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4 * hidden_dim, hidden_dim)
+        )
+        self.layer_norm2 = torch.nn.LayerNorm(hidden_dim)
+    
+    def forward(self, x, encoder_outputs):
+        norm_x = self.layer_norm1(x)
+        attn_out, _ = self.attn(norm_x, encoder_outputs, encoder_outputs)
+        x = x + attn_out
+
+        mlp_out = self.mlp(self.layer_norm2(x))
+        return x + mlp_out
+
+class TrajectoryDecoder(torch.nn.Module):
+    def __init__(self, action_dim, hidden_dim=256, num_blocks=4):
+        super().__init__()
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.seed = torch.nn.Parameter(torch.randn((1, 1, hidden_dim)) * 0.02)
+        self.blocks = torch.nn.ModuleList([TrajectoryDecoderBlock(hidden_dim=hidden_dim) for _ in range(num_blocks)])
+        self.actor = pufferlib.pytorch.layer_init(torch.nn.Linear(hidden_dim, sum(action_dim)), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(torch.nn.Linear(hidden_dim, 1), std=1)
+    
+    def forward(self, encoder_outputs):
+        x = self.seed.repeat(encoder_outputs.size(0), 1, 1)
+        for block in self.blocks:
+            x = block(x, encoder_outputs)
+
+        actions, value = self.decode_actions(x.reshape(-1, self.hidden_dim))
+        return actions, value
+
+    def decode_actions(self, x):
+        action = self.actor(x)
+        action = torch.split(action, self.action_dim, dim=1)
+        value = self.value_fn(x)
+        return action, value
+
+class Wayformer(torch.nn.Module):
+    def __init__(self, env, **kwargs):
+        super().__init__()
+        hidden_dim = 128
+        ego_dim = 23 if env.dynamics_model == "jerk" else 20
+        action_dim = env.single_action_space.nvec.tolist()
+        self.encoder = SceneEncoder(ego_dim=ego_dim, hidden_dim=hidden_dim, num_blocks=2)
+        self.decoder = TrajectoryDecoder(action_dim=action_dim, hidden_dim=hidden_dim, num_blocks=2)
+
+    def forward(self, x, state=None):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+    def forward_eval(self, observations, state=None):
+        return self(observations)
