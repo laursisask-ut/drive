@@ -179,7 +179,7 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     if(ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s", env->ini_file);
     }
-    if (kwargs && PyDict_GetItemString(kwargs, "scenario_length")) {
+    if (kwargs && PyDict_GetItemString(kwargs, "scenario_length") && !Py_IsNone(PyDict_GetItemString(kwargs, "scenario_length"))) {
         conf.scenario_length = (int)unpack(kwargs, "scenario_length");
     }
     if (conf.scenario_length <= 0) {
@@ -201,6 +201,10 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->deterministic_agent_selection = unpack(kwargs, "deterministic_agent_selection");
     env->dt = conf.dt;
     env->control_non_vehicles = (int)unpack(kwargs, "control_non_vehicles");
+    
+    if (kwargs && Py_IsTrue(PyDict_GetItemString(kwargs, "play_exactly_once"))) {
+        env->play_exactly_once = 1;
+    }
 
     int max_agents = unpack(kwargs, "max_agents");
     env->num_agents = max_agents;

@@ -715,6 +715,7 @@ def generate_map():
         if random.choice([True, False]):
             points = list(reversed(points))
         points = points[random.randint(0, len(points)//2):]
+        points = points[:200]
 
         heading = [0]
         vx = [0]
@@ -770,7 +771,7 @@ def save_map_binary(map_tuple, path):
             size = ent.array_size
 
             if ent.mark_as_expert and size == 1:
-                size = 600
+                size = 200
                 ent.traj_x = alloc_float_array([ent.traj_x[0]] * size)
                 ent.traj_y = alloc_float_array([ent.traj_y[0]] * size)
                 ent.traj_z = alloc_float_array([ent.traj_z[0]] * size)

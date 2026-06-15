@@ -382,6 +382,7 @@ struct Drive {
     float goal_radius;
     int control_all_agents;
     int deterministic_agent_selection;
+    int play_exactly_once;
     int policy_agents_per_env;
     int logs_capacity;
     int use_goal_generation;
@@ -706,6 +707,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     env->num_entities = env->num_objects + env->num_roads;
     Entity* entities = (Entity*)malloc(env->num_entities * sizeof(Entity));
     memset(entities, 0, env->num_entities * sizeof(Entity));
+    int initial_scenario_length = env->scenario_length;
     for (int i = 0; i < env->num_entities; i++) {
 	    // Read base entity data
         fread(&entities[i].type, sizeof(int), 1, file);
@@ -721,7 +723,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         entities[i].traj_y = (float*)malloc(size * sizeof(float));
         entities[i].traj_z = (float*)malloc(size * sizeof(float));
         if (entities[i].type == VEHICLE || entities[i].type == PEDESTRIAN || entities[i].type == CYCLIST) {  // Object type
-            if (size > env->scenario_length) env->scenario_length = size;
+            if (initial_scenario_length == 0 && size > env->scenario_length) env->scenario_length = size;
             // Allocate arrays for object-specific data
             entities[i].traj_vx = (float*)malloc(size * sizeof(float));
             entities[i].traj_vy = (float*)malloc(size * sizeof(float));
@@ -2750,11 +2752,15 @@ void c_step(Drive* env){
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     env->timestep++;
+
+    if (env->timestep > env->scenario_length && env->play_exactly_once) return;
+
     if(env->timestep == env->scenario_length){
         add_log(env);
 	    if (env->export_replay_enabled && env->export_log.traj_x)
             saveReplayToFile(env);
-        c_reset(env);
+        if (!env->play_exactly_once)
+            c_reset(env);
         return;
     }
 

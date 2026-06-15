@@ -257,8 +257,7 @@ class PuffeRL:
             num_maps=-1,
             map_dir="validation-maps",
             dynamic_map_generation=False,
-            all_maps_exactly_once=True,
-            scenario_length=620
+            all_maps_exactly_once=True
         )
         self.synthetic_validation_env = Drive(
             resample_frequency=-1,
@@ -267,7 +266,7 @@ class PuffeRL:
             map_dir="synthetic-validation-maps",
             dynamic_map_generation=False,
             all_maps_exactly_once=True,
-            scenario_length=203
+            scenario_length=200
         )
 
         self.run_validation()
@@ -908,13 +907,13 @@ class PuffeRL:
 
     @torch.no_grad()
     def run_validation(self):
-        self._run_validation_env(self.validation_env, self.val_stats)
+        self._run_validation_env(self.validation_env, self.val_stats, 620)
 
     @torch.no_grad()
     def run_synthetic_validation(self):
-        self._run_validation_env(self.synthetic_validation_env, self.synthetic_val_stats)
+        self._run_validation_env(self.synthetic_validation_env, self.synthetic_val_stats, 201)
 
-    def _run_validation_env(self, env, stats):
+    def _run_validation_env(self, env, stats, max_scenario_length):
         observations, _ = env.reset()
         num_agents = observations.shape[0]
 
@@ -928,7 +927,7 @@ class PuffeRL:
         else:
             state = None
 
-        for _ in range(env.scenario_length):
+        for _ in range(max_scenario_length):
             logits, _value = self.policy.forward_eval(torch.as_tensor(observations).to(device), state)
             actions, _, _ = pufferlib.pytorch.sample_logits(logits)
             observations, _rewards, _terminals, _truncations, info = env.step(actions.cpu())

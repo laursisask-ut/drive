@@ -181,6 +181,7 @@ class Drive(pufferlib.PufferEnv):
                 init_steps=init_steps,
                 export_replay=export_replay,
                 replay_dir=replay_dir,
+                play_exactly_once=all_maps_exactly_once
             )
             env_ids.append(env_id)
 
