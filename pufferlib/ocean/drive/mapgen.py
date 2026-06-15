@@ -367,10 +367,73 @@ def negate(arr):
     return [-value for value in arr]
 
 
+def point_in_box(point, box):
+    return box.min.x <= point.x <= box.max.x and box.min.y <= point.y <= box.max.y
+
+
+def clamp_spawn_offset(line, s):
+    return min(s, max(0, length(line) - 7.5))
+
+
+def add_spawn_position(queue, grid, lanelet, s, pos, min_distance):
+    cell = (int(pos.x // min_distance), int(pos.y // min_distance))
+    has_near_position = any(
+        distance(pos, other_pos) < min_distance
+        for dx in range(-1, 2)
+        for dy in range(-1, 2)
+        for other_pos in grid.get((cell[0] + dx, cell[1] + dy), [])
+    )
+    if has_near_position:
+        return
+    queue.append((lanelet, s))
+    grid.setdefault(cell, []).append(pos)
+
+
+def make_spawn_position_queues(lanelets, box):
+    spawn_spacing = 15
+    min_spawn_distance = 5
+    candidate_positions = []
+    for lanelet in lanelets:
+        if "subtype" not in lanelet.attributes or lanelet.attributes["subtype"] != "road" or len(lanelet.centerline) < 3:
+            continue
+        line = to2D(lanelet.centerline)
+        line_length = length(line)
+        if line_length < spawn_spacing:
+            continue
+        s = spawn_spacing / 2
+        while s <= line_length - spawn_spacing / 2:
+            pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
+            if point_in_box(pos, box):
+                candidate_positions.append((lanelet, s, pos))
+            s += spawn_spacing
+    random.shuffle(candidate_positions)
+    moving_spawn_positions = []
+    stationary_spawn_positions = []
+    moving_spawn_grid = {}
+    stationary_spawn_grid = {}
+    for lanelet, s, pos in candidate_positions:
+        if routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
+            add_spawn_position(moving_spawn_positions, moving_spawn_grid, lanelet, s, pos, min_spawn_distance)
+            continue
+        if random.choice([True, False]):
+            add_spawn_position(moving_spawn_positions, moving_spawn_grid, lanelet, s, pos, min_spawn_distance)
+        else:
+            line = to2D(lanelet.rightBound)
+            stationary_s = clamp_spawn_offset(line, s)
+            stationary_pos = fromArcCoordinates(line, ArcCoordinates(stationary_s, 0.0))
+            if point_in_box(stationary_pos, box):
+                add_spawn_position(stationary_spawn_positions, stationary_spawn_grid, lanelet, stationary_s, stationary_pos, min_spawn_distance)
+    return moving_spawn_positions, stationary_spawn_positions
+
+
 agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "32"))
 goals_per_agent = int(os.getenv("GOALS_PER_AGENT", "8"))
 
 def generate_map():
+    num_agents = agents_per_generated_map
+    num_stationary_objects = random.randint(16, 48)
+    num_walking_pedestrians = random.randint(16, 48)
+
     while True:
         center = random.choice(map_points)
         # center = BasicPoint2d(0.0, 0.0)
@@ -387,22 +450,10 @@ def generate_map():
 
         spawn_box_lanelets = lanelet2_map.laneletLayer.search(spawn_box)
 
-        allowed_spawn_lanelets = [
-            lanelet
-            for lanelet in spawn_box_lanelets
-            if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "road" and len(lanelet.centerline) >= 3
-        ]
+        moving_spawn_position_queue, stationary_spawn_position_queue = make_spawn_position_queues(spawn_box_lanelets, spawn_box)
 
-        allowed_spawn_lanelet_weights = [length(l.centerline) for l in allowed_spawn_lanelets]
-
-        if allowed_spawn_lanelets:
+        if len(moving_spawn_position_queue) >= num_agents and len(stationary_spawn_position_queue) >= num_stationary_objects:
             break
-
-    num_agents = agents_per_generated_map
-    num_stationary_objects = random.randint(16, 48)
-    num_walking_pedestrians = random.randint(16, 48)
-
-    used_spawn_positions = {}
 
     vehicle_samples = random.choices(VEHICLE_PROFILES, weights=vehicle_weights, k=num_agents)
 
@@ -411,34 +462,17 @@ def generate_map():
     spawn_headings = []
     spawn_vx = []
     spawn_vy = []
+    spawn_attempts = 0
+    max_spawn_attempts = max(len(moving_spawn_position_queue) * 4, num_agents)
     i = 0
     while i < num_agents:
         is_initially_parked = random.uniform(0, 1) < 0.05
         
-        lanelet, = random.choices(allowed_spawn_lanelets, weights=allowed_spawn_lanelet_weights, k=1)
-        if is_initially_parked:
-            while routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
-                lanelet = routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet)
-
-        if lanelet not in used_spawn_positions:
-            used_spawn_positions[lanelet] = []
+        spawn_lanelet, spawn_offset = moving_spawn_position_queue.pop()
+        lanelet, s = spawn_lanelet, spawn_offset
 
         line = to2D(lanelet.centerline)
-
-        s = random.uniform(0.1, 0.9) * length(line)
-        # If another vehicle is too close, make up to 5 
-        # attempts to choose another spawn position
-        vehicle_length = vehicle_samples[i][2][1]
-        for _ in range(10):
-            any_vehicle_near = False
-            for other_offset, other_length in used_spawn_positions[lanelet]:
-                if abs(s-other_offset) < (vehicle_length+other_length)/2 + 5:
-                    any_vehicle_near = True
-                    break
-            if any_vehicle_near:
-                s = random.uniform(0.1, 0.9) * length(line)
-            else:
-                break
+        s = clamp_spawn_offset(line, s)
 
         spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
 
@@ -500,13 +534,16 @@ def generate_map():
         if os.getenv("ONLY_WITHIN_BOUNDARY") == "1":
             all_in_boundary = True
             for gp in agent_goal_positions:
-                if gp.x < spawn_box.min.x or gp.y < spawn_box.min.y or gp.x > spawn_box.max.x or gp.y > spawn_box.max.y:
+                if not point_in_box(gp, spawn_box):
                     all_in_boundary = False
                     break
             if not all_in_boundary:
+                moving_spawn_position_queue.insert(0, (spawn_lanelet, spawn_offset))
+                spawn_attempts += 1
+                if spawn_attempts > max_spawn_attempts:
+                    return generate_map()
                 continue
 
-        used_spawn_positions[lanelet].append((s, vehicle_length))
         spawn_positions.append(spawn_pos)
         spawn_headings.append(heading)
         spawn_vy.append(math.sin(heading)*initial_speed)
@@ -613,35 +650,13 @@ def generate_map():
         ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.1)
         ent.mark_as_expert = 0
 
-        allowed_spawn_lanelets = [
-            lanelet
-            for lanelet in spawn_box_lanelets
-            if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "road" and len(lanelet.centerline) >= 3
-        ]
-
-    spawn_lanelets = random.choices(render_box_lanelets, weights=[length(l.centerline) for l in render_box_lanelets], k=num_stationary_objects)
     vehicle_samples = random.choices(STATIONARY_OBJECT_PROFILES, weights=stationary_object_weights, k=num_stationary_objects)
 
     for i in range(num_stationary_objects):
-        lanelet = spawn_lanelets[i]
-        while routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
-            lanelet = routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet)
+        lanelet, s = stationary_spawn_position_queue.pop()
         line = to2D(lanelet.rightBound)
-        s = random.uniform(0.1, 0.9) * length(line)
+        s = clamp_spawn_offset(line, s)
         _, _, obj_dims = vehicle_samples[i]
-        (_, vehicle_length, _) = obj_dims
-
-        if lanelet in used_spawn_positions:
-            for _ in range(5):
-                any_vehicle_near = False
-                for other_offset, other_length in used_spawn_positions[lanelet]:
-                    if abs(s-other_offset) < (vehicle_length+other_length)/2 + 5:
-                        any_vehicle_near = True
-                        break
-                if any_vehicle_near:
-                    s = random.uniform(0.1, 0.9) * length(line)
-                else:
-                    break
         
         spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
 
