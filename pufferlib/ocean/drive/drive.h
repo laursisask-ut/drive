@@ -751,13 +751,13 @@ Entity* load_map_binary(const char* filename, Drive* env) {
 
             // Reasonable defaults, needed for validation runs
             entities[i].max_speed = 90/3.6f;
-            entities[i].lane_center_reward_coefficient = 2.5e-5;
-            entities[i].comfort_reward_coefficient = 0.005f;
-            entities[i].lane_align_reward_coefficient = 2.5e-4f;
+            entities[i].lane_center_reward_coefficient = 2.5e-4;
+            entities[i].comfort_reward_coefficient = 0.01f;
+            entities[i].lane_align_reward_coefficient = 2.5e-3f;
             entities[i].collision_reward_coefficient = 1.0f;
             entities[i].offroad_reward_coefficient = 1.0f;
             entities[i].lane_center_bias = 0.0f;
-            entities[i].goal_radius = 2.0f;
+            entities[i].goal_radius = 3.0f;
         }
         // Read remaining scalar fields
         fread(&entities[i].width, sizeof(float), 1, file);
