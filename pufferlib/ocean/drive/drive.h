@@ -2698,6 +2698,8 @@ void c_reset(Drive* env){
         env->entities[agent_idx].collided_before_goal = 0;
         env->entities[agent_idx].reached_goal_this_episode = 0;
         env->entities[agent_idx].reached_final_goal = 0;
+        env->entities[agent_idx].sampled_new_goal = 0;
+        env->entities[agent_idx].multi_goal_idx = 0;
         env->entities[agent_idx].metrics_array[COLLISION_IDX] = 0.0f;
         env->entities[agent_idx].metrics_array[OFFROAD_IDX] = 0.0f;
         env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 0.0f;
@@ -2709,7 +2711,10 @@ void c_reset(Drive* env){
         if (env->use_goal_generation) {
             env->entities[agent_idx].goal_position_x = env->entities[agent_idx].init_goal_x;
             env->entities[agent_idx].goal_position_y = env->entities[agent_idx].init_goal_y;
-            env->entities[agent_idx].sampled_new_goal = 0;
+        } else if (env->entities[agent_idx].multi_goal_count > 0) {
+            env->entities[agent_idx].goal_position_x = env->entities[agent_idx].multi_goal_position_x[0];
+            env->entities[agent_idx].goal_position_y = env->entities[agent_idx].multi_goal_position_y[0];
+            env->entities[agent_idx].goal_position_z = env->entities[agent_idx].multi_goal_position_z[0];
         }
 
         if (short_term_goals() || subsample_scenario()) {
