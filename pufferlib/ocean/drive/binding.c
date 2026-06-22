@@ -64,6 +64,22 @@ static int my_put(Env* env, PyObject* args, PyObject* kwargs) {
         return 1;
     }
     env->terminals = PyArray_DATA(terminals);
+
+    PyObject* trunc = PyDict_GetItemString(kwargs, "truncations");
+    if (!PyObject_TypeCheck(trunc, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "Truncations must be a NumPy array");
+        return 1;
+    }
+    PyArrayObject* truncations = (PyArrayObject*)trunc;
+    if (!PyArray_ISCONTIGUOUS(truncations)) {
+        PyErr_SetString(PyExc_ValueError, "Truncations must be contiguous");
+        return 1;
+    }
+    if (PyArray_NDIM(truncations) != 1) {
+        PyErr_SetString(PyExc_ValueError, "Truncations must be 1D");
+        return 1;
+    }
+    env->truncations = PyArray_DATA(truncations);
     return 0;
 }
 

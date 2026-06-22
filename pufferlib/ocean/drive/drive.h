@@ -400,6 +400,7 @@ struct Drive {
     float* actions;
     float* rewards;
     unsigned char* terminals;
+    unsigned char* truncations;
     Log log;
     Log* logs;
     int* collision_counts;
@@ -2169,6 +2170,7 @@ void allocate(Drive* env){
     env->actions = (float*)calloc(env->active_agent_count*2, sizeof(float));
     env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
     env->terminals= (unsigned char*)calloc(env->active_agent_count, sizeof(unsigned char));
+    env->truncations = (unsigned char*)calloc(env->active_agent_count, sizeof(unsigned char));
 }
 
 void free_allocated(Drive* env){
@@ -2176,6 +2178,7 @@ void free_allocated(Drive* env){
     free(env->actions);
     free(env->rewards);
     free(env->terminals);
+    free(env->truncations);
     c_close(env);
 }
 
@@ -2721,6 +2724,10 @@ int subsample_scenario() {
 }
 
 void c_reset(Drive* env){
+    memset(env->rewards, 0, env->active_agent_count * sizeof(float));
+    memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
+    memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
+
     if (env->export_replay_enabled && env->export_log.traj_x == NULL) {
         env->export_log.traj_x = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
         env->export_log.traj_y = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
@@ -2822,6 +2829,8 @@ void respawn_agent(Drive* env, int agent_idx){
 void c_step(Drive* env){
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
+    memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
+
     env->timestep++;
 
     if (env->timestep > env->scenario_length && env->play_exactly_once) return;
@@ -2832,6 +2841,7 @@ void c_step(Drive* env){
             saveReplayToFile(env);
         if (!env->play_exactly_once)
             c_reset(env);
+        memset(env->truncations, 1, env->active_agent_count * sizeof(unsigned char));
         return;
     }
 

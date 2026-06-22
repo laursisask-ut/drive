@@ -20,13 +20,24 @@ def test_drive_emits_log_after_custom_scenario_length():
 
     env.reset(seed=0)
     logs = []
-    for _ in range(6):
-        actions = np.zeros_like(env.actions)
-        _, _, _, _, info = env.step(actions)
-        if info:
-            logs.extend(info)
+    terminal_counts = []
+    truncation_counts = []
+    try:
+        for _ in range(6):
+            actions = np.zeros_like(env.actions)
+            _, _, terminals, truncations, info = env.step(actions)
+            terminal_counts.append(int(terminals.sum()))
+            truncation_counts.append(int(truncations.sum()))
+            if info:
+                logs.extend(info)
 
-    env.close()
+        assert terminal_counts[4] == 0
+        assert truncation_counts[4] == env.num_agents
+        env.reset(seed=1)
+        assert not env.terminals.any()
+        assert not env.truncations.any()
+    finally:
+        env.close()
 
     assert logs, "Drive never flushed its log; scenario_length may be ignored"
     assert pytest.approx(logs[-1]["episode_length"], rel=0.0, abs=1e-6) == 5

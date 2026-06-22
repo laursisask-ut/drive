@@ -186,14 +186,89 @@ class Drive(pufferlib.PufferEnv):
             env_ids.append(env_id)
 
         self.c_envs = binding.vectorize(*env_ids)
+        self._pending_resample = False
 
     def reset(self, seed=0):
+        self._pending_resample = False
         binding.vec_reset(self.c_envs, seed)
         self.tick = 0
         return self.observations, []
 
+    def _resample_envs(self):
+        binding.vec_close(self.c_envs)
+        if self.dynamic_map_generation:
+            assert self.num_agents % agents_per_generated_map == 0
+            num_envs = self.num_agents // agents_per_generated_map
+            map_ids = [0] * num_envs
+            agent_offsets = list(range(0, self.num_agents+agents_per_generated_map, agents_per_generated_map))
+        else:
+            agent_offsets, map_ids, num_envs = binding.shared(
+                map_dir=self.map_dir,
+                num_agents=self.num_agents,
+                num_maps=self.num_maps,
+                num_policy_controlled_agents=self.num_policy_controlled_agents,
+                control_all_agents=1 if self.control_all_agents else 0,
+                deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                all_maps_exactly_once=self.all_maps_exactly_once
+            )
+        env_ids = []
+        seed = np.random.randint(0, 2**32 - 1)
+        export_replay = [self.artifact_dir is not None and random.random() < 0.0004 for _ in range(num_envs)]
+        if any(export_replay):
+            wall_time = int(time.monotonic() - self.start_time)
+            replays_dir = os.path.join(self.artifact_dir, "replays", str(wall_time))
+        for i in range(num_envs):
+            if export_replay[i]:
+                replay_dir = os.path.join(replays_dir, f"{os.getpid():05}-{i:02}")
+                os.makedirs(replay_dir, exist_ok=True)
+            else:
+                replay_dir = None
+            cur = agent_offsets[i]
+            nxt = agent_offsets[i + 1]
+            env_id = binding.env_init(
+                self.observations[cur:nxt],
+                self.actions[cur:nxt],
+                self.rewards[cur:nxt],
+                self.terminals[cur:nxt],
+                self.truncations[cur:nxt],
+                seed,
+                action_type=self._action_type_flag,
+                human_agent_idx=self.human_agent_idx,
+                reward_vehicle_collision=self.reward_vehicle_collision,
+                reward_offroad_collision=self.reward_offroad_collision,
+                reward_goal=self.reward_goal,
+                reward_goal_post_respawn=self.reward_goal_post_respawn,
+                reward_ade=self.reward_ade,
+                goal_radius=self.goal_radius,
+                dt=self.dt,
+                scenario_length=(int(self.scenario_length) if self.scenario_length is not None else None),
+                control_all_agents=1 if self.control_all_agents else 0,
+                num_policy_controlled_agents=self.num_policy_controlled_agents,
+                deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
+                map_dir=self.map_dir,
+                map_id=map_ids[i],
+                dynamic_map_generator=generate_map if self.dynamic_map_generation else None,
+                max_agents=nxt - cur,
+                ini_file="pufferlib/config/ocean/drive.ini",
+                control_non_vehicles=int(self.control_non_vehicles),
+                init_steps=self.init_steps,
+                export_replay=export_replay[i],
+                replay_dir=replay_dir
+            )
+            env_ids.append(env_id)
+        self.c_envs = binding.vectorize(*env_ids)
+        binding.vec_reset(self.c_envs, seed)
+
     def step(self, actions):
         self.terminals[:] = 0
+        self.truncations[:] = 0
+
+        if self._pending_resample:
+            self._pending_resample = False
+            self.tick = 0
+            self._resample_envs()
+            return (self.observations, self.rewards, self.terminals, self.truncations, [])
+
         self.actions[:] = actions
         binding.vec_step(self.c_envs)
         self.tick += 1
@@ -204,74 +279,8 @@ class Drive(pufferlib.PufferEnv):
                 info.append(log)
                 # print(log)
         if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
-            self.tick = 0
-            will_resample = 1
-            if will_resample:
-                binding.vec_close(self.c_envs)
-                if self.dynamic_map_generation:
-                    assert self.num_agents % agents_per_generated_map == 0
-                    num_envs = self.num_agents // agents_per_generated_map
-                    map_ids = [0] * num_envs
-                    agent_offsets = list(range(0, self.num_agents+agents_per_generated_map, agents_per_generated_map))
-                else:
-                    agent_offsets, map_ids, num_envs = binding.shared(
-                        map_dir=self.map_dir,
-                        num_agents=self.num_agents,
-                        num_maps=self.num_maps,
-                        num_policy_controlled_agents=self.num_policy_controlled_agents,
-                        control_all_agents=1 if self.control_all_agents else 0,
-                        deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
-                        all_maps_exactly_once=self.all_maps_exactly_once
-                    )
-                env_ids = []
-                seed = np.random.randint(0, 2**32 - 1)
-                export_replay = [self.artifact_dir is not None and random.random() < 0.0004 for _ in range(num_envs)]
-                if any(export_replay):
-                    wall_time = int(time.monotonic() - self.start_time)
-                    replays_dir = os.path.join(self.artifact_dir, "replays", str(wall_time))
-                for i in range(num_envs):
-                    if export_replay[i]:
-                        replay_dir = os.path.join(replays_dir, f"{os.getpid():05}-{i:02}")
-                        os.makedirs(replay_dir, exist_ok=True)
-                    else:
-                        replay_dir = None
-                    cur = agent_offsets[i]
-                    nxt = agent_offsets[i + 1]
-                    env_id = binding.env_init(
-                        self.observations[cur:nxt],
-                        self.actions[cur:nxt],
-                        self.rewards[cur:nxt],
-                        self.terminals[cur:nxt],
-                        self.truncations[cur:nxt],
-                        seed,
-                        action_type=self._action_type_flag,
-                        human_agent_idx=self.human_agent_idx,
-                        reward_vehicle_collision=self.reward_vehicle_collision,
-                        reward_offroad_collision=self.reward_offroad_collision,
-                        reward_goal=self.reward_goal,
-                        reward_goal_post_respawn=self.reward_goal_post_respawn,
-                        reward_ade=self.reward_ade,
-                        goal_radius=self.goal_radius,
-                        dt=self.dt,
-                        scenario_length=(int(self.scenario_length) if self.scenario_length is not None else None),
-                        control_all_agents=1 if self.control_all_agents else 0,
-                        num_policy_controlled_agents=self.num_policy_controlled_agents,
-                        deterministic_agent_selection=1 if self.deterministic_agent_selection else 0,
-                        map_dir=self.map_dir,
-                        map_id=map_ids[i],
-                        dynamic_map_generator=generate_map if self.dynamic_map_generation else None,
-                        max_agents=nxt - cur,
-                        ini_file="pufferlib/config/ocean/drive.ini",
-                        control_non_vehicles=int(self.control_non_vehicles),
-                        init_steps=self.init_steps,
-                        export_replay=export_replay[i],
-                        replay_dir=replay_dir
-                    )
-                    env_ids.append(env_id)
-                self.c_envs = binding.vectorize(*env_ids)
-
-                binding.vec_reset(self.c_envs, seed)
-                self.terminals[:] = 1
+            self._pending_resample = True
+            self.truncations[:] = 1
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
 
     def render(self):
