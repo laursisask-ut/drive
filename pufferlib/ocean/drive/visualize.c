@@ -271,6 +271,7 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         e->lane_align_reward_coefficient = 2.5e-3f;
         e->collision_reward_coefficient = 1.0f;
         e->offroad_reward_coefficient = 1.0f;
+        e->stop_line_reward_coefficient = 1.0f;
         e->lane_center_bias = 0.0f;
         e->goal_radius = goal_radius;
     }
@@ -423,7 +424,7 @@ int main(int argc, char* argv[]) {
                 goal_radius = atof(argv[i + 1]);
                 i++;
                 if (goal_radius <= 0) {
-                    goal_radius = 2.0f; // Ensure valid value
+                    goal_radius = 3.0f; // Ensure valid value
                 }
             }
         } else if (strcmp(argv[i], "--map-name") == 0) {

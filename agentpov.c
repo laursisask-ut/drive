@@ -15,7 +15,7 @@
 #include <rlgl.h>
 #include <lz4.h>
 
-#define DISPLAY_REWARD_COMPONENT_COUNT 6
+#define DISPLAY_REWARD_COMPONENT_COUNT 7
 #define DISPLAY_ACTION_COMPONENT_COUNT 2
 
 static const char *DISPLAY_REWARD_LABELS[DISPLAY_REWARD_COMPONENT_COUNT] = {
@@ -25,6 +25,7 @@ static const char *DISPLAY_REWARD_LABELS[DISPLAY_REWARD_COMPONENT_COUNT] = {
     "Lane alignment",
     "Collision",
     "Offroad",
+    "Stop line",
 };
 
 static const float DISPLAY_ACCELERATION_VALUES[7] = {
@@ -37,6 +38,19 @@ static const float DISPLAY_STEERING_VALUES[13] = {
 };
 
 static const int EGO_OBS_COLLISION_REWARD_COEFFICIENT_IDX = 10;
+
+static Color traffic_light_color_from_obs(float value) {
+    if (value <= -0.75f) {
+        return DARKGRAY;
+    }
+    if (value <= -0.25f) {
+        return RED;
+    }
+    if (value < 0.25f) {
+        return ORANGE;
+    }
+    return GREEN;
+}
 
 static int write_all(int fd, const unsigned char *buf, size_t len) {
     size_t total = 0;
@@ -496,8 +510,8 @@ int main(int argc, char *argv[]) {
                 color = (Color){220, 220, 220, 255};
             } else if (road_type == 7) {
                 color = RED;
-            } else if (road_type == 11) {
-                color = PINK;
+            } else if (road_type == 9) {
+                color = traffic_light_color_from_obs(road_obs[3]);
             } else if (road_type == 8) {
                 color = YELLOW;
             }
@@ -536,8 +550,8 @@ int main(int argc, char *argv[]) {
         }
 
         if (acceleration_index >= 0 && acceleration_index < (int)(sizeof(DISPLAY_ACCELERATION_VALUES) / sizeof(DISPLAY_ACCELERATION_VALUES[0]))) {
-            float acceleration_g = DISPLAY_ACCELERATION_VALUES[acceleration_index] / 9.81f;
-            DrawText(TextFormat("Acceleration action: %+0.2f g", acceleration_g), 10, 102, 18, WHITE);
+            float acceleration_ms = DISPLAY_ACCELERATION_VALUES[acceleration_index];
+            DrawText(TextFormat("Acceleration action: %+0.2f m/s^2", acceleration_ms), 10, 102, 18, WHITE);
         } else {
             DrawText("Acceleration action: N/A", 10, 102, 18, WHITE);
         }

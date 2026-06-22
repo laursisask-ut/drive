@@ -58,6 +58,8 @@ class Entity(Structure):
         ("multi_goal_position_y", POINTER(c_float)),
         ("multi_goal_position_z", POINTER(c_float)),
         ("mark_as_expert", c_int),
+        ("traffic_light_color", c_int),
+        ("traffic_light_transition_in", c_int),
         ("collision_state", c_int),
         ("collided_with_agent_idx", c_int),
         ("metrics_array", c_float * 6),
@@ -93,6 +95,7 @@ class Entity(Structure):
         ("lane_align_reward_coefficient", c_float),
         ("collision_reward_coefficient", c_float),
         ("offroad_reward_coefficient", c_float),
+        ("stop_line_reward_coefficient", c_float),
         ("lane_center_bias", c_float),
         ("hide_other_vehicles", c_int),
         # Jerk dynamics
@@ -441,7 +444,7 @@ def generate_map():
             lat = float(os.getenv("CENTER_LAT"))
             lon = float(os.getenv("CENTER_LON"))
             center = to2D(projector.forward(GPSPoint(lat, lon)))
-        spawn_distance = 100
+        spawn_distance = 110
 
         spawn_box = BoundingBox2d(
             BasicPoint2d(center.x - spawn_distance, center.y - spawn_distance),
@@ -502,8 +505,8 @@ def generate_map():
 
         for _ in range(goals_per_agent):
             can_add_more_goals = True
-            # 3-6 seconds away
-            goal_distance = speed_limit / 3.6 * random.uniform(3, 6)
+            # 3-9 seconds away
+            goal_distance = speed_limit / 3.6 * random.uniform(3, 9)
             while True:
                 line = to2D(current_lanelet.centerline)
                 following_lanelets = routing_graph.following(current_lanelet, withLaneChanges=True)
@@ -603,9 +606,13 @@ def generate_map():
         if linestring.attributes["subtype"] == "yield_manual":
             add_linestring_segments_in_box(7, linestring)
     
+    seen_traffic_light_lines = set()
     for reg_el in lanelet2_map.regulatoryElementLayer.search(render_box):
         if reg_el.attributes["subtype"] == "traffic_light":
-            add_linestring_segments_in_box(9, reg_el.parameters["ref_line"][0])
+            traffic_light_line = reg_el.parameters["ref_line"][0]
+            if traffic_light_line.id not in seen_traffic_light_lines:
+                seen_traffic_light_lines.add(traffic_light_line.id)
+                add_linestring_segments_in_box(9, traffic_light_line)
 
     for linestring in lanelet2_map.lineStringLayer.search(render_box):
         if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
@@ -645,6 +652,7 @@ def generate_map():
         ent.lane_align_reward_coefficient = random.uniform(2.5e-5, 2.5e-3)
         ent.collision_reward_coefficient = random.uniform(0, 1.0)
         ent.offroad_reward_coefficient = random.uniform(0, 1.0)
+        ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
         ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.1)

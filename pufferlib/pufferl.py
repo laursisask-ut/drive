@@ -64,6 +64,7 @@ TABLE_METRIC_KEYS = {
     "expert_collision_counts",
     "blind_vehicle_collision_counts",
     "offroad_counts",
+    "stop_line_counts",
     "comfort_violation_counts",
     "lane_center_offset_counts",
     "acceleration_action_counts",
@@ -244,6 +245,7 @@ class PuffeRL:
         self.expert_collision_counts = np.zeros((100,), np.int64)
         self.blind_vehicle_collision_counts = np.zeros((100,), np.int64)
         self.offroad_counts = np.zeros((100,), np.int64)
+        self.stop_line_counts = np.zeros((100,), np.int64)
         self.comfort_violation_counts = np.zeros((100,), np.int64)
         self.lane_center_offset_counts = np.zeros((10000,), np.int64)
         self.acceleration_action_counts = np.zeros((7,), np.int64)
@@ -299,6 +301,9 @@ class PuffeRL:
             return True
         if key == "offroad_counts":
             self.offroad_counts += value
+            return True
+        if key == "stop_line_counts":
+            self.stop_line_counts += value
             return True
         if key == "comfort_violation_counts":
             self.comfort_violation_counts += value
@@ -769,6 +774,7 @@ class PuffeRL:
             logs["expert_collision_counts"] = self.create_expert_collision_counts_table()
             logs["blind_vehicle_collision_counts"] = self.create_blind_vehicle_collision_counts_table()
             logs["offroad_counts"] = self.create_offroad_counts_table()
+            logs["stop_line_counts"] = self.create_stop_line_counts_table()
             logs["comfort_violation_counts"] = self.create_comfort_violation_counts_table()
             logs["lane_center_offset_counts"] = self.create_lane_center_offset_counts_table()
             logs["acceleration_action_counts"] = self.create_acceleration_action_counts_table()
@@ -820,6 +826,14 @@ class PuffeRL:
         self.offroad_counts[:] = 0
 
         return wandb.Table(data=data, columns=["offroad_coefficient", "n"], log_mode="MUTABLE")
+
+    def create_stop_line_counts_table(self):
+        data = []
+        for coef_bin in range(100):
+            data.append([coef_bin / 100, self.stop_line_counts[coef_bin]])
+        self.stop_line_counts[:] = 0
+
+        return wandb.Table(data=data, columns=["stop_line_coefficient", "n"], log_mode="MUTABLE")
 
     def create_comfort_violation_counts_table(self):
         data = []

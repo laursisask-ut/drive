@@ -26,6 +26,12 @@
 #define CROSSWALK 8
 #define TRAFFIC_LIGHT_STOP_LINE 9
 
+#define TRAFFIC_LIGHT_OFF 0
+#define TRAFFIC_LIGHT_RED 1
+#define TRAFFIC_LIGHT_YELLOW 2
+#define TRAFFIC_LIGHT_GREEN 3
+#define TRAFFIC_LIGHT_UPDATE_INTERVAL 5
+
 #define INVALID_POSITION -10000.0f
 
 // Minimum distance to goal position
@@ -42,6 +48,7 @@
 #define NO_COLLISION 0
 #define VEHICLE_COLLISION 1
 #define OFFROAD 2
+#define RED_TRAFFIC_LIGHT_CROSSED 3
 
 // Metrics array indices
 #define COLLISION_IDX 0
@@ -85,9 +92,10 @@
 #define REWARD_COMPONENT_LANE_ALIGNMENT 3
 #define REWARD_COMPONENT_COLLISION 4
 #define REWARD_COMPONENT_OFFROAD 5
-#define REPLAY_REWARD_COMPONENT_COUNT 6
-#define REWARD_COMPONENT_VELOCITY 6
-#define REWARD_COMPONENT_ADE 7
+#define REWARD_COMPONENT_STOP_LINE 6
+#define REPLAY_REWARD_COMPONENT_COUNT 7
+#define REWARD_COMPONENT_VELOCITY 7
+#define REWARD_COMPONENT_ADE 8
 
 #define COLLISION_COUNT_BINS 101
 #define COLLISION_COUNT_BUCKETS 5151
@@ -139,11 +147,13 @@ struct Log {
     float lane_alignment_reward;
     float collision_reward;
     float offroad_reward;
+    float stop_line_reward;
     float velocity_reward;
     float ade_reward;
     float episode_length;
     float score;
     float offroad_rate;
+    float stop_line_rate;
     float collision_rate;
     float num_goals_reached;
     float completion_rate;
@@ -155,6 +165,7 @@ struct Log {
     float expert_static_car_count;
     float static_car_count;
     float avg_offroad_per_agent;
+    float avg_stop_line_per_agent;
     float avg_collisions_per_agent;
     float lane_lateral_offset;
     float lane_heading_angle_diff;
@@ -187,6 +198,8 @@ struct Entity {
     float* multi_goal_position_y;
     float* multi_goal_position_z;
     int mark_as_expert;
+    int traffic_light_color;
+    int traffic_light_transition_in;
     int collision_state;
     int collided_with_agent_idx;
     float metrics_array[6]; // metrics_array: [collision, offroad, reached_goal, lane_aligned, avg_displacement_error, lane_lateral_offset]
@@ -222,6 +235,7 @@ struct Entity {
     float lane_align_reward_coefficient;
     float collision_reward_coefficient;
     float offroad_reward_coefficient;
+    float stop_line_reward_coefficient;
     float lane_center_bias;
     int hide_other_vehicles;
 
@@ -266,6 +280,55 @@ float clip(float value, float min, float max) {
     if (value < min) return min;
     if (value > max) return max;
     return value;
+}
+
+static inline int rand_int_inclusive(int min_value, int max_value) {
+    return min_value + rand() % (max_value - min_value + 1);
+}
+
+static inline int grid_map_entity_type(int type) {
+    return type >= ROAD_LANE && type <= TRAFFIC_LIGHT_STOP_LINE;
+}
+
+static inline int sample_traffic_light_transition(int color) {
+    switch (color) {
+        case TRAFFIC_LIGHT_RED:
+            return rand_int_inclusive(5, 50);
+        case TRAFFIC_LIGHT_YELLOW:
+            return rand_int_inclusive(10, 30);
+        case TRAFFIC_LIGHT_GREEN:
+            return rand_int_inclusive(10, 100);
+        default:
+            return 0;
+    }
+}
+
+static inline float traffic_light_observation_value(int color) {
+    switch (color) {
+        case TRAFFIC_LIGHT_RED:
+            return -0.5f;
+        case TRAFFIC_LIGHT_YELLOW:
+            return 0.0f;
+        case TRAFFIC_LIGHT_GREEN:
+            return 0.5f;
+        case TRAFFIC_LIGHT_OFF:
+        default:
+            return -1.0f;
+    }
+}
+
+static inline Color traffic_light_render_color(int color) {
+    switch (color) {
+        case TRAFFIC_LIGHT_RED:
+            return RED;
+        case TRAFFIC_LIGHT_YELLOW:
+            return ORANGE;
+        case TRAFFIC_LIGHT_GREEN:
+            return GREEN;
+        case TRAFFIC_LIGHT_OFF:
+        default:
+            return DARKGRAY;
+    }
 }
 
 float compute_displacement_error(Entity* agent, int timestep) {
@@ -345,6 +408,7 @@ struct Drive {
     int* expert_collision_counts;
     int* blind_vehicle_collision_counts;
     int* offroad_counts;
+    int* stop_line_counts;
     int* comfort_violation_counts;
     int* lane_center_offset_counts;
     int* acceleration_action_counts;
@@ -390,6 +454,7 @@ struct Drive {
     int scenario_length;
     int control_non_vehicles;
     int dynamic_map_generation;
+    int traffic_lights_enabled;
     int export_replay_enabled;
     char* replay_dir;
     ReplayExportLog export_log;
@@ -473,10 +538,14 @@ void add_log(Drive* env) {
         }
         int offroad = env->logs[i].offroad_rate;
         env->log.offroad_rate += offroad;
+        int stop_line = env->logs[i].stop_line_rate;
+        env->log.stop_line_rate += stop_line;
         int collided = env->logs[i].collision_rate;
         env->log.collision_rate += collided;
         float avg_offroad_per_agent = env->logs[i].avg_offroad_per_agent;
         env->log.avg_offroad_per_agent += avg_offroad_per_agent;
+        float avg_stop_line_per_agent = env->logs[i].avg_stop_line_per_agent;
+        env->log.avg_stop_line_per_agent += avg_stop_line_per_agent;
         float avg_collisions_per_agent = env->logs[i].avg_collisions_per_agent;
         env->log.avg_collisions_per_agent += avg_collisions_per_agent;
         int num_goals_reached = env->logs[i].num_goals_reached;
@@ -502,6 +571,7 @@ void add_log(Drive* env) {
         env->log.lane_alignment_reward += env->logs[i].lane_alignment_reward;
         env->log.collision_reward += env->logs[i].collision_reward;
         env->log.offroad_reward += env->logs[i].offroad_reward;
+        env->log.stop_line_reward += env->logs[i].stop_line_reward;
         env->log.velocity_reward += env->logs[i].velocity_reward;
         env->log.ade_reward += env->logs[i].ade_reward;
         // Log composition counts per agent so vec_log averaging recovers the per-env value
@@ -531,6 +601,9 @@ static inline void accumulate_reward_component(Log* log, int component, float re
         break;
     case REWARD_COMPONENT_OFFROAD:
         log->offroad_reward += reward;
+        break;
+    case REWARD_COMPONENT_STOP_LINE:
+        log->stop_line_reward += reward;
         break;
     case REWARD_COMPONENT_VELOCITY:
         log->velocity_reward += reward;
@@ -756,6 +829,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             entities[i].lane_align_reward_coefficient = 2.5e-3f;
             entities[i].collision_reward_coefficient = 1.0f;
             entities[i].offroad_reward_coefficient = 1.0f;
+            entities[i].stop_line_reward_coefficient = 1.0f;
             entities[i].lane_center_bias = 0.0f;
             entities[i].goal_radius = 3.0f;
         }
@@ -961,7 +1035,7 @@ void init_grid_map(Drive* env){
     float bottom_right_y;
     int first_valid_point = 0;
     for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type > 3 && env->entities[i].type <= 8){
+        if(grid_map_entity_type(env->entities[i].type)){
             // Check all points in the trajectory for road elements
             Entity* e = &env->entities[i];
             for(int j = 0; j < e->array_size; j++){
@@ -999,7 +1073,7 @@ void init_grid_map(Drive* env){
 
     // Calculate number of entities in each grid cell
     for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type > 3 && env->entities[i].type <= 8){
+        if(grid_map_entity_type(env->entities[i].type)){
             for(int j = 0; j < env->entities[i].array_size - 1; j++){
                 float x_center = (env->entities[i].traj_x[j] + env->entities[i].traj_x[j+1]) / 2;
                 float y_center = (env->entities[i].traj_y[j] + env->entities[i].traj_y[j+1]) / 2;
@@ -1024,7 +1098,7 @@ void init_grid_map(Drive* env){
 
     // Populate grid cells
     for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type > 3 && env->entities[i].type <= 8){         // NOTE: Only Road Edges, Lines, and Lanes in grid map
+        if(grid_map_entity_type(env->entities[i].type)){         // NOTE: Road edges, lines, lanes, and stop lines in grid map
             for(int j = 0; j < env->entities[i].array_size - 1; j++){
                 float x_center = (env->entities[i].traj_x[j] + env->entities[i].traj_x[j+1]) / 2;
                 float y_center = (env->entities[i].traj_y[j] + env->entities[i].traj_y[j+1]) / 2;
@@ -1522,6 +1596,19 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
         Entity* entity;
         entity = &env->entities[entity_list[i].entity_idx];
 
+        if (env->traffic_lights_enabled && entity->type == TRAFFIC_LIGHT_STOP_LINE && entity->traffic_light_color == TRAFFIC_LIGHT_RED) {
+            int geometry_idx = entity_list[i].geometry_idx;
+            float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
+            float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
+            for (int k = 0; k < 4; k++) {
+                int next = (k + 1) % 4;
+                if (check_line_intersection(corners[k], corners[next], start, end)) {
+                    collided = RED_TRAFFIC_LIGHT_CROSSED;
+                    break;
+                }
+            }
+        }
+
         // Check for offroad collision with road edges
         if(entity->type == ROAD_EDGE && collided != OFFROAD) {
             int geometry_idx = entity_list[i].geometry_idx;
@@ -1863,6 +1950,46 @@ void init_goal_positions(Drive* env){
     }
 }
 
+void init_traffic_lights(Drive* env) {
+    env->traffic_lights_enabled = rand_int_inclusive(0, 4) > 0;
+
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != TRAFFIC_LIGHT_STOP_LINE) continue;
+
+        if (env->traffic_lights_enabled) {
+            e->traffic_light_color = rand_int_inclusive(TRAFFIC_LIGHT_OFF, TRAFFIC_LIGHT_GREEN);
+            e->traffic_light_transition_in = sample_traffic_light_transition(e->traffic_light_color);
+        } else {
+            e->traffic_light_color = TRAFFIC_LIGHT_OFF;
+        }
+    }
+}
+
+void update_traffic_lights(Drive* env) {
+    if (!env->traffic_lights_enabled || env->timestep == env->init_steps + 1 || env->timestep % TRAFFIC_LIGHT_UPDATE_INTERVAL != 0) {
+        return;
+    }
+
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != TRAFFIC_LIGHT_STOP_LINE || e->traffic_light_color == TRAFFIC_LIGHT_OFF) continue;
+
+        e->traffic_light_transition_in -= TRAFFIC_LIGHT_UPDATE_INTERVAL;
+        if (e->traffic_light_transition_in > 0) continue;
+
+        if (e->traffic_light_color == TRAFFIC_LIGHT_RED) {
+            e->traffic_light_color = TRAFFIC_LIGHT_YELLOW;
+        } else if (e->traffic_light_color == TRAFFIC_LIGHT_YELLOW) {
+            e->traffic_light_color = rand_int_inclusive(0, 1) ? TRAFFIC_LIGHT_GREEN : TRAFFIC_LIGHT_RED;
+        } else if (e->traffic_light_color == TRAFFIC_LIGHT_GREEN) {
+            e->traffic_light_color = TRAFFIC_LIGHT_YELLOW;
+        }
+
+        e->traffic_light_transition_in = sample_traffic_light_transition(e->traffic_light_color);
+    }
+}
+
 void init(Drive* env){
     env->human_agent_idx = 0;
     env->timestep = 0;
@@ -1884,6 +2011,7 @@ void init(Drive* env){
     env->expert_collision_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->blind_vehicle_collision_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->offroad_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
+    env->stop_line_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->comfort_violation_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->lane_center_offset_counts = (int*)calloc(LANE_CENTER_OFFSET_BUCKETS, sizeof(int));
     env->acceleration_action_counts = (int*)calloc(CLASSIC_ACCELERATION_ACTION_BINS, sizeof(int));
@@ -2073,6 +2201,7 @@ void c_close(Drive* env){
     free(env->expert_collision_counts);
     free(env->blind_vehicle_collision_counts);
     free(env->offroad_counts);
+    free(env->stop_line_counts);
     free(env->comfort_violation_counts);
     free(env->lane_center_offset_counts);
     free(env->acceleration_action_counts);
@@ -2181,7 +2310,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 
         // Track signed longitudinal speed so negative acceleration can produce reverse motion.
         float speed = sqrtf(vx*vx + vy*vy);
-        float new_speed = speed + 0.5f * acceleration * env->dt;
+        float new_speed = speed + acceleration * env->dt;
         new_speed = clipSpeed(new_speed, agent);
 
         // Compute yaw rate
@@ -2486,7 +2615,10 @@ void compute_observations(Drive* env) {
             float x_obs = rel_x*cos_heading + rel_y*sin_heading;
             float y_obs = -rel_x*sin_heading + rel_y*cos_heading;
             float length = relative_distance_2d(mid_x, mid_y, end_x, end_y);
-            float width = 0.1;
+            float line_attribute = 0.1f / MAX_ROAD_SCALE;
+            if (entity->type == TRAFFIC_LIGHT_STOP_LINE) {
+                line_attribute = traffic_light_observation_value(entity->traffic_light_color);
+            }
             // Calculate angle from ego to midpoint (vector from ego to midpoint)
             float dx = end_x - mid_x;
             float dy = end_y - mid_y;
@@ -2503,7 +2635,7 @@ void compute_observations(Drive* env) {
             obs[obs_idx] = x_obs * 0.02f;
             obs[obs_idx + 1] = y_obs * 0.02f;
             obs[obs_idx + 2] = length / MAX_ROAD_SEGMENT_LENGTH;
-            obs[obs_idx + 3] = width / MAX_ROAD_SCALE;
+            obs[obs_idx + 3] = line_attribute;
             obs[obs_idx + 4] = cos_angle;
             obs[obs_idx + 5] = sin_angle;
             obs[obs_idx + 6] = entity->type - 4.0f;
@@ -2690,6 +2822,7 @@ void c_reset(Drive* env){
     }
     env->timestep = env->init_steps;
     set_start_position(env);
+    init_traffic_lights(env);
     for(int x = 0;x<env->active_agent_count; x++){
         env->logs[x] = (Log){0};
         int agent_idx = env->active_agent_indices[x];
@@ -2769,6 +2902,8 @@ void c_step(Drive* env){
         return;
     }
 
+    update_traffic_lights(env);
+
     // Move statix experts
     for (int i = 0; i < env->expert_static_car_count; i++) {
         int expert_idx = env->expert_static_car_indices[i];
@@ -2833,6 +2968,15 @@ void c_step(Drive* env){
                 if (e->offroad_reward_coefficient >= 0.5f) {
                     env->terminals[i] = 1;
                 }
+            } else if (collision_state == RED_TRAFFIC_LIGHT_CROSSED &&
+                    prev_collision_state != RED_TRAFFIC_LIGHT_CROSSED) {
+                float stop_line_reward = -e->stop_line_reward_coefficient;
+                env->rewards[i] = stop_line_reward;
+                env->logs[i].stop_line_rate = 1.0f;
+                record_reward_component(env, i, REWARD_COMPONENT_STOP_LINE, stop_line_reward);
+                env->logs[i].avg_stop_line_per_agent += 1.0f;
+                int stop_line_bin = clipped_scaled_bin(e->stop_line_reward_coefficient, 100.0f, COEFFICIENT_COUNT_BINS);
+                env->stop_line_counts[stop_line_bin]++;
             }
             if(!env->entities[agent_idx].reached_goal_this_episode){
                 env->entities[agent_idx].collided_before_goal = 1;
@@ -2896,7 +3040,7 @@ void c_step(Drive* env){
                     env->entities[agent_idx].reached_final_goal = 1;
                 }
             } else if (env->entities[agent_idx].multi_goal_count > 0) {
-                float reward = env->reward_goal * fmaxf(1.0f - 0.2f * env->entities[agent_idx].multi_goal_idx, 0.1f);
+                float reward = env->reward_goal;
                 env->rewards[i] += reward;
                 record_reward_component(env, i, REWARD_COMPONENT_GOAL, reward);
                 env->entities[agent_idx].sampled_new_goal = 1;
@@ -3757,7 +3901,7 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
             } else if (env->entities[i].type == CROSSWALK) {
                 DrawLine3D(start, end, YELLOW);
             } else if (env->entities[i].type == TRAFFIC_LIGHT_STOP_LINE) {
-                DrawLine3D(start, end, PINK);
+                DrawLine3D(start, end, traffic_light_render_color(env->entities[i].traffic_light_color));
             } else if (env->entities[i].type == ROAD_LANE) {
                 DrawLine3D(start, end, GRAY);
             }

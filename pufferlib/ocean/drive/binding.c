@@ -309,6 +309,7 @@ static int my_log(
     int* expert_collision_counts,
     int* blind_vehicle_collision_counts,
     int* offroad_counts,
+    int* stop_line_counts,
     int* comfort_violation_counts,
     int* lane_center_offset_counts,
     int* acceleration_action_counts,
@@ -316,6 +317,7 @@ static int my_log(
     int* speed_counts) {
     assign_to_dict(dict, "n", log->n);
     assign_to_dict(dict, "offroad_rate", log->offroad_rate);
+    assign_to_dict(dict, "stop_line_rate", log->stop_line_rate);
     assign_to_dict(dict, "episode_length", log->episode_length);
     assign_to_dict(dict, "collision_rate", log->collision_rate);
     assign_to_dict(dict, "episode_return", log->episode_return);
@@ -325,6 +327,7 @@ static int my_log(
     assign_to_dict(dict, "lane_alignment_reward", log->lane_alignment_reward);
     assign_to_dict(dict, "collision_reward", log->collision_reward);
     assign_to_dict(dict, "offroad_reward", log->offroad_reward);
+    assign_to_dict(dict, "stop_line_reward", log->stop_line_reward);
     assign_to_dict(dict, "velocity_reward", log->velocity_reward);
     assign_to_dict(dict, "ade_reward", log->ade_reward);
     assign_to_dict(dict, "dnf_rate", log->dnf_rate);
@@ -337,6 +340,7 @@ static int my_log(
     // assign_to_dict(dict, "expert_static_car_count", log->expert_static_car_count);
     // assign_to_dict(dict, "static_car_count", log->static_car_count);
     assign_to_dict(dict, "avg_offroad_per_agent", log->avg_offroad_per_agent);
+    assign_to_dict(dict, "avg_stop_line_per_agent", log->avg_stop_line_per_agent);
     assign_to_dict(dict, "avg_collisions_per_agent", log->avg_collisions_per_agent);
     assign_to_dict(dict, "close_to_lane", log->close_to_lane);
     assign_to_dict(dict, "lane_heading_angle_diff", log->lane_heading_angle_diff);
@@ -352,6 +356,9 @@ static int my_log(
         return 1;
     }
     if (assign_int_array_to_dict(dict, "offroad_counts", offroad_counts, COEFFICIENT_COUNT_BINS)) {
+        return 1;
+    }
+    if (assign_int_array_to_dict(dict, "stop_line_counts", stop_line_counts, COEFFICIENT_COUNT_BINS)) {
         return 1;
     }
     if (assign_int_array_to_dict(dict, "comfort_violation_counts", comfort_violation_counts, COEFFICIENT_COUNT_BINS)) {
