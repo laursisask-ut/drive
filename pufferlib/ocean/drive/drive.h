@@ -2833,15 +2833,17 @@ void c_step(Drive* env){
 
     env->timestep++;
 
-    if (env->timestep > env->scenario_length && env->play_exactly_once) return;
+    if (env->timestep > env->scenario_length + 1 && env->play_exactly_once) return;
 
-    if(env->timestep == env->scenario_length){
+    if (env->timestep == env->scenario_length) {
         add_log(env);
 	    if (env->export_replay_enabled && env->export_log.traj_x)
             saveReplayToFile(env);
-        if (!env->play_exactly_once)
-            c_reset(env);
         memset(env->truncations, 1, env->active_agent_count * sizeof(unsigned char));
+    }
+
+    if (env->timestep == env->scenario_length + 1 && !env->play_exactly_once) {
+        c_reset(env);
         return;
     }
 

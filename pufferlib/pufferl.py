@@ -78,6 +78,70 @@ DRIVE_CLASSIC_STEERING_VALUES = [
     0.035, 0.08, 0.167, 0.333, 0.5, 0.667,
 ]
 
+SYNTHETIC_VALIDATION_SCENARIO_LENGTH = 200
+YIELD_VALIDATION_MAP_COUNT = 64
+DRIVE_STEPS_PER_SECOND = 10
+YIELD_VALIDATION_SECONDS = 10
+YIELD_VALIDATION_SCENARIO_LENGTH = YIELD_VALIDATION_SECONDS * DRIVE_STEPS_PER_SECOND
+YIELD_VALIDATION_AGENTS_PER_MAP = 1
+
+VALIDATION_SPECS = (
+    {
+        "name": "validation",
+        "env_kwargs": dict(
+            resample_frequency=-1,
+            num_maps=-1,
+            map_dir="validation-maps",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+        ),
+        "max_scenario_length": 620,
+    },
+    {
+        "name": "synthetic_validation",
+        "env_kwargs": dict(
+            resample_frequency=-1,
+            num_maps=128,
+            num_agents=128 * agents_per_generated_map,
+            map_dir="synthetic-validation-maps",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            scenario_length=SYNTHETIC_VALIDATION_SCENARIO_LENGTH,
+        ),
+        "max_scenario_length": SYNTHETIC_VALIDATION_SCENARIO_LENGTH + 1,
+    },
+    {
+        "name": "yield_validation",
+        "sample_count": YIELD_VALIDATION_MAP_COUNT,
+        "sample_seed": 0,
+        "env_kwargs": dict(
+            resample_frequency=-1,
+            num_maps=YIELD_VALIDATION_MAP_COUNT,
+            num_agents=YIELD_VALIDATION_MAP_COUNT * YIELD_VALIDATION_AGENTS_PER_MAP,
+            map_dir="yield-validation",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            scenario_length=YIELD_VALIDATION_SCENARIO_LENGTH,
+        ),
+        "max_scenario_length": YIELD_VALIDATION_SCENARIO_LENGTH + 1,
+    },
+    {
+        "name": "yield_multi_car_validation",
+        "sample_count": YIELD_VALIDATION_MAP_COUNT,
+        "sample_seed": 1,
+        "env_kwargs": dict(
+            resample_frequency=-1,
+            num_maps=YIELD_VALIDATION_MAP_COUNT,
+            num_agents=YIELD_VALIDATION_MAP_COUNT * YIELD_VALIDATION_AGENTS_PER_MAP,
+            map_dir="yield-multi-car-validation",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            scenario_length=YIELD_VALIDATION_SCENARIO_LENGTH,
+        ),
+        "max_scenario_length": YIELD_VALIDATION_SCENARIO_LENGTH + 1,
+    },
+)
+
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
@@ -238,8 +302,7 @@ class PuffeRL:
         self.utilization = Utilization()
         self.profile = Profile()
         self.stats = defaultdict(list)
-        self.val_stats = defaultdict(list)
-        self.synthetic_val_stats = defaultdict(list)
+        self._reset_validation_stats()
         self.last_stats = defaultdict(list)
         self.collision_counts = np.zeros((5151,), np.int64)
         self.expert_collision_counts = np.zeros((100,), np.int64)
@@ -254,29 +317,25 @@ class PuffeRL:
         self.last_table_metrics_sent_epoch = 0
         self.losses = {}
 
-        self.validation_env = Drive(
-            resample_frequency=-1,
-            num_maps=-1,
-            map_dir="validation-maps",
-            dynamic_map_generation=False,
-            all_maps_exactly_once=True
-        )
-        self.synthetic_validation_env = Drive(
-            resample_frequency=-1,
-            num_maps=128,
-            num_agents=128 * agents_per_generated_map,
-            map_dir="synthetic-validation-maps",
-            dynamic_map_generation=False,
-            all_maps_exactly_once=True,
-            scenario_length=200
-        )
-
-        self.run_validation()
-        self.run_synthetic_validation()
+        self.validation_envs = self._create_validation_envs()
+        self.run_validations()
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
+
+    def _reset_validation_stats(self):
+        self.validation_stats = {spec["name"]: defaultdict(list) for spec in VALIDATION_SPECS}
+
+    def _create_validation_envs(self):
+        validation_envs = {}
+        for spec in VALIDATION_SPECS:
+            validation_envs[spec["name"]] = (
+                Drive(**spec["env_kwargs"]),
+                spec["max_scenario_length"],
+            )
+
+        return validation_envs
 
     @property
     def uptime(self):
@@ -574,15 +633,13 @@ class PuffeRL:
             self.losses = losses
             self.print_dashboard()
             self.stats = defaultdict(list)
-            self.val_stats = defaultdict(list)
-            self.synthetic_val_stats = defaultdict(list)
+            self._reset_validation_stats()
             self.last_log_time = time.time()
             self.last_log_step = self.global_step
             profile.clear()
 
         if self.epoch % config["validation_interval"] == 0 or done_training:
-            self.run_validation()
-            self.run_synthetic_validation()
+            self.run_validations()
 
         if self.epoch % config["checkpoint_interval"] == 0 or done_training:
             self.save_checkpoint()
@@ -727,33 +784,26 @@ class PuffeRL:
 
         return logs
 
+    def _mean_stats(self, stats):
+        for k in list(stats.keys()):
+            v = stats[k]
+            try:
+                v = np.mean(v)
+            except:
+                del stats[k]
+                continue
+
+            stats[k] = v
+
     def mean_and_log(self):
         config = self.config
-        for k in list(self.stats.keys()):
-            v = self.stats[k]
-            try:
-                v = np.mean(v)
-            except:
-                del self.stats[k]
+        self._mean_stats(self.stats)
+        for stats in self.validation_stats.values():
+            self._mean_stats(stats)
 
-            self.stats[k] = v
-        for k in list(self.val_stats.keys()):
-            v = self.val_stats[k]
-            try:
-                v = np.mean(v)
-            except:
-                del self.val_stats[k]
-
-            self.val_stats[k] = v
-        for k in list(self.synthetic_val_stats.keys()):
-            v = self.synthetic_val_stats[k]
-            try:
-                v = np.mean(v)
-            except:
-                del self.synthetic_val_stats[k]
-
-            self.synthetic_val_stats[k] = v
-
+        validation_logs = {}
+        for name, stats in self.validation_stats.items():
+            validation_logs.update({f"{name}/{k}": v for k, v in stats.items()})
         device = config["device"]
         agent_steps = int(dist_sum(self.global_step, device))
         logs = {
@@ -763,8 +813,7 @@ class PuffeRL:
             "epoch": int(dist_sum(self.epoch, device)),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
             **{f"environment/{k}": v for k, v in self.stats.items()},
-            **{f"validation/{k}": v for k, v in self.val_stats.items()},
-            **{f"synthetic_validation/{k}": v for k, v in self.synthetic_val_stats.items()},
+            **validation_logs,
             **{f"losses/{k}": v for k, v in self.losses.items()},
             **{f"performance/{k}": v["elapsed"] for k, v in self.profile},
             # **{f'environment/{k}': dist_mean(v, device) for k, v in self.stats.items()},
@@ -923,12 +972,10 @@ class PuffeRL:
         return model_path
 
     @torch.no_grad()
-    def run_validation(self):
-        self._run_validation_env(self.validation_env, self.val_stats, 620)
-
-    @torch.no_grad()
-    def run_synthetic_validation(self):
-        self._run_validation_env(self.synthetic_validation_env, self.synthetic_val_stats, 201)
+    def run_validations(self):
+        for name in self.validation_envs:
+            env, max_scenario_length = self.validation_envs[name]
+            self._run_validation_env(env, self.validation_stats[name], max_scenario_length)
 
     def _run_validation_env(self, env, stats, max_scenario_length):
         observations, _ = env.reset()
