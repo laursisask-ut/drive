@@ -2399,7 +2399,7 @@ void compute_observations(Drive* env) {
         obs[2] = ego_speed / MAX_SPEED;
         obs[3] = ego_entity->width / MAX_VEH_WIDTH;
         obs[4] = ego_entity->length / MAX_VEH_LEN;
-        obs[5] = (ego_entity->collision_state > 0) ? 1.0f : 0.0f;
+        obs[5] = ego_entity->stop_line_reward_coefficient;
 
         if (ego_entity->max_speed == 0.0f) {
             obs[6] = 1.0f;
