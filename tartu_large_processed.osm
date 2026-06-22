@@ -1349679,12 +1349679,6 @@
     <tag k="type" v="regulatory_element" />
     <tag k="subtype" v="right_of_way" />
   </relation>
-  <relation id="200010" version="1" visible="true">
-    <member type="way" ref="5034066" role="ref_line" />
-    <member type="relation" ref="71556" role="right_of_way" />
-    <tag k="type" v="regulatory_element" />
-    <tag k="subtype" v="right_of_way" />
-  </relation>
   <relation id="200011" version="1" visible="true">
     <member type="way" ref="5034069" role="ref_line" />
     <member type="relation" ref="71557" role="right_of_way" />
