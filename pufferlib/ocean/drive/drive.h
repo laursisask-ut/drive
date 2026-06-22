@@ -379,8 +379,6 @@ struct GridMap {
 
     // Extras/Optimizations
     int vision_range;
-    int* neighbor_cache_count; // number of entities in each cells neighbor cache
-    GridMapEntity** neighbor_cache_entities; // preallocated array to hold neighbor entities
 };
 
 struct ReplayExportLog {
@@ -1150,78 +1148,6 @@ void init_neighbor_offsets(Drive* env) {
             steps_to_take++;
         }
     }
-}
-
-void cache_neighbor_offsets(Drive* env){
-    int count = 0;
-    int cell_count = env->grid_map->grid_cols*env->grid_map->grid_rows;
-    env->grid_map->neighbor_cache_entities = (GridMapEntity**)calloc(cell_count, sizeof(GridMapEntity*));
-    env->grid_map->neighbor_cache_count = (int*)calloc(cell_count + 1, sizeof(int));
-    for(int i = 0; i < cell_count; i++){
-        int cell_x = i % env->grid_map->grid_cols;  // Convert to 2D coordinates
-        int cell_y = i / env->grid_map->grid_cols;
-        int current_cell_neighbor_count = 0;
-        for(int j = 0; j < env->grid_map->vision_range*env->grid_map->vision_range; j++){
-            int x = cell_x + env->neighbor_offsets[j*2];
-            int y = cell_y + env->neighbor_offsets[j*2+1];
-            int grid_index = env->grid_map->grid_cols*y + x;
-            if(x < 0 || x >= env->grid_map->grid_cols || y < 0 || y >= env->grid_map->grid_rows) continue;
-            int grid_count = env->grid_map->cell_entities_count[grid_index];
-            current_cell_neighbor_count += grid_count;
-        }
-        env->grid_map->neighbor_cache_count[i] = current_cell_neighbor_count;
-        count += current_cell_neighbor_count;
-        if(current_cell_neighbor_count == 0) {
-            env->grid_map->neighbor_cache_entities[i] = NULL;
-            continue;
-        }
-        env->grid_map->neighbor_cache_entities[i] = (GridMapEntity*)calloc(current_cell_neighbor_count, sizeof(GridMapEntity));
-    }
-
-    env->grid_map->neighbor_cache_count[cell_count] = count;
-    for(int i = 0; i < cell_count; i ++){
-        int cell_x = i % env->grid_map->grid_cols;  // Convert to 2D coordinates
-        int cell_y = i / env->grid_map->grid_cols;
-        int base_index = 0;
-        for(int j = 0; j < env->grid_map->vision_range*env->grid_map->vision_range; j++){
-            int x = cell_x + env->neighbor_offsets[j*2];
-            int y = cell_y + env->neighbor_offsets[j*2+1];
-            int grid_index = env->grid_map->grid_cols*y + x;
-            if(x < 0 || x >= env->grid_map->grid_cols || y < 0 || y >= env->grid_map->grid_rows) continue;
-            int grid_count = env->grid_map->cell_entities_count[grid_index];
-
-            // Skip if no entities or source is NULL
-            if(grid_count == 0 || env->grid_map->cells[grid_index] == NULL) {
-                continue;
-            }
-
-            int src_idx = grid_index;
-            int dst_idx = base_index;
-            // Copy grid_count pairs (entity_idx, geometry_idx) at once
-            memcpy(&env->grid_map->neighbor_cache_entities[i][dst_idx],
-                env->grid_map->cells[src_idx],
-                grid_count * sizeof(GridMapEntity));
-            // for(int k = 0; k < grid_count; k++){
-            //     env->grid_map->neighbor_cache_entities[i][dst_idx + k] = env->grid_map->cells[src_idx][k];
-            // }
-            base_index += grid_count;
-        }
-    }
-}
-
-int get_neighbor_cache_entities(Drive* env, int cell_idx, GridMapEntity* entities, int max_entities) {
-    GridMap* grid_map = env->grid_map;
-    if (cell_idx < 0 || cell_idx >= (grid_map->grid_cols * grid_map->grid_rows)) {
-        return 0; // Invalid cell index
-    }
-
-    int count = grid_map->neighbor_cache_count[cell_idx];
-    // Limit to available space
-    if (count > max_entities) {
-        count = max_entities;
-    }
-    memcpy(entities, grid_map->neighbor_cache_entities[cell_idx], count * sizeof(GridMapEntity));
-    return count;
 }
 
 void set_means(Drive* env) {
@@ -2000,7 +1926,6 @@ void init(Drive* env){
     if (env->use_goal_generation) init_topology_graph(env);
     env->grid_map->vision_range = 21;
     init_neighbor_offsets(env);
-    cache_neighbor_offsets(env);
     env->logs_capacity = 0;
     set_active_agents(env);
     env->logs_capacity = env->active_agent_count;
@@ -2216,11 +2141,7 @@ void c_close(Drive* env){
     free(env->grid_map->cell_entities_count);
     free(env->neighbor_offsets);
 
-    for(int i = 0; i < grid_cell_count; i++){
-        free(env->grid_map->neighbor_cache_entities[i]);
-    }
-    free(env->grid_map->neighbor_cache_entities);
-    free(env->grid_map->neighbor_cache_count);
+
     free(env->grid_map);
     free(env->static_car_indices);
     free(env->expert_static_car_indices);
@@ -2581,67 +2502,79 @@ void compute_observations(Drive* env) {
         memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
         obs_idx += remaining_partner_obs;
         // map observations
-        GridMapEntity entity_list[MAX_ENTITIES_PER_CELL*25];
         int grid_idx = getGridIndex(env, ego_entity->x, ego_entity->y);
 
-        int list_size = get_neighbor_cache_entities(env, grid_idx, entity_list, MAX_ROAD_SEGMENT_OBSERVATIONS);
+        int cell_x = grid_idx % env->grid_map->grid_cols;
+        int cell_y = grid_idx / env->grid_map->grid_cols;
+        int road_obs_count = 0;
+        int neighbor_count = env->grid_map->vision_range*env->grid_map->vision_range;
+        for (int j = 0; j < neighbor_count && road_obs_count < MAX_ROAD_SEGMENT_OBSERVATIONS; j++) {
+            int x = cell_x + env->neighbor_offsets[j*2];
+            int y = cell_y + env->neighbor_offsets[j*2+1];
+            if (x < 0 || x >= env->grid_map->grid_cols || y < 0 || y >= env->grid_map->grid_rows) continue;
+            int neighbor_idx = env->grid_map->grid_cols*y + x; 
+            int entity_count = env->grid_map->cell_entities_count[neighbor_idx];
+            if (entity_count == 0 || env->grid_map->cells[neighbor_idx] == NULL) continue;
 
-        for(int k = 0; k < list_size; k++) {
-            int entity_idx = entity_list[k].entity_idx;
-            int geometry_idx = entity_list[k].geometry_idx;
+            GridMapEntity* neighbor_entities = env->grid_map->cells[neighbor_idx];
+            for (int k = 0; k < entity_count && road_obs_count < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
+                int entity_idx = neighbor_entities[k].entity_idx;
+                int geometry_idx = neighbor_entities[k].geometry_idx;
 
-            // Validate entity_idx before accessing
-            if(entity_idx < 0 || entity_idx >= env->num_entities) {
-                printf("ERROR: Invalid entity_idx %d (max: %d)\n", entity_idx, env->num_entities-1);
-                continue;
-            }
+                // Validate entity_idx before accessing
+                if(entity_idx < 0 || entity_idx >= env->num_entities) {
+                    printf("ERROR: Invalid entity_idx %d (max: %d)\n", entity_idx, env->num_entities-1);
+                    continue;
+                }
 
-            Entity* entity = &env->entities[entity_idx];
+                Entity* entity = &env->entities[entity_idx];
 
-            // Validate geometry_idx before accessing
-            if(geometry_idx < 0 || geometry_idx >= entity->array_size) {
-                printf("ERROR: Invalid geometry_idx %d for entity %d (max: %d)\n",
-                       geometry_idx, entity_idx, entity->array_size-1);
-                continue;
+                // Validate geometry_idx before accessing
+                if(geometry_idx < 0 || geometry_idx >= entity->array_size) {
+                    printf("ERROR: Invalid geometry_idx %d for entity %d (max: %d)\n",
+                        geometry_idx, entity_idx, entity->array_size-1);
+                    continue;
+                }
+                float start_x = entity->traj_x[geometry_idx];
+                float start_y = entity->traj_y[geometry_idx];
+                float end_x = entity->traj_x[geometry_idx+1];
+                float end_y = entity->traj_y[geometry_idx+1];
+                float mid_x = (start_x + end_x) / 2.0f;
+                float mid_y = (start_y + end_y) / 2.0f;
+                float rel_x = mid_x - ego_entity->x;
+                float rel_y = mid_y - ego_entity->y;
+                float x_obs = rel_x*cos_heading + rel_y*sin_heading;
+                float y_obs = -rel_x*sin_heading + rel_y*cos_heading;
+                float length = relative_distance_2d(mid_x, mid_y, end_x, end_y);
+                float line_attribute = 0.1f / MAX_ROAD_SCALE;
+                if (entity->type == TRAFFIC_LIGHT_STOP_LINE) {
+                    line_attribute = traffic_light_observation_value(entity->traffic_light_color);
+                }
+                // Calculate angle from ego to midpoint (vector from ego to midpoint)
+                float dx = end_x - mid_x;
+                float dy = end_y - mid_y;
+                float dx_norm = dx;
+                float dy_norm = dy;
+                float hypot = sqrtf(dx*dx + dy*dy);
+                if(hypot > 0) {
+                    dx_norm /= hypot;
+                    dy_norm /= hypot;
+                }
+                // Compute sin and cos of relative angle directly without atan2f
+                float cos_angle = dx_norm*cos_heading + dy_norm*sin_heading;
+                float sin_angle = -dx_norm*sin_heading + dy_norm*cos_heading;
+                obs[obs_idx] = x_obs * 0.02f;
+                obs[obs_idx + 1] = y_obs * 0.02f;
+                obs[obs_idx + 2] = length / MAX_ROAD_SEGMENT_LENGTH;
+                obs[obs_idx + 3] = line_attribute;
+                obs[obs_idx + 4] = cos_angle;
+                obs[obs_idx + 5] = sin_angle;
+                obs[obs_idx + 6] = entity->type - 4.0f;
+                obs_idx += 7;
+                road_obs_count++;
             }
-            float start_x = entity->traj_x[geometry_idx];
-            float start_y = entity->traj_y[geometry_idx];
-            float end_x = entity->traj_x[geometry_idx+1];
-            float end_y = entity->traj_y[geometry_idx+1];
-            float mid_x = (start_x + end_x) / 2.0f;
-            float mid_y = (start_y + end_y) / 2.0f;
-            float rel_x = mid_x - ego_entity->x;
-            float rel_y = mid_y - ego_entity->y;
-            float x_obs = rel_x*cos_heading + rel_y*sin_heading;
-            float y_obs = -rel_x*sin_heading + rel_y*cos_heading;
-            float length = relative_distance_2d(mid_x, mid_y, end_x, end_y);
-            float line_attribute = 0.1f / MAX_ROAD_SCALE;
-            if (entity->type == TRAFFIC_LIGHT_STOP_LINE) {
-                line_attribute = traffic_light_observation_value(entity->traffic_light_color);
-            }
-            // Calculate angle from ego to midpoint (vector from ego to midpoint)
-            float dx = end_x - mid_x;
-            float dy = end_y - mid_y;
-            float dx_norm = dx;
-            float dy_norm = dy;
-            float hypot = sqrtf(dx*dx + dy*dy);
-            if(hypot > 0) {
-                dx_norm /= hypot;
-                dy_norm /= hypot;
-            }
-            // Compute sin and cos of relative angle directly without atan2f
-            float cos_angle = dx_norm*cos_heading + dy_norm*sin_heading;
-            float sin_angle = -dx_norm*sin_heading + dy_norm*cos_heading;
-            obs[obs_idx] = x_obs * 0.02f;
-            obs[obs_idx + 1] = y_obs * 0.02f;
-            obs[obs_idx + 2] = length / MAX_ROAD_SEGMENT_LENGTH;
-            obs[obs_idx + 3] = line_attribute;
-            obs[obs_idx + 4] = cos_angle;
-            obs[obs_idx + 5] = sin_angle;
-            obs[obs_idx + 6] = entity->type - 4.0f;
-            obs_idx += 7;
         }
-        int remaining_obs = (MAX_ROAD_SEGMENT_OBSERVATIONS - list_size) * 7;
+        int remaining_obs = (MAX_ROAD_SEGMENT_OBSERVATIONS - road_obs_count) * 7;
         // Set the entire block to 0 at once
         memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
 
