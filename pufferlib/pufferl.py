@@ -610,7 +610,10 @@ class PuffeRL:
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
-                self.optimizer.step()
+                if self.is_grad_finite():
+                    self.optimizer.step()
+                else:
+                    print("Gradient is not finite, skipping parameter update!")
                 self.optimizer.zero_grad()
 
         # Reprioritize experience
@@ -783,6 +786,12 @@ class PuffeRL:
                             os.remove(expected_weights_path)
 
         return logs
+
+    def is_grad_finite(self):
+        for param in self.policy.parameters():
+            if param.grad is not None and not param.grad.isfinite().all().item():
+                return False
+        return True
 
     def _mean_stats(self, stats):
         for k in list(stats.keys()):
