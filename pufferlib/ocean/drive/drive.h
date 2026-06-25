@@ -238,6 +238,7 @@ struct Entity {
     float stop_line_reward_coefficient;
     float lane_center_bias;
     int hide_other_vehicles;
+    float friction_coefficient;
 
     // Jerk dynamics
     float a_long;
@@ -2189,7 +2190,7 @@ float clipSpeed(float speed, Entity* agent) {
     }
 
     if (speed > maxSpeed) return maxSpeed;
-    if (speed < -maxSpeed) return -maxSpeed;
+    if (speed < 0) return 0;
     return speed;
 }
 
@@ -2232,13 +2233,27 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         agent->prev_x = x;
         agent->prev_y = y;
 
-        // Track signed longitudinal speed so negative acceleration can produce reverse motion.
+        float friction_coefficient = agent->friction_coefficient;
+        if (agent->friction_coefficient == 0.0f) friction_coefficient = 1.0f;
+
+        float max_acceleration = 9.81 * friction_coefficient;
+        if (acceleration > max_acceleration) acceleration = max_acceleration;
+        if (acceleration < -max_acceleration) acceleration = -max_acceleration;
+
         float speed = sqrtf(vx*vx + vy*vy);
         float new_speed = speed + acceleration * env->dt;
         new_speed = clipSpeed(new_speed, agent);
 
         // Compute yaw rate
         float beta = tanh(.5*tanf(steering));
+
+        float max_lateral_acceleration = sqrtf(max_acceleration*max_acceleration-acceleration*acceleration);
+        float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
+        if (fabsf(a_lat) > max_lateral_acceleration) {
+            steering = copysignf(atanf(max_lateral_acceleration / new_speed / new_speed * agent->length), steering);
+            beta = tanh(.5*tanf(steering));
+            a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
+        }
 
         // New heading
         float yaw_rate = (new_speed*cosf(beta)*tanf(steering)) / agent->length;
@@ -2260,8 +2275,6 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         agent->heading_y = sinf(heading);
         agent->vx = new_vx;
         agent->vy = new_vy;
-
-        float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
 
         int comfort_violations = (acceleration > 3.0f) + (fabsf(a_lat) > 3.0f);
         if (comfort_violations > 0) {

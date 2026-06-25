@@ -98,6 +98,7 @@ class Entity(Structure):
         ("stop_line_reward_coefficient", c_float),
         ("lane_center_bias", c_float),
         ("hide_other_vehicles", c_int),
+        ("friction_coefficient", c_float),
         # Jerk dynamics
         ("a_long", c_float),
         ("a_lat", c_float),
@@ -114,15 +115,15 @@ lanelet2_map = load("tartu_large_processed.osm", projector)
 map_points = list(lanelet2_map.pointLayer)
 
 VEHICLE_PROFILES = [
-    (0.30, 100, (1.90, 4.82, 1.46)),  # sedans
-    (0.20, 100, (1.90, 4.89, 1.69)),  # Lexus 450h
-    (0.12, 100, (2.00, 5.02, 1.78)),  # SUVs
-    (0.05, 100, (2.03, 5.88, 1.97)),  # pickup trucks
-    (0.07, 100, (1.95, 5.40, 1.97)),  # vans
+    (0.30, 65, (1.90, 4.82, 1.46)),  # sedans
+    (0.20, 50, (1.90, 4.89, 1.69)),  # Lexus 450h
+    (0.12, 55, (2.00, 5.02, 1.78)),  # SUVs
+    (0.05, 55, (2.03, 5.88, 1.97)),  # pickup trucks
+    (0.07, 55, (1.95, 5.40, 1.97)),  # vans
     (0.07, 50, (2.55, 12.00, 2.30)), # buses
-    (0.03, 60, (2.55, 8.00, 3.60)),  # trucks
+    (0.03, 55, (2.55, 8.00, 3.60)),  # trucks
     (0.10, 25, (0.60, 1.80, 1.10)),  # bicycles
-    (0.03, 100, (0.80, 2.20, 1.25)),  # motorcycles
+    (0.03, 80, (0.80, 2.20, 1.25)),  # motorcycles
     (0.03, 20, (2.30, 6.40, 3.00)),  # street maintenance vehicle
 ]
 
@@ -656,6 +657,7 @@ def generate_map():
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
         ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.1)
+        ent.friction_coefficient = random.uniform(0.6, 1.2)
         ent.mark_as_expert = 0
 
     vehicle_samples = random.choices(STATIONARY_OBJECT_PROFILES, weights=stationary_object_weights, k=num_stationary_objects)
