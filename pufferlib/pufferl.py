@@ -318,6 +318,8 @@ class PuffeRL:
         self.speed_counts = np.zeros((100,), np.int64)
         self.last_table_metrics_sent_epoch = 0
         self.losses = {}
+        self.policy_loss_history = deque(maxlen=250)
+        self.value_loss_history = deque(maxlen=250)
 
         self.validation_envs = self._create_validation_envs()
         self.run_validations()
@@ -497,6 +499,7 @@ class PuffeRL:
         epoch = self.epoch
         profile("train", epoch)
         losses = defaultdict(float)
+        grad_norm_steps = 0
         config = self.config
         device = config["device"]
 
@@ -607,6 +610,29 @@ class PuffeRL:
 
             entropy_loss = entropy.mean()
 
+            policy_loss_abs = abs(pg_loss.item())
+            value_loss_value = v_loss.item()
+            if len(self.policy_loss_history) >= 250 and len(self.value_loss_history) >= 250:
+                max_outlier = 5 if epoch > self.total_epochs * 0.1 else 20
+                policy_loss_max = max(self.policy_loss_history)
+                value_loss_max = max(self.value_loss_history)
+                if policy_loss_max > 0 and policy_loss_abs > max_outlier * policy_loss_max:
+                    print(
+                        f"Skipping optimizer update at epoch {self.epoch}, minibatch {mb}: "
+                        f"|policy_loss| {policy_loss_abs:.6g} > {max_outlier}x rolling max {policy_loss_max:.6g}",
+                        flush=True
+                    )
+                    self.optimizer.zero_grad()
+                    continue
+                if value_loss_max > 0 and value_loss_value > max_outlier * value_loss_max:
+                    print(
+                        f"Skipping optimizer update at epoch {self.epoch}, minibatch {mb}: "
+                        f"value_loss {value_loss_value:.6g} > {max_outlier}x rolling max {value_loss_max:.6g}",
+                        flush=True
+                    )
+                    self.optimizer.zero_grad()
+                    continue
+
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
@@ -625,12 +651,16 @@ class PuffeRL:
             losses["approx_kl"] += approx_kl.item() / self.total_minibatches
             losses["clipfrac"] += clipfrac.item() / self.total_minibatches
             losses["importance"] += ratio.mean().item() / self.total_minibatches
+            self.policy_loss_history.append(policy_loss_abs)
+            self.value_loss_history.append(value_loss_value)
 
             # Learn on accumulated minibatches
             profile("learn", epoch)
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
+                losses["grad_norm"] += grad_norm.item()
+                grad_norm_steps += 1
                 if self.is_grad_finite():
                     self.optimizer.step()
                 else:
@@ -639,7 +669,9 @@ class PuffeRL:
 
         # Reprioritize experience
         profile("train_misc", epoch)
-        if config["anneal_lr"]:
+        if grad_norm_steps > 0:
+            losses["grad_norm"] /= grad_norm_steps
+        if config["anneal_lr"] and grad_norm_steps > 0:
             self.scheduler.step()
 
         y_pred = self.values.flatten()
