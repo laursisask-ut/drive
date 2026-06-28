@@ -60,6 +60,10 @@ class Drive(pufferlib.PufferEnv):
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
 
+        if isinstance(resample_frequency, list):
+            resample_frequency = random.Random(seed).choice(resample_frequency)
+            scenario_length = self.scenario_length = self.resample_frequency = resample_frequency
+
         # Observation space calculation
         if dynamics_model == "classic":
             ego_features = 20

@@ -405,17 +405,27 @@ class Multiprocessing:
 
         self.ready_workers = []
         self.waiting_workers = []
+        self.pending_workers = set()
 
     def recv(self):
         recv_precheck(self)
         while True:
-            # Bandaid patch for new experience buffer desync
             if self.sync_traj:
-                worker = self.waiting_workers[0]
+                if not self.pending_workers:
+                    self.pending_workers = set(range(self.num_workers))
+
+                # Generation gate: each worker may be returned once before
+                # any worker becomes eligible for the next trajectory chunk.
+                worker = self.waiting_workers.pop(0)
+                if worker not in self.pending_workers:
+                    self.waiting_workers.append(worker)
+                    continue
+
                 sem = self.buf["semaphores"][worker]
                 if sem >= MAIN:
-                    self.waiting_workers.pop(0)
                     self.ready_workers.append(worker)
+                else:
+                    self.waiting_workers.append(worker)
             else:
                 worker = self.waiting_workers.pop(0)
                 sem = self.buf["semaphores"][worker]
@@ -475,6 +485,10 @@ class Multiprocessing:
                 self.ready_workers = self.ready_workers[self.workers_per_batch :]
                 break
 
+        if self.sync_traj:
+            for worker in s_range:
+                self.pending_workers.remove(worker)
+
         self.w_slice = w_slice
         buf = self.buf
 
@@ -522,6 +536,7 @@ class Multiprocessing:
         self.ready_workers = []
         self.ready_next_workers = []  # Used to evenly sample workers
         self.waiting_workers = list(range(self.num_workers))
+        self.pending_workers = set(range(self.num_workers))
         self.infos = [[] for _ in range(self.num_workers)]
 
         self.buf["semaphores"][:] = RESET

@@ -748,7 +748,7 @@ def generate_map():
         if random.choice([True, False]):
             points = list(reversed(points))
         points = points[random.randint(0, len(points)//2):]
-        points = points[:200]
+        points = points[:400]
 
         heading = [0]
         vx = [0]
