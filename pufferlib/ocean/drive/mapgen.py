@@ -99,6 +99,8 @@ class Entity(Structure):
         ("lane_center_bias", c_float),
         ("hide_other_vehicles", c_int),
         ("friction_coefficient", c_float),
+        ("steering_gain", c_float),
+        ("acceleration_gain", c_float),
         # Jerk dynamics
         ("a_long", c_float),
         ("a_lat", c_float),
@@ -516,14 +518,17 @@ def generate_map():
                 if not following_lanelets and path_remaining <= goal_distance:
                     goal_pos = interpolatedPointAtDistance(line, current_lanelet_offset+path_remaining)
                     can_add_more_goals = False
+                    goal_distance -= path_remaining
                     break
                 elif not following_lanelets and path_remaining > goal_distance:
                     goal_pos = interpolatedPointAtDistance(line, current_lanelet_offset+goal_distance)
                     current_lanelet_offset += goal_distance
+                    goal_distance = 0
                     break
                 elif path_remaining > goal_distance:
                     goal_pos = interpolatedPointAtDistance(line, current_lanelet_offset+goal_distance)
                     current_lanelet_offset += goal_distance
+                    goal_distance = 0
                     break
                 else:
                     goal_distance -= path_remaining
@@ -657,7 +662,10 @@ def generate_map():
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
         ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.1)
-        ent.friction_coefficient = random.uniform(0.6, 1.2)
+        ent.friction_coefficient = random.uniform(0.7, 1.3)
+        ent.acceleration_gain = random.uniform(0.9, 1.1)
+        ent.steering_gain = random.uniform(0.9, 1.1)
+        ent.wheelbase = random.uniform(0.55, 0.65) * ent.length
         ent.mark_as_expert = 0
 
     vehicle_samples = random.choices(STATIONARY_OBJECT_PROFILES, weights=stationary_object_weights, k=num_stationary_objects)

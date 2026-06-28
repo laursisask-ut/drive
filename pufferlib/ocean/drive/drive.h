@@ -239,6 +239,8 @@ struct Entity {
     float lane_center_bias;
     int hide_other_vehicles;
     float friction_coefficient;
+    float steering_gain;
+    float acceleration_gain;
 
     // Jerk dynamics
     float a_long;
@@ -914,7 +916,7 @@ void set_start_position(Drive* env){
         e->jerk_long = 0.0f;
         e->jerk_lat = 0.0f;
         e->steering_angle = 0.0f;
-        e->wheelbase = 0.6f * e->length;
+        if (e->wheelbase == 0.0f) e->wheelbase = 0.6f * e->length;
 
         if (env->export_log.traj_x) {
             env->export_log.traj_x[i*MAX_EXPORT_STEPS+step] = e->x;
@@ -1646,9 +1648,6 @@ int valid_active_agent(Drive* env, int agent_idx){
     float rel_goal_x = goal_x*cos_heading + goal_y*sin_heading;
     float rel_goal_y = -goal_x*sin_heading + goal_y*cos_heading;
     float distance_to_goal = relative_distance_2d(0, 0, rel_goal_x, rel_goal_y);
-    // Shrink agent size
-    env->entities[agent_idx].width *= 0.7f;
-    env->entities[agent_idx].length *= 0.7f;
     if(distance_to_goal >= MIN_DISTANCE_TO_GOAL && env->entities[agent_idx].mark_as_expert == 0 && env->active_agent_count < env->num_agents){
         return distance_to_goal;
     }
@@ -2222,6 +2221,8 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
             acceleration = ACCELERATION_VALUES[acceleration_index];
             steering = STEERING_VALUES[steering_index];
         }
+        if (agent->acceleration_gain != 0.0f) acceleration *= agent->acceleration_gain;
+        if (agent->steering_gain != 0.0f) steering *= agent->steering_gain;
 
         // Current state
         float x = agent->x;
@@ -2248,15 +2249,15 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         float beta = tanh(.5*tanf(steering));
 
         float max_lateral_acceleration = sqrtf(max_acceleration*max_acceleration-acceleration*acceleration);
-        float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
+        float a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->wheelbase;
         if (fabsf(a_lat) > max_lateral_acceleration) {
-            steering = copysignf(atanf(max_lateral_acceleration / new_speed / new_speed * agent->length), steering);
+            steering = copysignf(atanf(max_lateral_acceleration / new_speed / new_speed * agent->wheelbase), steering);
             beta = tanh(.5*tanf(steering));
-            a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->length;
+            a_lat = new_speed * new_speed * cosf(beta)*tanf(steering) / agent->wheelbase;
         }
 
         // New heading
-        float yaw_rate = (new_speed*cosf(beta)*tanf(steering)) / agent->length;
+        float yaw_rate = (new_speed*cosf(beta)*tanf(steering)) / agent->wheelbase;
 
         // New velocity
         float new_vx = new_speed * cosf(heading + beta);

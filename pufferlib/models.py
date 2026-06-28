@@ -178,13 +178,44 @@ class LSTMWrapper(nn.Module):
 
         hidden = hidden.reshape(B, TT, self.input_size)
 
-        hidden = hidden.transpose(0, 1)
-        # hidden = self.pre_layernorm(hidden)
-        hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
-        hidden = hidden.float()
+        reset = None
+        terminals = state.get("terminals")
+        truncations = state.get("truncations")
+        if terminals is not None or truncations is not None:
+            reset = torch.zeros(B, TT, dtype=torch.bool, device=hidden.device)
+            if terminals is not None:
+                reset |= terminals.to(hidden.device).bool()
+            if truncations is not None:
+                reset |= truncations.to(hidden.device).bool()
 
-        # hidden = self.post_layernorm(hidden)
-        hidden = hidden.transpose(0, 1)
+        if reset is not None:
+            if lstm_state is None:
+                h = hidden.new_zeros(B, self.hidden_size)
+                c = hidden.new_zeros(B, self.hidden_size)
+            else:
+                h, c = lstm_state
+                h = h.squeeze(0)
+                c = c.squeeze(0)
+
+            outputs = []
+            for t in range(TT):
+                reset_t = reset[:, t].unsqueeze(-1)
+                h = h.masked_fill(reset_t, 0)
+                c = c.masked_fill(reset_t, 0)
+                h, c = self.cell(hidden[:, t], (h, c))
+                outputs.append(h)
+
+            hidden = torch.stack(outputs, dim=1).float()
+            lstm_h = h.unsqueeze(0)
+            lstm_c = c.unsqueeze(0)
+        else:
+            hidden = hidden.transpose(0, 1)
+            # hidden = self.pre_layernorm(hidden)
+            hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
+            hidden = hidden.float()
+
+            # hidden = self.post_layernorm(hidden)
+            hidden = hidden.transpose(0, 1)
 
         flat_hidden = hidden.reshape(B * TT, self.hidden_size)
         logits, values = self.policy.decode_actions(flat_hidden)

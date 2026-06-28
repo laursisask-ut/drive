@@ -216,6 +216,8 @@ class PuffeRL:
             h = policy.hidden_size
             self.lstm_h = {i * n: torch.zeros(n, h, device=device) for i in range(total_agents // n)}
             self.lstm_c = {i * n: torch.zeros(n, h, device=device) for i in range(total_agents // n)}
+            self.initial_lstm_h = torch.zeros(segments, h, device=device)
+            self.initial_lstm_c = torch.zeros(segments, h, device=device)
 
         # Minibatching & gradient accumulation
         minibatch_size = config["minibatch_size"]
@@ -390,11 +392,6 @@ class PuffeRL:
         config = self.config
         device = config["device"]
 
-        if config["use_rnn"]:
-            for k in self.lstm_h:
-                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
-                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
-
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile("env", epoch)
@@ -412,6 +409,10 @@ class PuffeRL:
             d = torch.as_tensor(d).to(device)  # , non_blocking=True)
             t = torch.as_tensor(t).to(device)  # , non_blocking=True)
 
+            # Fast path for fully vectorized envs
+            l = self.ep_lengths[env_id.start].item()
+            batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
+
             profile("eval_forward", epoch)
             with torch.no_grad(), self.amp_context:
                 state = dict(
@@ -422,8 +423,18 @@ class PuffeRL:
                 )
 
                 if config["use_rnn"]:
-                    state["lstm_h"] = self.lstm_h[env_id.start]
-                    state["lstm_c"] = self.lstm_c[env_id.start]
+                    lstm_h = self.lstm_h[env_id.start]
+                    lstm_c = self.lstm_c[env_id.start]
+                    reset = (d.bool() | t.bool()).unsqueeze(-1)
+                    lstm_h = lstm_h.masked_fill(reset, 0)
+                    lstm_c = lstm_c.masked_fill(reset, 0)
+                    self.lstm_h[env_id.start] = lstm_h
+                    self.lstm_c[env_id.start] = lstm_c
+                    if l == 0:
+                        self.initial_lstm_h[batch_rows] = lstm_h
+                        self.initial_lstm_c[batch_rows] = lstm_c
+                    state["lstm_h"] = lstm_h
+                    state["lstm_c"] = lstm_c
 
                 logits, value = self.policy.forward_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
@@ -434,10 +445,6 @@ class PuffeRL:
                 if config["use_rnn"]:
                     self.lstm_h[env_id.start] = state["lstm_h"]
                     self.lstm_c[env_id.start] = state["lstm_c"]
-
-                # Fast path for fully vectorized envs
-                l = self.ep_lengths[env_id.start].item()
-                batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
 
                 if config["cpu_offload"]:
                     self.observations[batch_rows, l] = o
@@ -520,31 +527,52 @@ class PuffeRL:
             )
 
             profile("train_copy", epoch)
-            adv = advantages.abs().sum(axis=1)
-            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
-            prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs, self.minibatch_segments)
-            mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
-            mb_obs = self.observations[idx]
-            mb_actions = self.actions[idx]
-            mb_logprobs = self.logprobs[idx]
-            mb_rewards = self.rewards[idx]
-            mb_terminals = self.terminals[idx]
-            mb_truncations = self.truncations[idx]
-            mb_ratio = self.ratio[idx]
-            mb_values = self.values[idx]
-            mb_returns = advantages[idx] + mb_values
-            mb_advantages = advantages[idx]
+            if config["use_rnn"]:
+                adv = advantages.abs().sum(axis=1)
+                prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+                prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
+                idx = torch.multinomial(prio_probs, self.minibatch_segments)
+                mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
+                mb_obs = self.observations[idx]
+                mb_actions = self.actions[idx]
+                mb_logprobs = self.logprobs[idx]
+                mb_terminals = self.terminals[idx]
+                mb_truncations = self.truncations[idx]
+                mb_values = self.values[idx]
+                mb_returns = advantages[idx] + mb_values
+                mb_advantages = advantages[idx]
+            else:
+                flat_count = self.values.numel()
+                adv = advantages.abs().reshape(-1)
+                prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+                prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
+                idx = torch.multinomial(prio_probs, self.minibatch_size)
+                mb_prio = (flat_count * prio_probs[idx]) ** -anneal_beta
+                mb_obs = self.observations.reshape(flat_count, *self.observations.shape[2:])[idx]
+                mb_actions = self.actions.reshape(flat_count, *self.actions.shape[2:])[idx]
+                mb_logprobs = self.logprobs.reshape(flat_count)[idx]
+                mb_values = self.values.reshape(flat_count)[idx]
+                mb_returns = advantages.reshape(flat_count)[idx] + mb_values
+                mb_advantages = advantages.reshape(flat_count)[idx]
 
             profile("train_forward", epoch)
             if not config["use_rnn"]:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
 
-            state = dict(
-                action=mb_actions,
-                lstm_h=None,
-                lstm_c=None,
-            )
+            if config["use_rnn"]:
+                state = dict(
+                    action=mb_actions,
+                    lstm_h=self.initial_lstm_h[idx].unsqueeze(0),
+                    lstm_c=self.initial_lstm_c[idx].unsqueeze(0),
+                    terminals=mb_terminals,
+                    truncations=mb_truncations,
+                )
+            else:
+                state = dict(
+                    action=mb_actions,
+                    lstm_h=None,
+                    lstm_c=None,
+                )
 
             logits, newvalue = self.policy(mb_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
@@ -553,26 +581,16 @@ class PuffeRL:
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
             logratio = newlogprob - mb_logprobs
             ratio = logratio.exp()
-            self.ratio[idx] = ratio.detach()
+            if config["use_rnn"]:
+                self.ratio[idx] = ratio.detach()
+            else:
+                self.ratio.reshape(-1)[idx] = ratio.detach()
 
             with torch.no_grad():
                 old_approx_kl = (-logratio).mean()
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config["clip_coef"]).float().mean()
 
-            adv = advantages[idx]
-            adv = compute_puff_advantage(
-                mb_values,
-                mb_rewards,
-                mb_terminals,
-                mb_truncations,
-                ratio,
-                adv,
-                config["gamma"],
-                config["gae_lambda"],
-                config["vtrace_rho_clip"],
-                config["vtrace_c_clip"],
-            )
             adv = mb_advantages
             adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -593,7 +611,10 @@ class PuffeRL:
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
-            self.values[idx] = newvalue.detach().float()
+            if config["use_rnn"]:
+                self.values[idx] = newvalue.detach().float()
+            else:
+                self.values.reshape(-1)[idx] = newvalue.detach().float()
 
             # Logging
             profile("train_misc", epoch)
