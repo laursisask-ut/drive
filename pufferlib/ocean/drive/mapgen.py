@@ -114,7 +114,8 @@ utm_origin_lat = 58.385345
 utm_origin_lon = 26.726272
 projector = UtmProjector(Origin(utm_origin_lat, utm_origin_lon), True, False)
 lanelet2_map = load("tartu_large_processed.osm", projector)
-map_points = list(lanelet2_map.pointLayer)
+map_lanelets = list(lanelet2_map.laneletLayer)
+map_lanelet_centerline_lengths = [length(to2D(lanelet.centerline)) for lanelet in map_lanelets]
 
 VEHICLE_PROFILES = [
     (0.30, 65, (1.90, 4.82, 1.46)),  # sedans
@@ -196,12 +197,8 @@ def calculate_normal(linestring, i):
     return BasicPoint2d(math.cos(normal_angle), math.sin(normal_angle))
 
 
-def sample_points_along_line(linestring, start_offset, end_offset, speed, sample_rate=0.1, lateral_shift=None, speed_jitter=0.2):
-    if speed <= 0:
-        return []
-
-    if lateral_shift is None:
-        lateral_shift = random.uniform(-1.5, 1.5)
+def sample_points_along_line(linestring, start_offset, end_offset, speed, sample_rate=0.1):
+    lateral_shift = random.uniform(-1.5, 1.5)
     
     points = []
 
@@ -222,10 +219,7 @@ def sample_points_along_line(linestring, start_offset, end_offset, speed, sample
     offset = start_offset
 
     while i + 1 < len(linestring) and offset < end_offset:
-        if speed_jitter:
-            distance_per_tick = avg_distance_per_tick * random.uniform(1.0 - speed_jitter, 1.0 + speed_jitter)
-        else:
-            distance_per_tick = avg_distance_per_tick
+        distance_per_tick = avg_distance_per_tick * random.uniform(0.8, 1.2)
         if distance(current_pos, linestring[i + 1]) < distance_per_tick:
             distance_traveled = distance(current_pos, linestring[i + 1])
             i += 1
@@ -384,6 +378,52 @@ def point_in_box(point, box):
     return box.min.x <= point.x <= box.max.x and box.min.y <= point.y <= box.max.y
 
 
+def rectangle_corners(x, y, heading, width, length):
+    cos_heading = math.cos(heading)
+    sin_heading = math.sin(heading)
+    half_width = width / 2
+    half_length = length / 2
+    return [
+        (
+            x + length_sign * half_length * cos_heading - width_sign * half_width * sin_heading,
+            y + length_sign * half_length * sin_heading + width_sign * half_width * cos_heading,
+        )
+        for length_sign, width_sign in ((1, 1), (1, -1), (-1, -1), (-1, 1))
+    ]
+
+
+def projections_overlap(corners_a, corners_b, axis):
+    axis_x, axis_y = axis
+    projections_a = [x * axis_x + y * axis_y for x, y in corners_a]
+    projections_b = [x * axis_x + y * axis_y for x, y in corners_b]
+    return max(projections_a) >= min(projections_b) and max(projections_b) >= min(projections_a)
+
+
+def rectangles_collide(pose_a, size_a, pose_b, size_b):
+    x_a, y_a, heading_a = pose_a
+    width_a, length_a = size_a
+    x_b, y_b, heading_b = pose_b
+    width_b, length_b = size_b
+    corners_a = rectangle_corners(x_a, y_a, heading_a, width_a, length_a)
+    corners_b = rectangle_corners(x_b, y_b, heading_b, width_b, length_b)
+    axes = [
+        (math.cos(heading_a), math.sin(heading_a)),
+        (-math.sin(heading_a), math.cos(heading_a)),
+        (math.cos(heading_b), math.sin(heading_b)),
+        (-math.sin(heading_b), math.cos(heading_b)),
+    ]
+    return all(projections_overlap(corners_a, corners_b, axis) for axis in axes)
+
+
+def vehicle_collides(pose, dimensions, placed_vehicles):
+    size = dimensions[:2]
+    return any(rectangles_collide(pose, size, other_pose, other_size) for other_pose, other_size in placed_vehicles)
+
+
+def sample_dimensions(base_dimensions, variation):
+    return tuple(dimension * (1 + random.uniform(-variation, variation)) for dimension in base_dimensions)
+
+
 def add_spawn_position(queue, grid, lanelet, s, pos, min_distance):
     cell = (int(pos.x // min_distance), int(pos.y // min_distance))
     has_near_position = any(
@@ -399,7 +439,7 @@ def add_spawn_position(queue, grid, lanelet, s, pos, min_distance):
 
 
 def make_spawn_position_queues(lanelets, box):
-    spawn_spacing = 15
+    spawn_spacing = 12
     min_spawn_distance = 5
     candidate_positions = []
     for lanelet in lanelets:
@@ -424,7 +464,7 @@ def make_spawn_position_queues(lanelets, box):
         if routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
             add_spawn_position(moving_spawn_positions, moving_spawn_grid, lanelet, s, pos, min_spawn_distance)
             continue
-        if random.choice([True, False]):
+        if lanelet.attributes["turn_direction"] != "straight" or random.random() < 1 / 2:
             add_spawn_position(moving_spawn_positions, moving_spawn_grid, lanelet, s, pos, min_spawn_distance)
         else:
             line = to2D(lanelet.rightBound)
@@ -434,122 +474,35 @@ def make_spawn_position_queues(lanelets, box):
     return moving_spawn_positions, stationary_spawn_positions
 
 
-def lanelet_speed_limit_mps(lanelet, vehicle_speed_limit):
-    speed_limit = 50
-    if "speed_limit" in lanelet.attributes:
-        speed_limit = float(lanelet.attributes["speed_limit"])
-    return min(speed_limit, vehicle_speed_limit) / 3.6
-
-
-def append_route_points(route_points, points, speed):
-    if not points:
-        return
-
-    if not route_points:
-        route_points.extend(points)
-        return
-
-    if distance(route_points[-1], points[0]) > 0.1:
-        connector_points = linear_interpolate(route_points[-1], points[0], speed)
-        route_points.extend(connector_points[1:])
-
-    if route_points and distance(route_points[-1], points[0]) < 0.1:
-        route_points.extend(points[1:])
-    else:
-        route_points.extend(points)
-
-
-def sample_fixed_vehicle_trajectory(spawn_lanelet, spawn_offset, vehicle_speed_limit):
-    target_steps = 400
-    points = []
-    lanelet = spawn_lanelet
-    lanelet_offset = spawn_offset
-    speed_fraction = random.uniform(0.35, 0.85)
-    lateral_shift = random.uniform(-0.6, 0.6)
-
-    for _ in range(32):
-        line = to2D(lanelet.centerline)
-        line_length = length(line)
-        if line_length < 0.1:
-            break
-
-        speed = max(1.5, lanelet_speed_limit_mps(lanelet, vehicle_speed_limit) * speed_fraction)
-        segment_points = sample_points_along_line(
-            line,
-            lanelet_offset,
-            line_length,
-            speed,
-            lateral_shift=lateral_shift,
-            speed_jitter=0.1,
-        )
-        append_route_points(points, segment_points, speed)
-        if len(points) >= target_steps:
-            return points[:target_steps]
-
-        following_lanelets = routing_graph.following(lanelet, withLaneChanges=False)
-        if not following_lanelets:
-            break
-
-        lanelet = random.choice(following_lanelets)
-        lanelet_offset = 0.0
-
-    if not points:
-        line = to2D(spawn_lanelet.centerline)
-        points.append(fromArcCoordinates(line, ArcCoordinates(spawn_offset, 0.0)))
-
-    points.extend([points[-1]] * (target_steps - len(points)))
-    return points[:target_steps]
-
-
-def trajectory_motion(points, sample_rate=0.1):
-    headings = []
-    vx = []
-    vy = []
-
-    for i, point in enumerate(points):
-        if i + 1 < len(points):
-            next_point = points[i + 1]
-            dx = next_point.x - point.x
-            dy = next_point.y - point.y
-        elif i > 0:
-            prev_point = points[i - 1]
-            dx = point.x - prev_point.x
-            dy = point.y - prev_point.y
-        else:
-            dx = 0.0
-            dy = 0.0
-
-        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
-            heading = math.atan2(dy, dx) + math.pi
-        elif headings:
-            heading = headings[-1]
-        else:
-            heading = 0.0
-
-        headings.append(heading)
-        vx.append(-dx / sample_rate)
-        vy.append(-dy / sample_rate)
-
-    return headings, vx, vy
-
-
 agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "32"))
 goals_per_agent = int(os.getenv("GOALS_PER_AGENT", "8"))
 
-def generate_map():
+def generate_map(generation_attempt=0):
+    max_generation_attempts = 100
+    if generation_attempt >= max_generation_attempts:
+        raise RuntimeError(f"Could not generate a collision-free map after {max_generation_attempts} attempts")
+
     num_agents = agents_per_generated_map
-    num_stationary_objects = random.randint(8, 24)
-    num_fixed_trajectory_vehicles = random.randint(8, 24)
+    num_stationary_objects = random.randint(16, 48)
     num_walking_pedestrians = random.randint(16, 48)
 
-    while True:
-        center = random.choice(map_points)
-        # center = BasicPoint2d(0.0, 0.0)
+    max_center_sampling_attempts = 1000
+    for _ in range(max_center_sampling_attempts):
         if os.getenv("CENTER_LAT") is not None:
             lat = float(os.getenv("CENTER_LAT"))
             lon = float(os.getenv("CENTER_LON"))
             center = to2D(projector.forward(GPSPoint(lat, lon)))
-        spawn_distance = 110
+        else:
+            center_lanelet = random.choices(
+                map_lanelets,
+                weights=map_lanelet_centerline_lengths,
+                k=1,
+            )[0]
+            centerline = to2D(center_lanelet.centerline)
+            center_offset = random.uniform(0.0, length(centerline))
+            center = interpolatedPointAtDistance(centerline, center_offset)
+
+        spawn_distance = 250
 
         spawn_box = BoundingBox2d(
             BasicPoint2d(center.x - spawn_distance, center.y - spawn_distance),
@@ -560,20 +513,25 @@ def generate_map():
 
         moving_spawn_position_queue, stationary_spawn_position_queue = make_spawn_position_queues(spawn_box_lanelets, spawn_box)
 
-        if len(moving_spawn_position_queue) >= num_agents + num_fixed_trajectory_vehicles and len(stationary_spawn_position_queue) >= num_stationary_objects:
+        if len(moving_spawn_position_queue) >= num_agents:
+            num_stationary_objects = min(num_stationary_objects, len(stationary_spawn_position_queue))
             break
+    else:
+        raise RuntimeError(f"Could not find {num_agents} moving spawn positions after {max_center_sampling_attempts} attempts")
 
     vehicle_samples = random.choices(VEHICLE_PROFILES, weights=vehicle_weights, k=num_agents)
+    vehicle_dimensions = [sample_dimensions(sample[2], 0.1) for sample in vehicle_samples]
 
     spawn_positions = []
     goal_positions = []
     spawn_headings = []
     spawn_vx = []
     spawn_vy = []
+    placed_vehicles = []
     spawn_attempts = 0
     max_spawn_attempts = max(len(moving_spawn_position_queue) * 4, num_agents)
     i = 0
-    while i < num_agents:
+    while i < num_agents and moving_spawn_position_queue and spawn_attempts <= max_spawn_attempts:
         is_initially_parked = random.uniform(0, 1) < 0.05
         
         spawn_lanelet, spawn_offset = moving_spawn_position_queue.pop()
@@ -589,6 +547,11 @@ def generate_map():
         if is_initially_parked:
             spawn_pos.x += math.cos(heading+math.pi/2)
             spawn_pos.y += math.sin(heading+math.pi/2)
+
+        vehicle_pose = (spawn_pos.x, spawn_pos.y, heading)
+        if vehicle_collides(vehicle_pose, vehicle_dimensions[i], placed_vehicles):
+            spawn_attempts += 1
+            continue
 
         speed_limit = 50
         if "speed_limit" in lanelet.attributes:
@@ -651,7 +614,7 @@ def generate_map():
                 moving_spawn_position_queue.insert(0, (spawn_lanelet, spawn_offset))
                 spawn_attempts += 1
                 if spawn_attempts > max_spawn_attempts:
-                    return generate_map()
+                    break
                 continue
 
         spawn_positions.append(spawn_pos)
@@ -659,28 +622,49 @@ def generate_map():
         spawn_vy.append(math.sin(heading)*initial_speed)
         spawn_vx.append(math.cos(heading)*initial_speed)
         goal_positions.append(agent_goal_positions)
+        placed_vehicles.append((vehicle_pose, vehicle_dimensions[i][:2]))
         i += 1
 
-    fixed_vehicle_samples = random.choices(VEHICLE_PROFILES, weights=vehicle_weights, k=num_fixed_trajectory_vehicles)
-    fixed_vehicle_trajectories = []
-    i = 0
-    while i < num_fixed_trajectory_vehicles:
-        if not moving_spawn_position_queue:
+    if i < num_agents:
+        return generate_map(generation_attempt + 1)
+
+    candidate_stationary_samples = random.choices(
+        STATIONARY_OBJECT_PROFILES,
+        weights=stationary_object_weights,
+        k=num_stationary_objects,
+    )
+    stationary_vehicle_dimensions = []
+    stationary_spawn_positions = []
+    stationary_spawn_headings = []
+    for sample in candidate_stationary_samples:
+        if not stationary_spawn_position_queue:
             break
 
-        spawn_lanelet, spawn_offset = moving_spawn_position_queue.pop()
-        _, vehicle_speed_limit, _ = fixed_vehicle_samples[i]
-        points = sample_fixed_vehicle_trajectory(spawn_lanelet, spawn_offset, vehicle_speed_limit)
-        fixed_vehicle_trajectories.append(points)
-        i += 1
-    num_fixed_trajectory_vehicles = len(fixed_vehicle_trajectories)
+        dimensions = sample_dimensions(sample[2], 0.2)
+        lanelet, s = stationary_spawn_position_queue.pop()
+        line = to2D(lanelet.rightBound)
+        spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
+        near = interpolatedPointAtDistance(line, s + 1)
+        road_heading = math.atan2(near.y - spawn_pos.y, near.x - spawn_pos.x)
+        road_normal = BasicPoint2d(math.cos(road_heading + math.pi / 2), math.sin(road_heading + math.pi / 2))
+        spawn_pos += road_normal * random.uniform(-4, 0.25)
+        heading = road_heading + random.choice([math.pi, 0]) + random.uniform(-0.5, 0.5)
+        vehicle_pose = (spawn_pos.x, spawn_pos.y, heading)
+        if vehicle_collides(vehicle_pose, dimensions, placed_vehicles):
+            continue
+
+        stationary_vehicle_dimensions.append(dimensions)
+        stationary_spawn_positions.append(spawn_pos)
+        stationary_spawn_headings.append(heading)
+        placed_vehicles.append((vehicle_pose, dimensions[:2]))
+
+    num_stationary_objects = len(stationary_spawn_positions)
 
     min_x = 1e9
     max_x = -1e9
     min_y = 1e9
     max_y = -1e9
-    fixed_vehicle_points = [point for trajectory in fixed_vehicle_trajectories for point in trajectory]
-    for point in spawn_positions + [goal for goals in goal_positions for goal in goals] + fixed_vehicle_points:
+    for point in spawn_positions + stationary_spawn_positions + [goal for goals in goal_positions for goal in goals]:
         min_x = min(min_x, point.x)
         max_x = max(max_x, point.x)
         min_y = min(min_y, point.y)
@@ -740,12 +724,13 @@ def generate_map():
         if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
             add_linestring_segments_in_box(6, linestring)
 
-    num_objects = num_agents + num_stationary_objects + num_fixed_trajectory_vehicles + num_walking_pedestrians
+    num_objects = num_agents + num_stationary_objects + num_walking_pedestrians
     assert num_objects <= 128
     entities = alloc_entities(len(roads) + num_objects)
 
     for i in range(num_agents):
-        _, max_speed, obj_dims = vehicle_samples[i]
+        _, max_speed, _ = vehicle_samples[i]
+        width, vehicle_length, height = vehicle_dimensions[i]
 
         ent = entities[i]
         ent.type = 1
@@ -758,9 +743,9 @@ def generate_map():
         ent.traj_vx = alloc_float_array([spawn_vx[i]])
         ent.traj_vy = alloc_float_array([spawn_vy[i]])
         ent.traj_vz = alloc_float_array([0])
-        ent.width = obj_dims[0] * (1 + random.uniform(-0.1, 0.1))
-        ent.length = obj_dims[1] * (1 + random.uniform(-0.1, 0.1))
-        ent.height = obj_dims[2] * (1 + random.uniform(-0.1, 0.1))
+        ent.width = width
+        ent.length = vehicle_length
+        ent.height = height
         ent.goal_position_x = -goal_positions[i][0].x
         ent.goal_position_y = -goal_positions[i][0].y
         ent.goal_position_z = 0 # TODO: Height dimension
@@ -784,22 +769,10 @@ def generate_map():
         ent.wheelbase = random.uniform(0.55, 0.65) * ent.length
         ent.mark_as_expert = 0
 
-    vehicle_samples = random.choices(STATIONARY_OBJECT_PROFILES, weights=stationary_object_weights, k=num_stationary_objects)
-
     for i in range(num_stationary_objects):
-        lanelet, s = stationary_spawn_position_queue.pop()
-        line = to2D(lanelet.rightBound)
-        _, _, obj_dims = vehicle_samples[i]
-        
-        spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
-
-        near = interpolatedPointAtDistance(line, s+1)
-        road_heading = math.atan2(near.y - spawn_pos.y, near.x - spawn_pos.x)
-
-        road_normal = BasicPoint2d(math.cos(road_heading+math.pi/2), math.sin(road_heading+math.pi/2))
-        spawn_pos += road_normal * random.uniform(-4, 0.25)
-        
-        heading = road_heading + random.choice([math.pi, 0]) + random.uniform(-0.5, 0.5)
+        spawn_pos = stationary_spawn_positions[i]
+        heading = stationary_spawn_headings[i]
+        width, vehicle_length, height = stationary_vehicle_dimensions[i]
 
         ent = entities[i+num_agents]
         ent.type = 1
@@ -812,35 +785,13 @@ def generate_map():
         ent.traj_vx = alloc_float_array([0])
         ent.traj_vy = alloc_float_array([0])
         ent.traj_vz = alloc_float_array([0])
-        ent.width = obj_dims[0] * (1 + random.uniform(-0.2, 0.2))
-        ent.length = obj_dims[1] * (1 + random.uniform(-0.2, 0.2))
-        ent.height = obj_dims[2] * (1 + random.uniform(-0.2, 0.2))
+        ent.width = width
+        ent.length = vehicle_length
+        ent.height = height
         #ent.goal_position_x = ent.traj_x
         #ent.goal_position_y = ent.traj_y
         #ent.goal_position_z = ent.traj_z
         ent.mark_as_expert = 1
-
-    for i in range(num_fixed_trajectory_vehicles):
-        _, max_speed, obj_dims = fixed_vehicle_samples[i]
-        points = fixed_vehicle_trajectories[i]
-        heading, vx, vy = trajectory_motion(points)
-
-        ent = entities[i+num_agents+num_stationary_objects]
-        ent.type = 1
-        ent.array_size = len(points)
-        ent.traj_valid = alloc_int_array([1] * len(points))
-        ent.traj_x = alloc_float_array([-p.x for p in points])
-        ent.traj_y = alloc_float_array([-p.y for p in points])
-        ent.traj_z = alloc_float_array([0 for _p in points]) # TODO: Height dimension
-        ent.traj_heading = alloc_float_array(heading)
-        ent.traj_vx = alloc_float_array(vx)
-        ent.traj_vy = alloc_float_array(vy)
-        ent.traj_vz = alloc_float_array([0 for _p in points])
-        ent.width = obj_dims[0] * (1 + random.uniform(-0.1, 0.1))
-        ent.length = obj_dims[1] * (1 + random.uniform(-0.1, 0.1))
-        ent.height = obj_dims[2] * (1 + random.uniform(-0.1, 0.1))
-        ent.mark_as_expert = 1
-    
 
     spawn_lanelets = random.choices(render_box_lanelets, weights=[length(l.centerline) for l in render_box_lanelets], k=num_walking_pedestrians)
 
@@ -898,7 +849,7 @@ def generate_map():
             vy.append(dy)
             prev = point
 
-        ent = entities[i+num_agents+num_stationary_objects+num_fixed_trajectory_vehicles]
+        ent = entities[i+num_agents+num_stationary_objects]
         ent.type = 1
         ent.array_size = len(points)
         ent.traj_valid = alloc_int_array([1] * len(points))
