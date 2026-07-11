@@ -63,6 +63,9 @@ class Drive(nn.Module):
     def forward_train(self, x, state=None):
         return self.forward(x, state)
 
+    def forward_eval(self, x, state=None):
+        return self(x)
+
     def encode_observations(self, observations, state=None):
         ego_dim = self.ego_dim
         partner_dim = 63 * 7
