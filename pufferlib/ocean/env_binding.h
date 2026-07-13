@@ -1,6 +1,13 @@
 #include "env_config.h"
 #include <Python.h>
 #include <numpy/arrayobject.h>
+#include <stdint.h>
+
+static unsigned int derive_env_seed(unsigned int seed, int env_idx, int num_envs) {
+    uint64_t mixed = (uint64_t)seed * (uint64_t)(unsigned int)num_envs
+        + (uint64_t)(unsigned int)env_idx;
+    return (unsigned int)mixed;
+}
 
 // Forward declarations for env-specific functions supplied by user
 static int my_log(
@@ -154,7 +161,7 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_TypeError, "seed must be an integer");
         return NULL;
     }
-    int seed = PyLong_AsLong(seed_arg);
+    unsigned int seed = (unsigned int)PyLong_AsUnsignedLongMask(seed_arg);
 
     // Assumes each process has the same number of environments
     srand(seed);
@@ -167,7 +174,7 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     }
 
     // Add the seed to kwargs
-    PyObject* py_seed = PyLong_FromLong(seed);
+    PyObject* py_seed = PyLong_FromUnsignedLong(seed);
     if (PyDict_SetItemString(kwargs, "seed", py_seed) < 0) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to set seed in kwargs");
         Py_DECREF(py_seed);
@@ -178,6 +185,7 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
 
     PyObject* empty_args = PyTuple_New(0);
     my_init(env, empty_args, kwargs);
+    Py_DECREF(empty_args);
     Py_DECREF(kwargs);
     if (PyErr_Occurred()) {
         return NULL;
@@ -265,6 +273,7 @@ static PyObject* env_put(PyObject* self, PyObject* args, PyObject* kwargs) {
 
     PyObject* empty_args = PyTuple_New(0);
     my_put(env, empty_args, kwargs);
+    Py_DECREF(empty_args);
     if (PyErr_Occurred()) {
         return NULL;
     }
@@ -331,7 +340,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_TypeError, "seed must be an integer");
         return NULL;
     }
-    int seed = PyLong_AsLong(seed_obj);
+    unsigned int seed = (unsigned int)PyLong_AsUnsignedLongMask(seed_obj);
 
     PyObject* obs = PyTuple_GetItem(args, 0);
     if (!PyObject_TypeCheck(obs, &PyArray_Type)) {
@@ -434,11 +443,11 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         env->truncations = (void*)((char*)PyArray_DATA(truncations) + i*PyArray_STRIDE(truncations, 0));
 
         // Assumes each process has the same number of environments
-        int env_seed = i + seed*vec->num_envs;
+        unsigned int env_seed = derive_env_seed(seed, i, vec->num_envs);
         srand(env_seed);
 
         // Add the seed to kwargs for this environment
-        PyObject* py_seed = PyLong_FromLong(env_seed);
+        PyObject* py_seed = PyLong_FromUnsignedLong(env_seed);
         if (PyDict_SetItemString(kwargs, "seed", py_seed) < 0) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to set seed in kwargs");
             Py_DECREF(py_seed);
@@ -449,6 +458,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
 
         PyObject* empty_args = PyTuple_New(0);
         my_init(env, empty_args, kwargs);
+        Py_DECREF(empty_args);
         if (PyErr_Occurred()) {
             return NULL;
         }
@@ -508,11 +518,11 @@ static PyObject* vec_reset(PyObject* self, PyObject* args) {
         PyErr_SetString(PyExc_TypeError, "seed must be an integer");
         return NULL;
     }
-    int seed = PyLong_AsLong(seed_arg);
+    unsigned int seed = (unsigned int)PyLong_AsUnsignedLongMask(seed_arg);
 
     for (int i = 0; i < vec->num_envs; i++) {
         // Assumes each process has the same number of environments
-        srand(i + seed*vec->num_envs);
+        srand(derive_env_seed(seed, i, vec->num_envs));
         c_reset(vec->envs[i]);
     }
     Py_RETURN_NONE;

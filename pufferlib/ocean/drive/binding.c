@@ -248,22 +248,26 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
         PyObject* object_count = PyTuple_GetItem(map, 0);
         if (object_count == NULL) {
             PyErr_SetString(PyExc_TypeError, "object_count is not present");
+            Py_DECREF(map);
             return 1;
         }
         env->num_objects = PyLong_AsLong(object_count);
         if (env->num_objects < 1) {
             PyErr_SetString(PyExc_TypeError, "expected at least one object");
+            Py_DECREF(map);
             return 1;
         }
 
         PyObject* road_count = PyTuple_GetItem(map, 1);
         if (road_count == NULL) {
             PyErr_SetString(PyExc_TypeError, "road_count is not present");
+            Py_DECREF(map);
             return 1;
         }
         env->num_roads = PyLong_AsLong(road_count);
         if (env->num_roads < 1) {
             PyErr_SetString(PyExc_TypeError, "expected at least one road");
+            Py_DECREF(map);
             return 1;
         }
 
@@ -272,13 +276,16 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
         PyObject* entity_ptr = PyTuple_GetItem(map, 2);
         if (entity_ptr == NULL) {
             PyErr_SetString(PyExc_TypeError, "entity_ptr is not present");
+            Py_DECREF(map);
             return 1;
         }
         env->entities = (Entity*)PyLong_AsVoidPtr(entity_ptr);
         if (env->entities == NULL) {
             PyErr_SetString(PyExc_TypeError, "entity pointer is null");
+            Py_DECREF(map);
             return 1;
         }
+        Py_DECREF(map);
     } else {
         env->dynamic_map_generation = 0;
         int map_id = unpack(kwargs, "map_id");
