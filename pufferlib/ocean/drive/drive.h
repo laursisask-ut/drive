@@ -885,10 +885,16 @@ void set_start_position(Drive* env){
             continue;
         }
         if(is_active == 0){
-            e->vx = 0;
-            e->vy = 0;
-            e->vz = 0;
             e->collided_before_goal = 0;
+            if (e->mark_as_expert == 0) {
+                e->vx = 0;
+                e->vy = 0;
+                e->vz = 0;
+            } else {
+                e->vx = e->traj_vx[step];
+                e->vy = e->traj_vy[step];
+                e->vz = e->traj_vz[step];
+            }
         } else {
             e->vx = e->traj_vx[step];
             e->vy = e->traj_vy[step];
@@ -1225,6 +1231,9 @@ void move_expert(Drive* env, float* actions, int agent_idx){
         agent->x = INVALID_POSITION;
         agent->y = INVALID_POSITION;
         agent->z = 0.0f;
+        agent->vx = 0.0f;
+        agent->vy = 0.0f;
+        agent->vz = 0.0f;
         agent->heading = 0.0f;
         agent->heading_x = 1.0f;
         agent->heading_y = 0.0f;
@@ -1233,6 +1242,9 @@ void move_expert(Drive* env, float* actions, int agent_idx){
     agent->x = agent->traj_x[t];
     agent->y = agent->traj_y[t];
     agent->z = agent->traj_z[t];
+    agent->vx = agent->traj_vx[t];
+    agent->vy = agent->traj_vy[t];
+    agent->vz = agent->traj_vz[t];
     agent->heading = agent->traj_heading[t];
     agent->heading_x = cosf(agent->heading);
     agent->heading_y = sinf(agent->heading);
