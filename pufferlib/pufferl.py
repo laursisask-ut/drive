@@ -1063,7 +1063,7 @@ class PuffeRL:
 
         for _ in range(max_scenario_length):
             logits, _value = self.policy.forward_eval(torch.as_tensor(observations).to(device), state)
-            actions, _, _ = pufferlib.pytorch.sample_logits(logits)
+            actions = torch.stack([l.argmax(dim=-1) for l in logits], dim=-1)
             observations, _rewards, _terminals, _truncations, info = env.step(actions.cpu())
 
             for i in info:
