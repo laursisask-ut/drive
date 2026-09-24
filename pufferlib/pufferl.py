@@ -144,7 +144,7 @@ VALIDATION_SPECS = (
 
 
 class PuffeRL:
-    def __init__(self, config, vecenv, policy, logger=None):
+    def __init__(self, config, vecenv, policy, logger=None, anchor_policy=None):
         # Backend perf optimization
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.deterministic = config["torch_deterministic"]
@@ -248,6 +248,7 @@ class PuffeRL:
             pufferlib.pytorch.sample_logits = torch.compile(
                 pufferlib.pytorch.sample_logits, mode=config["compile_mode"]
             )
+        self.anchor_policy = None if anchor_policy is None else torch.compile(anchor_policy)
 
         # Optimizer
         if config["optimizer"] == "adam":
@@ -633,7 +634,13 @@ class PuffeRL:
                     self.optimizer.zero_grad()
                     continue
 
-            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss
+            behavior_anchor_kl_div = 0
+            if self.anchor_policy is not None:
+                with torch.no_grad():
+                    regularizer_logits, _ = self.anchor_policy(mb_obs, state)
+                behavior_anchor_kl_div = sum(pufferlib.pytorch.kl_div(p, q).mean() for p, q in zip(regularizer_logits, logits))
+
+            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.075 * behavior_anchor_kl_div
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
@@ -646,6 +653,7 @@ class PuffeRL:
             profile("train_misc", epoch)
             losses["policy_loss"] += pg_loss.item() / self.total_minibatches
             losses["value_loss"] += v_loss.item() / self.total_minibatches
+            losses["behavior_anchor_kl_div"] += behavior_anchor_kl_div.item() / self.total_minibatches
             losses["entropy"] += entropy_loss.item() / self.total_minibatches
             losses["old_approx_kl"] += old_approx_kl.item() / self.total_minibatches
             losses["approx_kl"] += approx_kl.item() / self.total_minibatches
@@ -1448,6 +1456,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv, env_name)
+    anchor_policy = load_anchor_policy(args, vecenv)
 
     if "LOCAL_RANK" in os.environ:
         args["train"]["device"] = torch.cuda.current_device()
@@ -1462,7 +1471,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         policy = model.to(local_rank)
 
     train_config = dict(**args["train"], env=env_name)
-    pufferl = PuffeRL(train_config, vecenv, policy, logger)
+    pufferl = PuffeRL(train_config, vecenv, policy, logger, anchor_policy)
 
     all_logs = []
     while pufferl.global_step < train_config["total_timesteps"]:
@@ -1677,6 +1686,19 @@ def load_env(env_name, args):
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
     return pufferlib.vector.make(make_env, env_kwargs=args["env"], **args["vec"])
+
+
+def load_anchor_policy(args, vecenv):
+    package = args["package"]
+    module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
+    env_module = importlib.import_module(module_name)
+
+    device = args["train"]["device"]
+    policy_cls = getattr(env_module.torch, args["behavioral_anchor"]["policy_name"])
+    policy = policy_cls(vecenv.driver_env).to(device)
+    policy.load_state_dict(torch.load(args["behavioral_anchor"]["policy_weights"]))
+
+    return policy
 
 
 def load_policy(args, vecenv, env_name=""):

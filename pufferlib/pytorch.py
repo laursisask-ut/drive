@@ -225,3 +225,9 @@ def sample_logits(logits, action=None):
         return action.squeeze(0), logprob.squeeze(0), logits_entropy.squeeze(0)
 
     return action.T, logprob.sum(0), logits_entropy
+
+def kl_div(logits_p, logits_q):
+    min_real = torch.finfo(logits_p.dtype).min
+    log_p = logits_p.clamp(min=min_real).log_softmax(dim=-1)
+    log_q = logits_q.clamp(min=min_real).log_softmax(dim=-1)
+    return torch.sum(log_p.exp() * (log_p - log_q), dim=-1)

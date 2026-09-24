@@ -826,9 +826,9 @@ Entity* load_map_binary(const char* filename, Drive* env) {
 
             // Reasonable defaults, needed for validation runs
             entities[i].max_speed = 90/3.6f;
-            entities[i].lane_center_reward_coefficient = 2.5e-4;
+            entities[i].lane_center_reward_coefficient = 2.5e-3;
             entities[i].comfort_reward_coefficient = 0.01f;
-            entities[i].lane_align_reward_coefficient = 2.5e-3f;
+            entities[i].lane_align_reward_coefficient = 2.5e-2f;
             entities[i].collision_reward_coefficient = 1.0f;
             entities[i].offroad_reward_coefficient = 1.0f;
             entities[i].stop_line_reward_coefficient = 1.0f;
@@ -880,6 +880,8 @@ void set_start_position(Drive* env){
         e->x = e->traj_x[step];
         e->y = e->traj_y[step];
         e->z = e->traj_z[step];
+        e->prev_x = e->x;
+        e->prev_y = e->y;
 
         if(e->type > CYCLIST || e->type == 0){
             continue;

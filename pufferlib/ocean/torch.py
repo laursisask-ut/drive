@@ -247,11 +247,13 @@ class TrajectoryDecoder(torch.nn.Module):
         return action, value
 
 class Wayformer(torch.nn.Module):
-    def __init__(self, env, **kwargs):
+    def __init__(self, env=None, ego_dim=None, action_dim=None, **kwargs):
         super().__init__()
         hidden_dim = 128
-        ego_dim = 23 if env.dynamics_model == "jerk" else 20
-        action_dim = env.single_action_space.nvec.tolist()
+        if ego_dim is None:
+            ego_dim = 23 if env.dynamics_model == "jerk" else 20
+        if action_dim is None:
+            action_dim = env.single_action_space.nvec.tolist()
         self.encoder = SceneEncoder(ego_dim=ego_dim, hidden_dim=hidden_dim, num_blocks=2)
         self.decoder = TrajectoryDecoder(action_dim=action_dim, hidden_dim=hidden_dim, num_blocks=1)
 
