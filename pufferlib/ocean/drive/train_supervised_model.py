@@ -48,17 +48,16 @@ def main():
     #model.load_state_dict(torch.load("/home/laur/Dev/PufferDrive/experiments/puffer_drive_n1uaeele/model_puffer_drive_003577.pt"))
 
     epochs = int(os.environ.get("EPOCHS", "10"))
-    batch_size = int(os.environ.get("BATCH_SIZE", 128))
+    batch_size = int(os.environ.get("BATCH_SIZE", 1024))
 
-    if os.environ.get("WANDB") == "1":
-        wandb.login()
-        wandb.init(project="drive-supervised", config={"epochs": epochs, "batch_size": batch_size})
+    wandb.login()
+    wandb.init(project="drive-supervised", config={"epochs": epochs, "batch_size": batch_size})
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     original_model = model
     model = torch.compile(model)
-    optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     dataset = PregeneratedDataset("supervised_data.npz")
