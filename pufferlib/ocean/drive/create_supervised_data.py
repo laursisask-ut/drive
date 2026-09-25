@@ -65,6 +65,13 @@ def calculate_heading_change(a, b):
 def process_scenario(filepath):
     print(f"processing {filepath}", file=sys.stderr)
     scenario = json.load(open(filepath, "r"))
+    hidden_road_border_ids = {
+        int(value) for value in scenario.get("hidden_road_border_ids", [])
+    }
+    hidden_centerline_lanelet_ids = {
+        int(value)
+        for value in scenario.get("hidden_centerline_lanelet_ids", [])
+    }
 
     inputs = np.zeros((90, 1861), dtype=np.float32)
     actions = np.zeros((90, 2), dtype=np.int32)
@@ -105,7 +112,11 @@ def process_scenario(filepath):
         lateral_offset = None
         lane_heading_angle_diff = None
         for lanelet in lanelet2_map.laneletLayer.search(centerline_search_box):
-            if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "road":
+            if (
+                lanelet.id not in hidden_centerline_lanelet_ids
+                and "subtype" in lanelet.attributes
+                and lanelet.attributes["subtype"] == "road"
+            ):
                 arc = toArcCoordinates(to2D(lanelet.centerline), BasicPoint2d(ego_x, ego_y))
                 if abs(arc.distance) < 4 and (lateral_offset is None or abs(arc.distance) < abs(lateral_offset)):
                     lateral_offset = -arc.distance
@@ -165,7 +176,9 @@ def process_scenario(filepath):
         centerline_linestrings = [
             (lanelet.centerline, 0, default_line_attribute)
             for lanelet in lanelet2_map.laneletLayer.search(search_box)
-            if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "road"
+            if lanelet.id not in hidden_centerline_lanelet_ids
+            and "subtype" in lanelet.attributes
+            and lanelet.attributes["subtype"] == "road"
         ]
 
         nearby_linestrings = lanelet2_map.lineStringLayer.search(search_box)
@@ -173,14 +186,33 @@ def process_scenario(filepath):
         border_linestrings = [
             (linestring, 2, default_line_attribute)
             for linestring in nearby_linestrings
-            if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}
+            if linestring.id not in hidden_road_border_ids
+            and "type" in linestring.attributes
+            and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}
         ]
 
         stop_line_linestrings = []
         for linestring in nearby_linestrings:
             if "type" in linestring.attributes and linestring.attributes["type"] == "stop_line":
-                # TODO: Traffic lights
-                if linestring.attributes["subtype"] in {"yield_manual", "yield", "yield_stop"}:
+                traffic_light_states = scenario.get("traffic_light_states", {})
+                state_sequence = traffic_light_states.get(str(linestring.id))
+                if state_sequence is not None:
+                    status = state_sequence[t]
+                    if status == "red":
+                        line_attribute = -0.5
+                    elif status == "yellow":
+                        line_attribute = 0.0
+                    elif status == "green":
+                        line_attribute = 0.5
+                    elif status == "off":
+                        line_attribute = -1.0
+                    else:
+                        raise ValueError(
+                            f"Unknown traffic-light state {status!r} for stop line "
+                            f"{linestring.id} in {filepath}"
+                        )
+                    stop_line_linestrings.append((linestring, 5, line_attribute))
+                elif linestring.attributes["subtype"] in {"yield_manual", "yield", "yield_stop"}:
                     stop_line_linestrings.append((linestring, 3, default_line_attribute))
 
         crosswalk_linestrings = [
