@@ -57,11 +57,11 @@ def main():
     model = model.to(device)
     original_model = model
     model = torch.compile(model)
-    optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     dataset = PregeneratedDataset("supervised_data.npz")
-    train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
+    train_dataset, val_dataset = random_split(dataset, [0.9, 0.1])
 
     train_loader = DataLoader(FlattenedDataset(train_dataset), batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(FlattenedDataset(val_dataset), batch_size=batch_size)
@@ -107,6 +107,10 @@ def main():
             loss_sum = 0
             val_accel_accuracy_sum = 0
             val_steering_accuracy_sum = 0
+            accel_preds = []
+            accel_y_true = []
+            steering_preds = []
+            steering_y_true = []
             for inputs, target_actions in val_loader:
                 inputs = inputs.to(device)
                 target_actions = target_actions.to(device)
@@ -116,11 +120,31 @@ def main():
                 val_accel_accuracy_sum += (torch.argmax(predicted_accel, dim=1) == target_actions[:, 0]).float().mean()
                 val_steering_accuracy_sum += (torch.argmax(predicted_steering, dim=1) == target_actions[:, 1]).float().mean()
 
+                accel_preds += torch.argmax(predicted_accel, dim=1).tolist()
+                accel_y_true += target_actions[:, 0].tolist()
+
+                steering_preds += torch.argmax(predicted_steering, dim=1).tolist()
+                steering_y_true += target_actions[:, 1].tolist()
+
             print(f"Train loss: {train_loss_sum / train_updates:.5f}, validation loss: {loss_sum / len(val_loader):.5f}, "
                     f"train accel accuracy: {train_accel_accuracy_sum / train_updates:.4f}, " 
                     f"validation accel accuracy: {val_accel_accuracy_sum / len(val_loader):4f}, "
                     f"train steering accuracy: {train_steering_accuracy_sum / train_updates:.4f}, "
                     f"validation steering accuracy: {val_steering_accuracy_sum / len(val_loader):.4f}")
+
+            accel_confusion_matrix = wandb.plot.confusion_matrix(
+                preds=accel_preds,
+                y_true=accel_y_true,
+                class_names=[-4.0, -2.667, -1.333, 0.0, 1.333, 2.667],
+                title="Acceleration Confusion Matrix"
+            )
+
+            steering_confusion_matrix = wandb.plot.confusion_matrix(
+                preds=steering_preds,
+                y_true=steering_y_true,
+                class_names=[-0.667, -0.5, -0.333, -0.167, -0.08, -0.035, 0.0, 0.035, 0.08, 0.167, 0.333, 0.500, 0.667],
+                title="Steering Confusion Matrix"
+            )
 
             wandb.log({
                 "epoch": epoch,
@@ -129,7 +153,9 @@ def main():
                 "validation_accel_accuracy": val_accel_accuracy_sum / len(val_loader),
                 "train_steering_accuracy": train_steering_accuracy_sum / train_updates,
                 "validation_steering_accuracy": val_steering_accuracy_sum / len(val_loader),
-                "learning_rate": scheduler.get_last_lr()[0]
+                "learning_rate": scheduler.get_last_lr()[0],
+                "acceleration_confusion_matrix": accel_confusion_matrix,
+                "steering_confusion_matrix": steering_confusion_matrix
             })
 
         scheduler.step()

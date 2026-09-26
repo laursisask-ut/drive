@@ -17,7 +17,7 @@ utm_origin_lon = 26.726272
 projector = UtmProjector(Origin(utm_origin_lat, utm_origin_lon), True, False)
 lanelet2_map = load("tartu_large_processed.osm", projector)
 
-ACCELERATION_VALUES = [-4.0, -2.667, -1.333, 0.0, 1.333, 2.667, 4.0]
+ACCELERATION_VALUES = [-4.0, -2.667, -1.333, 0.0, 1.333, 2.667] # 4.0 is not allowed here
 STEERING_VALUES = [-0.667, -0.5, -0.333, -0.167, -0.08, -0.035, 0.0, 0.035, 0.08, 0.167, 0.333, 0.500, 0.667]
 
 def to_egocentric_vector(x, y, ego_heading):
@@ -88,17 +88,25 @@ def process_scenario(filepath):
 
         speed = scenario["ego"]["speed"][t]
         next_speed = scenario["ego"]["speed"][t + 1]
-        next_heading = scenario["ego"]["heading"][t + 1]
+        next_heading = normalize_heading(scenario["ego"]["heading"][t + 1])
 
         desired_acceleration = (next_speed - prev_speed) / 0.1
-        accel_action_idx = min(range(len(ACCELERATION_VALUES)), key=lambda i: abs(ACCELERATION_VALUES[i] - desired_acceleration))
+        if next_speed < 0.01 and prev_speed < 1.333*0.1:
+            accel_action_idx = ACCELERATION_VALUES.index(-1.333)
+        elif desired_acceleration > 0:
+            accel_action_idx = max([i for i in range(len(ACCELERATION_VALUES)) if ACCELERATION_VALUES[i] >= 0 and desired_acceleration >= ACCELERATION_VALUES[i]], key=lambda x: ACCELERATION_VALUES[x])
+        else:
+            accel_action_idx = min([i for i in range(len(ACCELERATION_VALUES)) if ACCELERATION_VALUES[i] <= 0 and desired_acceleration <= ACCELERATION_VALUES[i]], key=lambda x: ACCELERATION_VALUES[x])
         actions[t][0] = accel_action_idx
         prev_speed = max(0.1, prev_speed + ACCELERATION_VALUES[accel_action_idx] * 0.1)
 
         if speed > 0.1:
             wheelbase = 0.6 * scenario["ego"]["length"]
             desired_steering = math.atan(calculate_heading_change(prev_heading, next_heading) * wheelbase / speed / 0.1)
-            steering_action_idx = min(range(len(STEERING_VALUES)), key=lambda i: abs(STEERING_VALUES[i] - desired_steering))
+            if desired_steering > 0:
+                steering_action_idx = max([i for i in range(len(STEERING_VALUES)) if STEERING_VALUES[i] >= 0 and desired_steering >= STEERING_VALUES[i]], key=lambda x: STEERING_VALUES[x])
+            else:
+                steering_action_idx = min([i for i in range(len(STEERING_VALUES)) if STEERING_VALUES[i] <= 0 and desired_steering <= STEERING_VALUES[i]], key=lambda x: STEERING_VALUES[x])
             actions[t][1] = steering_action_idx
             prev_heading = normalize_heading(prev_heading + speed * 0.1 * math.tan(STEERING_VALUES[steering_action_idx]) / wheelbase)
 
