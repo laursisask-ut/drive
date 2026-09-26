@@ -440,8 +440,6 @@ struct Drive {
     float reward_offroad_collision;
     float reward_ade;
     char* map_name;
-    float world_mean_x;
-    float world_mean_y;
     float dt;
     float reward_goal;
     float reward_goal_post_respawn;
@@ -1181,50 +1179,6 @@ void init_neighbor_offsets(Drive* env) {
     }
 }
 
-void set_means(Drive* env) {
-    float mean_x = 0.0f;
-    float mean_y = 0.0f;
-    int64_t point_count = 0;
-
-    // Compute single mean for all entities (vehicles and roads)
-    for (int i = 0; i < env->num_entities; i++) {
-        if (env->entities[i].type == VEHICLE || env->entities[i].type == PEDESTRIAN || env->entities[i].type == CYCLIST) {
-            for (int j = 0; j < env->entities[i].array_size; j++) {
-                // Assume a validity flag exists (e.g., valid[j]); adjust if not available
-                if (env->entities[i].traj_valid[j]) { // Add validity check if applicable
-                    point_count++;
-                    mean_x += (env->entities[i].traj_x[j] - mean_x) / point_count;
-                    mean_y += (env->entities[i].traj_y[j] - mean_y) / point_count;
-                }
-            }
-        } else if (env->entities[i].type >= 4) {
-            for (int j = 0; j < env->entities[i].array_size; j++) {
-                point_count++;
-                mean_x += (env->entities[i].traj_x[j] - mean_x) / point_count;
-                mean_y += (env->entities[i].traj_y[j] - mean_y) / point_count;
-            }
-        }
-    }
-    env->world_mean_x = mean_x;
-    env->world_mean_y = mean_y;
-    for (int i = 0; i < env->num_entities; i++) {
-        if (env->entities[i].type == VEHICLE || env->entities[i].type == PEDESTRIAN || env->entities[i].type == CYCLIST || env->entities[i].type >= 4) {
-            for (int j = 0; j < env->entities[i].array_size; j++) {
-                if(env->entities[i].traj_x[j] == INVALID_POSITION) continue;
-                env->entities[i].traj_x[j] -= mean_x;
-                env->entities[i].traj_y[j] -= mean_y;
-            }
-            env->entities[i].goal_position_x -= mean_x;
-            env->entities[i].goal_position_y -= mean_y;
-            for (int j = 0; j < env->entities[i].multi_goal_count; j++) {
-                env->entities[i].multi_goal_position_x[j] -= mean_x;
-                env->entities[i].multi_goal_position_y[j] -= mean_y;
-            }
-        }
-    }
-
-}
-
 void move_expert(Drive* env, float* actions, int agent_idx){
     Entity* agent = &env->entities[agent_idx];
     int t = env->timestep;
@@ -1955,7 +1909,6 @@ void init(Drive* env){
     env->timestep = 0;
     if (!env->dynamic_map_generation)
         env->entities = load_map_binary(env->map_name, env);
-    set_means(env);
     init_grid_map(env);
     if (env->use_goal_generation) init_topology_graph(env);
     env->grid_map->vision_range = 21;
