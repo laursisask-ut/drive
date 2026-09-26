@@ -2879,6 +2879,25 @@ void respawn_agent(Drive* env, int agent_idx){
     env->entities[agent_idx].multi_goal_idx = 0;
 }
 
+float compute_distance_to_goal(Entity* e) {
+    // Compute distance from the goal to the closest point on the vehicle
+    // This is needed for really large vehicles like buses that otherwise
+    // may have hard time going through the goals.
+
+    float cos_heading = e->heading_x;
+    float sin_heading = e->heading_y;
+
+    float goal_x = e->goal_position_x - e->x;
+    float goal_y = e->goal_position_y - e->y;
+
+    float rel_goal_x = goal_x*cos_heading + goal_y*sin_heading;
+    float rel_goal_y = -goal_x*sin_heading + goal_y*cos_heading;
+
+    float dx = fmaxf(fabsf(rel_goal_x) - 0.5f * e->length, 0.0f);
+    float dy = fmaxf(fabsf(rel_goal_y) - 0.5f * e->width, 0.0f);
+    return sqrtf(dx * dx + dy * dy);
+}
+
 void c_step(Drive* env){
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
@@ -2996,6 +3015,8 @@ void c_step(Drive* env){
             }
         }
 
+        float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
+
         if (lateral_offset > -100.0f) {
             env->logs[i].lane_lateral_offset += fabsf(lateral_offset);
             env->logs[i].lane_heading_angle_diff += lane_heading_angle_diff;
@@ -3005,7 +3026,6 @@ void c_step(Drive* env){
             env->rewards[i] += lane_align_reward;
             record_reward_component(env, i, REWARD_COMPONENT_LANE_ALIGNMENT, lane_align_reward);
 
-            float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
             if (speed > 2.5f) {
                 float velocity_reward = 2.5e-4f * fmax(cosf(lane_heading_angle_diff), 0.0f);
                 env->rewards[i] += velocity_reward;
@@ -3013,11 +3033,7 @@ void c_step(Drive* env){
             }
         }
 
-        float distance_to_goal = relative_distance_2d(
-                env->entities[agent_idx].x,
-                env->entities[agent_idx].y,
-                env->entities[agent_idx].goal_position_x,
-                env->entities[agent_idx].goal_position_y);
+        float distance_to_goal = compute_distance_to_goal(&env->entities[agent_idx]);
 
         // Reward agent if it is within X meters of goal
         if (!env->entities[agent_idx].reached_final_goal && distance_to_goal < env->entities[agent_idx].goal_radius) {
@@ -3027,7 +3043,6 @@ void c_step(Drive* env){
                 env->logs[i].num_goals_reached += 1;
                 env->entities[agent_idx].reached_goal_this_episode = 1;
                 env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
-
                 if (env->entities[agent_idx].goal_timestep < env->entities[agent_idx].array_size - 1) {
                     int t = fmin(env->entities[agent_idx].goal_timestep + 80,
                         env->entities[agent_idx].array_size - 1);
@@ -3038,21 +3053,24 @@ void c_step(Drive* env){
                     env->entities[agent_idx].reached_final_goal = 1;
                 }
             } else if (env->entities[agent_idx].multi_goal_count > 0) {
-                float reward = env->reward_goal;
-                env->rewards[i] += reward;
-                record_reward_component(env, i, REWARD_COMPONENT_GOAL, reward);
-                env->entities[agent_idx].sampled_new_goal = 1;
-                env->logs[i].num_goals_reached += 1;
-                env->entities[agent_idx].reached_goal_this_episode = 1;
-                env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
+                // The vehicle must slow down to 1 m/s to obtain the last goal reward
+                if (speed < 1 || env->entities[agent_idx].multi_goal_idx < env->entities[agent_idx].multi_goal_count - 1) {
+                    float reward = env->reward_goal;
+                    env->rewards[i] += reward;
+                    record_reward_component(env, i, REWARD_COMPONENT_GOAL, reward);
+                    env->entities[agent_idx].sampled_new_goal = 1;
+                    env->logs[i].num_goals_reached += 1;
+                    env->entities[agent_idx].reached_goal_this_episode = 1;
+                    env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
 
-                int goal_idx = ++env->entities[agent_idx].multi_goal_idx;
-                if (goal_idx < env->entities[agent_idx].multi_goal_count) {
-                    env->entities[agent_idx].goal_position_x = env->entities[agent_idx].multi_goal_position_x[goal_idx];
-                    env->entities[agent_idx].goal_position_y = env->entities[agent_idx].multi_goal_position_y[goal_idx];
-                    env->entities[agent_idx].goal_position_z = env->entities[agent_idx].multi_goal_position_z[goal_idx];
-                } else {
-                    env->entities[agent_idx].reached_final_goal = 1;
+                    int goal_idx = ++env->entities[agent_idx].multi_goal_idx;
+                    if (goal_idx < env->entities[agent_idx].multi_goal_count) {
+                        env->entities[agent_idx].goal_position_x = env->entities[agent_idx].multi_goal_position_x[goal_idx];
+                        env->entities[agent_idx].goal_position_y = env->entities[agent_idx].multi_goal_position_y[goal_idx];
+                        env->entities[agent_idx].goal_position_z = env->entities[agent_idx].multi_goal_position_z[goal_idx];
+                    } else {
+                        env->entities[agent_idx].reached_final_goal = 1;
+                    }
                 }
             } else {
                 env->rewards[i] += env->reward_goal;
