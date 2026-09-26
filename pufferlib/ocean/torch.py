@@ -119,7 +119,7 @@ class SceneEncoderBlock(torch.nn.Module):
     
     def forward(self, x):
         norm_x = self.layer_norm1(x)
-        attn_out, _ = self.attn(norm_x, norm_x, norm_x)
+        attn_out, _ = self.attn(norm_x, norm_x, norm_x, need_weights=False)
         x = x + attn_out
 
         mlp_out = self.mlp(self.layer_norm2(x))
@@ -216,7 +216,7 @@ class TrajectoryDecoderBlock(torch.nn.Module):
     
     def forward(self, x, encoder_outputs):
         norm_x = self.layer_norm1(x)
-        attn_out, _ = self.attn(norm_x, encoder_outputs, encoder_outputs)
+        attn_out, _ = self.attn(norm_x, encoder_outputs, encoder_outputs, need_weights=False)
         x = x + attn_out
 
         mlp_out = self.mlp(self.layer_norm2(x))
