@@ -640,7 +640,6 @@ class PuffeRL:
                 with torch.no_grad():
                     regularizer_logits, _ = self.anchor_policy(mb_obs, state)
                     behavior_anchor_kl_div = sum(pufferlib.pytorch.kl_div(p, q).mean() for p, q in zip(regularizer_logits, logits))
-                    behavior_anchor_kl_div.item()
 
             profile("train_misc", epoch)
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.075 * behavior_anchor_kl_div

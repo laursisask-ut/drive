@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include "error.h"
 #include "drive.h"
-#include "drivenet.h"
+#include "torch_model.h"
 #include "libgen.h"
 #include "../env_config.h"
 #define TRAJECTORY_LENGTH_DEFAULT 91
@@ -77,7 +77,7 @@ void CloseVideo(VideoRecorder *recorder) {
     waitpid(recorder->pid, NULL, 0);
 }
 
-void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int lasers, int trajectories, int frame_count, float* path, int log_trajectories, int show_grid, float* reward_log) {
+void renderTopDownView(Drive* env, Client* client, float map_height, int obs, int lasers, int trajectories, int frame_count, float* path, int log_trajectories, int show_grid, float* reward_log) {
 
     BeginDrawing();
     AgentLabel labels[MAX_AGENTS] = {0};
@@ -212,7 +212,7 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
     EndDrawing();
 }
 
-int eval_gif(const char* map_name, const char* policy_name, int show_grid, int obs_only, int lasers, int log_trajectories, int frame_skip, float goal_radius, int control_non_vehicles, int init_steps, int control_all_agents, int policy_agents_per_env, int deterministic_selection, const char* view_mode, const char* output_topdown, const char* output_agent, int num_maps, int scenario_length_override) {
+int eval_gif(const char* map_name, const char* policy_name, const char* model_path, const char* model_name, int show_grid, int obs_only, int lasers, int log_trajectories, int frame_skip, float goal_radius, int control_non_vehicles, int init_steps, int control_all_agents, int policy_agents_per_env, int deterministic_selection, const char* view_mode, const char* output_topdown, const char* output_agent, int num_maps, int scenario_length_override) {
 
     // Parse configuration from INI file
     env_init_config conf = {0};  // Initialize to zero
@@ -241,11 +241,24 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     }
     fclose(map_file);
 
-    FILE* policy_file = fopen(policy_name, "rb");
+    FILE* policy_file = fopen(model_path, "rb");
     if (policy_file == NULL) {
-        RAISE_FILE_ERROR(policy_name);
+        RAISE_FILE_ERROR(model_path);
     }
     fclose(policy_file);
+    if (control_all_agents == 1)
+        conf.control_all_agents = 1;
+    int effective_control_non_vehicles = control_non_vehicles >= 0
+        ? control_non_vehicles
+        : conf.control_non_vehicles;
+    int effective_init_steps = init_steps >= 0 ? init_steps : conf.init_steps;
+    int effective_policy_agents = policy_agents_per_env != INT_MIN
+        ? policy_agents_per_env
+        : conf.num_policy_controlled_agents;
+    int effective_deterministic_selection = deterministic_selection
+        ? 1
+        : conf.deterministic_agent_selection;
+    printf("control all agents before allocation is %d\n", conf.control_all_agents);
 
     Drive env = {
         .dynamics_model = conf.dynamics_model,
@@ -256,11 +269,11 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
         .goal_radius = conf.goal_radius,
         .dt = conf.dt,
 	    .map_name = (char*)map_name,
-        .control_non_vehicles = conf.control_non_vehicles,
-        .init_steps = conf.init_steps,
+        .control_non_vehicles = effective_control_non_vehicles,
+        .init_steps = effective_init_steps,
         .control_all_agents = conf.control_all_agents,
-        .policy_agents_per_env = conf.num_policy_controlled_agents,
-        .deterministic_agent_selection = conf.deterministic_agent_selection,
+        .policy_agents_per_env = effective_policy_agents,
+        .deterministic_agent_selection = effective_deterministic_selection,
         .export_replay_enabled = true,
         .replay_dir = strdup("replays")
     };
@@ -306,9 +319,15 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     SetTargetFPS(6000);
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_HIDDEN);
 
-    Weights* weights = load_weights(policy_name);
     printf("Active agents in map: %d\n", env.active_agent_count);
-    DriveNet* net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
+    TorchModel* net = torch_model_load(model_path, model_name, env.active_agent_count, env.dynamics_model);
+    if (net == NULL) {
+        fprintf(stderr, "Error: failed to load model %s from %s\n", model_name, model_path);
+        CloseWindow();
+        free(client);
+        free_allocated(&env);
+        return -1;
+    }
 
     int frame_count = env.scenario_length > 0 ? env.scenario_length : TRAJECTORY_LENGTH_DEFAULT;
     frame_count -= env.init_steps;
@@ -358,7 +377,7 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
                 WriteFrame(&topdown_recorder, img_width, img_height);
                 rendered_frames++;
             }
-            forward(net, env.observations, (int*)env.actions);
+            torch_model_forward(net, env.observations, (int*)env.actions);
             c_step(&env);
         }
     }
@@ -378,8 +397,7 @@ int eval_gif(const char* map_name, const char* policy_name, int show_grid, int o
     // Clean up resources
     free(client);
     free_allocated(&env);
-    free_drivenet(net);
-    free(weights);
+    torch_model_free(net);
     return 0;
 }
 
@@ -389,14 +407,16 @@ int main(int argc, char* argv[]) {
     int lasers = 0;
     int log_trajectories = 1;
     int frame_skip = 1;
-    float goal_radius = 2.0f;
-    int init_steps = 0;
+    float goal_radius = 3.0f;
+    int init_steps = -1;
     const char* map_name = NULL;
     const char* policy_name = "resources/drive/puffer_drive_weights.bin";
+    const char* model_path = "experiments/puffer_drive_ltbsu7h7/model_puffer_drive_000800.pt";
+    const char* model_name = "Wayformer";
     int control_all_agents = 0;
     int deterministic_selection = 0;
-    int policy_agents_per_env = -1;
-    int control_non_vehicles = 0;
+    int policy_agents_per_env = INT_MIN;
+    int control_non_vehicles = -1;
     int num_maps = 100;
     int scenario_length_cli = -1;
 
@@ -442,9 +462,31 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--policy-name") == 0) {
             if (i + 1 < argc) {
                 policy_name = argv[i + 1];
+                model_path = argv[i + 1];
                 i++;
             } else {
                 fprintf(stderr, "Error: --policy-name option requires a policy file path\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--model-path") == 0) {
+            if (i + 1 < argc) {
+                model_path = argv[i + 1];
+                i++;
+            } else {
+                fprintf(stderr, "Error: --model-path option requires a model file path\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--model-name") == 0) {
+            if (i + 1 < argc) {
+                model_name = argv[i + 1];
+                i++;
+                if (strcmp(model_name, "Drive") != 0 &&
+                    strcmp(model_name, "Wayformer") != 0) {
+                    fprintf(stderr, "Error: --model-name must be 'Drive' or 'Wayformer'\n");
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "Error: --model-name option requires Drive or Wayformer\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "--view") == 0) {
@@ -503,6 +545,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    eval_gif(map_name, policy_name, show_grid, obs_only, lasers, log_trajectories, frame_skip, goal_radius, control_non_vehicles, init_steps, control_all_agents, policy_agents_per_env, deterministic_selection, view_mode, output_topdown, output_agent, num_maps, scenario_length_cli);
+    eval_gif(map_name, policy_name, model_path, model_name, show_grid, obs_only, lasers, log_trajectories, frame_skip, goal_radius, control_non_vehicles, init_steps, control_all_agents, policy_agents_per_env, deterministic_selection, view_mode, output_topdown, output_agent, num_maps, scenario_length_cli);
     return 0;
 }
