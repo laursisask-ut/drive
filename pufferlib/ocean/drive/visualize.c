@@ -83,10 +83,13 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
     AgentLabel labels[MAX_AGENTS] = {0};
     int label_count = 0;
 
+    // Map coordinates need not be centered on the world origin.
+    float center_x = (env->grid_map->top_left_x + env->grid_map->bottom_right_x) * 0.5f;
+    float center_y = (env->grid_map->top_left_y + env->grid_map->bottom_right_y) * 0.5f;
     // Top-down orthographic camera
     Camera3D camera = {0};
-    camera.position = (Vector3){ 0.0f, 0.0f, 500.0f };  // above the scene
-    camera.target   = (Vector3){ 0.0f, 0.0f, 0.0f };  // look at origin
+    camera.position = (Vector3){ center_x, center_y, 500.0f };  // above the scene
+    camera.target   = (Vector3){ center_x, center_y, 0.0f };
     camera.up       = (Vector3){ 0.0f, -1.0f, 0.0f };
     camera.fovy     = map_height;
     camera.projection = CAMERA_ORTHOGRAPHIC;
@@ -96,11 +99,11 @@ void renderTopDownView(Drive* env, Client* client, int map_height, int obs, int 
         int idx = env->active_agent_indices[0];
         Entity* e = &env->entities[idx];
         if (e->reached_final_goal) {
-            camera.position = (Vector3){e->goal_position_x, e->goal_position_y, 500.0f};
+            camera.position = (Vector3){e->goal_position_x, e->goal_position_y, 50.0f};
             camera.target = (Vector3){e->goal_position_x, e->goal_position_y, 0.0f};
             camera.fovy = 150;
         } else {
-            camera.position = (Vector3){e->x, e->y, 500.0f};
+            camera.position = (Vector3){e->x, e->y, 50.0f};
             camera.target = (Vector3){e->x, e->y, 0.0f};
             camera.fovy = 150;
         }

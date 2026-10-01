@@ -1,8 +1,119 @@
 #include "drive.h"
+#include <Python.h>
+
+static PyObject* vec_active_agent_positions(PyObject* self, PyObject* args);
+static PyObject* make_static_road_map(PyObject* self, PyObject* args);
+
 #define Env Drive
 #define MY_SHARED
 #define MY_PUT
+#define MY_METHODS \
+    {"vec_active_agent_positions", vec_active_agent_positions, METH_VARARGS, \
+     "Return world XY positions, environment indices, and entity indices for active agents"}, \
+    {"create_static_road_map", make_static_road_map, METH_VARARGS, \
+     "Take ownership of a StaticRoadEntity array and build a reusable road map"}
 #include "../env_binding.h"
+
+#define STATIC_ROAD_MAP_CAPSULE "puffer_drive.StaticRoadMap"
+
+static void destroy_static_road_map_capsule(PyObject* capsule) {
+    StaticRoadMap* map = PyCapsule_GetPointer(capsule, STATIC_ROAD_MAP_CAPSULE);
+    if (map) release_static_road_map(map);
+}
+
+static PyObject* make_static_road_map(PyObject* self, PyObject* args) {
+    PyObject* address;
+    int count;
+    if (!PyArg_ParseTuple(args, "Oi", &address, &count)) return NULL;
+    StaticRoadEntity* roads = PyLong_AsVoidPtr(address);
+    if (PyErr_Occurred()) return NULL;
+    if (count < 0 || (count > 0 && roads == NULL)) {
+        PyErr_SetString(PyExc_ValueError, "Expected a nonnegative road count and a non-null road array");
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!grid_map_entity_type(roads[i].type) || roads[i].array_size < 0 ||
+            (roads[i].array_size > 0 && (!roads[i].traj_x || !roads[i].traj_y || !roads[i].traj_z)) ||
+            (roads[i].type == TRAFFIC_LIGHT_STOP_LINE && roads[i].traffic_light_idx < 0)) {
+            PyErr_SetString(PyExc_ValueError, "Invalid static road geometry or traffic-light index");
+            return NULL;
+        }
+    }
+    StaticRoadMap* map = create_static_road_map(roads, count);
+    PyObject* capsule = PyCapsule_New(map, STATIC_ROAD_MAP_CAPSULE, destroy_static_road_map_capsule);
+    if (!capsule) release_static_road_map(map);
+    return capsule;
+}
+
+static PyObject* vec_active_agent_positions(PyObject* self, PyObject* args) {
+    if (PyTuple_Size(args) != 1) {
+        PyErr_SetString(PyExc_TypeError, "vec_active_agent_positions requires 1 argument");
+        return NULL;
+    }
+
+    VecEnv* vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+
+    npy_intp agent_count = 0;
+    for (int env_idx = 0; env_idx < vec->num_envs; env_idx++) {
+        Drive* env = vec->envs[env_idx];
+        if (env->active_agent_count < 0 || env->active_agent_count > MAX_AGENTS) {
+            PyErr_SetString(PyExc_RuntimeError, "Invalid active agent count");
+            return NULL;
+        }
+        agent_count += env->active_agent_count;
+    }
+
+    npy_intp position_dims[2] = {agent_count, 2};
+    npy_intp index_dims[1] = {agent_count};
+    PyObject* positions = PyArray_SimpleNew(2, position_dims, NPY_FLOAT32);
+    PyObject* env_indices = PyArray_SimpleNew(1, index_dims, NPY_INT32);
+    PyObject* entity_indices = PyArray_SimpleNew(1, index_dims, NPY_INT32);
+    if (!positions || !env_indices || !entity_indices) {
+        Py_XDECREF(positions);
+        Py_XDECREF(env_indices);
+        Py_XDECREF(entity_indices);
+        return NULL;
+    }
+
+    float* position_data = (float*)PyArray_DATA((PyArrayObject*)positions);
+    int32_t* env_index_data = (int32_t*)PyArray_DATA((PyArrayObject*)env_indices);
+    int32_t* entity_index_data = (int32_t*)PyArray_DATA((PyArrayObject*)entity_indices);
+    npy_intp row = 0;
+    for (int env_idx = 0; env_idx < vec->num_envs; env_idx++) {
+        Drive* env = vec->envs[env_idx];
+        for (int active_idx = 0; active_idx < env->active_agent_count; active_idx++) {
+            int entity_idx = env->active_agent_indices[active_idx];
+            if (entity_idx < 0 || entity_idx >= env->num_objects) {
+                Py_DECREF(positions);
+                Py_DECREF(env_indices);
+                Py_DECREF(entity_indices);
+                PyErr_SetString(PyExc_RuntimeError, "Invalid active entity index");
+                return NULL;
+            }
+            Entity* entity = &env->entities[entity_idx];
+            position_data[2 * row] = entity->x;
+            position_data[2 * row + 1] = entity->y;
+            env_index_data[row] = env_idx;
+            entity_index_data[row] = entity_idx;
+            row++;
+        }
+    }
+
+    PyObject* result = PyTuple_New(3);
+    if (!result) {
+        Py_DECREF(positions);
+        Py_DECREF(env_indices);
+        Py_DECREF(entity_indices);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, positions);
+    PyTuple_SET_ITEM(result, 1, env_indices);
+    PyTuple_SET_ITEM(result, 2, entity_indices);
+    return result;
+}
 
 static int my_put(Env* env, PyObject* args, PyObject* kwargs) {
     PyObject* obs = PyDict_GetItemString(kwargs, "observations");
@@ -145,13 +256,7 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyList_SetItem(agent_offsets, env_count, offset);
         total_agent_count += env->active_agent_count;
         env_count++;
-        for(int j=0;j<env->num_entities;j++) {
-            free_entity(&env->entities[j]);
-        }
-        free(env->entities);
-        free(env->active_agent_indices);
-        free(env->static_car_indices);
-        free(env->expert_static_car_indices);
+        c_close(env);
         free(env);
     }
     if(total_agent_count >= num_agents){
@@ -172,20 +277,6 @@ static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     PyTuple_SetItem(tuple, 1, resized_map_ids);
     PyTuple_SetItem(tuple, 2, final_env_count);
     return tuple;
-
-    //Py_DECREF(num);
-    /*
-    for(int i = 0;i<num_envs; i++) {
-        for(int j=0;j<temp_envs[i].num_entities;j++) {
-            free_entity(&temp_envs[i].entities[j]);
-        }
-        free(temp_envs[i].entities);
-        free(temp_envs[i].active_agent_indices);
-        free(temp_envs[i].static_car_indices);
-    }
-    free(temp_envs);
-    */
-    // return agent_offsets;
 }
 
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
@@ -245,46 +336,55 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
 
         PyObject* map = PyObject_CallNoArgs(dynamic);
         if (map == NULL) return 1;
-        PyObject* object_count = PyTuple_GetItem(map, 0);
-        if (object_count == NULL) {
-            PyErr_SetString(PyExc_TypeError, "object_count is not present");
+        // 3 items: legacy combined Entity allocation (ownership transferred).
+        // 4 items: separate actor and road allocations (ownership transferred).
+        // 5 items: separate actors plus a shared road-map capsule. Only the
+        // actors transfer ownership; retain a map reference for this environment.
+        if (!PyTuple_Check(map) || PyTuple_Size(map) < 3 || PyTuple_Size(map) > 5) {
+            PyErr_SetString(PyExc_TypeError, "Expected (num_objects, num_roads, entities_ptr[, roads_ptr[, static_road_map]])");
             Py_DECREF(map);
             return 1;
         }
-        env->num_objects = PyLong_AsLong(object_count);
-        if (env->num_objects < 1) {
-            PyErr_SetString(PyExc_TypeError, "expected at least one object");
+        long num_objects = PyLong_AsLong(PyTuple_GetItem(map, 0));
+        long num_roads = PyLong_AsLong(PyTuple_GetItem(map, 1));
+        Entity* entities = PyLong_AsVoidPtr(PyTuple_GetItem(map, 2));
+        if (PyErr_Occurred()) {
             Py_DECREF(map);
             return 1;
         }
-
-        PyObject* road_count = PyTuple_GetItem(map, 1);
-        if (road_count == NULL) {
-            PyErr_SetString(PyExc_TypeError, "road_count is not present");
+        if (num_objects < 1 || num_objects > INT_MAX || num_roads < 0 || num_roads > INT_MAX || !entities) {
+            PyErr_SetString(PyExc_ValueError, "Invalid object/road count or null entity pointer");
             Py_DECREF(map);
             return 1;
         }
-        env->num_roads = PyLong_AsLong(road_count);
-        if (env->num_roads < 1) {
-            PyErr_SetString(PyExc_TypeError, "expected at least one road");
-            Py_DECREF(map);
-            return 1;
+        StaticRoadEntity* roads = NULL;
+        StaticRoadMap* shared_map = NULL;
+        if (PyTuple_Size(map) >= 4) {
+            roads = PyLong_AsVoidPtr(PyTuple_GetItem(map, 3));
+            if (PyErr_Occurred() || (num_roads > 0 && !roads)) {
+                if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "Static road entity pointer is null");
+                Py_DECREF(map);
+                return 1;
+            }
         }
-
-        env->num_entities = env->num_objects + env->num_roads;
-
-        PyObject* entity_ptr = PyTuple_GetItem(map, 2);
-        if (entity_ptr == NULL) {
-            PyErr_SetString(PyExc_TypeError, "entity_ptr is not present");
-            Py_DECREF(map);
-            return 1;
+        if (PyTuple_Size(map) == 5) {
+            shared_map = PyCapsule_GetPointer(PyTuple_GetItem(map, 4), STATIC_ROAD_MAP_CAPSULE);
+            if (!shared_map) {
+                Py_DECREF(map);
+                return 1;
+            }
+            if (shared_map->entities != roads || shared_map->num_roads != num_roads) {
+                PyErr_SetString(PyExc_ValueError, "Road array and count do not match the shared map");
+                Py_DECREF(map);
+                return 1;
+            }
         }
-        env->entities = (Entity*)PyLong_AsVoidPtr(entity_ptr);
-        if (env->entities == NULL) {
-            PyErr_SetString(PyExc_TypeError, "entity pointer is null");
-            Py_DECREF(map);
-            return 1;
-        }
+        env->num_objects = (int)num_objects;
+        env->num_roads = (int)num_roads;
+        env->entities = entities;
+        env->static_road_entities = roads;
+        if (shared_map) acquire_static_road_map(env, shared_map);
+        else if (PyTuple_Size(map) == 3) split_legacy_entities(env);
         Py_DECREF(map);
     } else {
         env->dynamic_map_generation = 0;

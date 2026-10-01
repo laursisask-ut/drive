@@ -198,8 +198,6 @@ struct Entity {
     float* multi_goal_position_y;
     float* multi_goal_position_z;
     int mark_as_expert;
-    int traffic_light_color;
-    int traffic_light_transition_in;
     int collision_state;
     int collided_with_agent_idx;
     float metrics_array[6]; // metrics_array: [collision, offroad, reached_goal, lane_aligned, avg_displacement_error, lane_lateral_offset]
@@ -249,6 +247,23 @@ struct Entity {
     float jerk_lat;
     float steering_angle;
     float wheelbase;
+};
+
+typedef struct StaticRoadEntity StaticRoadEntity;
+struct StaticRoadEntity {
+    int type;
+    int array_size;
+    float* traj_x;
+    float* traj_y;
+    float* traj_z;
+    int traffic_light_idx;
+};
+
+typedef struct TrafficLightState TrafficLightState;
+
+struct TrafficLightState {
+    int traffic_light_color;
+    int traffic_light_transition_in;
 };
 
 void free_entity(Entity* entity){
@@ -363,7 +378,7 @@ float compute_displacement_error(Entity* agent, int timestep) {
 
 typedef struct GridMapEntity GridMapEntity;
 struct GridMapEntity {
-    int entity_idx;
+    int entity_idx;  // Index into static_road_entities, independent of actor count.
     int geometry_idx;
 };
 
@@ -383,6 +398,20 @@ struct GridMap {
     // Extras/Optimizations
     int vision_range;
 };
+
+// Immutable geometry and spatial indices shared by environments. Each environment
+// (and the Python map owner, when present) holds one reference. Traffic-light
+// colors and timers belong to Drive, never to this shared map.
+typedef struct StaticRoadMap {
+    int ref_count;
+    int num_roads;
+    int num_traffic_lights;
+    StaticRoadEntity* entities;
+    GridMap* grid_map;
+    int* neighbor_offsets;
+    Graph* topology_graph;
+    int topology_initialized;
+} StaticRoadMap;
 
 struct ReplayExportLog {
     float* traj_x;
@@ -422,11 +451,14 @@ struct Drive {
     int action_type;
     int human_agent_idx;
     Entity* entities;
+    StaticRoadEntity* static_road_entities;
+    StaticRoadMap* static_road_map;
+    TrafficLightState* traffic_light_states;
     Graph* topology_graph;
-    int num_entities;
     int num_controllable_agents;
     int num_objects;
     int num_roads;
+    int num_traffic_lights;
     int static_car_count;
     int* static_car_indices;
     int expert_static_car_count;
@@ -459,6 +491,14 @@ struct Drive {
     char* replay_dir;
     ReplayExportLog export_log;
 };
+
+static int road_traffic_light_color(const Drive* env, const StaticRoadEntity* road) {
+    int idx = road->traffic_light_idx;
+    if (!env->traffic_light_states || idx < 0 || idx >= env->num_traffic_lights) {
+        return TRAFFIC_LIGHT_OFF;
+    }
+    return env->traffic_light_states[idx].traffic_light_color;
+}
 
 typedef struct {
     int candidates[MAX_AGENTS];
@@ -771,86 +811,160 @@ void freeTopologyGraph(struct Graph* graph) {
     free(graph);
 }
 
+static void free_static_road_entities(StaticRoadEntity* roads, int count) {
+    if (!roads) return;
+    for (int i = 0; i < count; i++) {
+        free(roads[i].traj_x);
+        free(roads[i].traj_y);
+        free(roads[i].traj_z);
+    }
+    free(roads);
+}
+
+static void free_grid_map(GridMap* grid) {
+    if (!grid) return;
+    for (int i = 0; i < grid->grid_cols * grid->grid_rows; i++) free(grid->cells[i]);
+    free(grid->cells);
+    free(grid->cell_entities_count);
+    free(grid);
+}
+
+static void release_static_road_map(StaticRoadMap* map) {
+    if (!map || --map->ref_count > 0) return;
+    free_static_road_entities(map->entities, map->num_roads);
+    free_grid_map(map->grid_map);
+    free(map->neighbor_offsets);
+    freeTopologyGraph(map->topology_graph);
+    free(map);
+}
+
+static void acquire_static_road_map(Drive* env, StaticRoadMap* map) {
+    map->ref_count++;
+    env->static_road_map = map;
+    env->static_road_entities = map->entities;
+    env->num_roads = map->num_roads;
+    env->num_traffic_lights = map->num_traffic_lights;
+    env->grid_map = map->grid_map;
+    env->neighbor_offsets = map->neighbor_offsets;
+    env->topology_graph = map->topology_graph;
+}
+
+// Compatibility for generators returning the old combined Entity allocation.
+// Transfer trajectory ownership, then release the combined array itself.
+static void split_legacy_entities(Drive* env) {
+    Entity* combined = env->entities;
+    env->entities = (Entity*)calloc(env->num_objects, sizeof(Entity));
+    memcpy(env->entities, combined, env->num_objects * sizeof(Entity));
+    env->static_road_entities = (StaticRoadEntity*)calloc(env->num_roads, sizeof(StaticRoadEntity));
+    int traffic_light_idx = 0;
+    for (int i = 0; i < env->num_roads; i++) {
+        Entity* e = &combined[env->num_objects + i];
+        StaticRoadEntity* road = &env->static_road_entities[i];
+        road->type = e->type;
+        road->array_size = e->array_size;
+        road->traj_x = e->traj_x;
+        road->traj_y = e->traj_y;
+        road->traj_z = e->traj_z;
+        road->traffic_light_idx = road->type == TRAFFIC_LIGHT_STOP_LINE ? traffic_light_idx++ : -1;
+        e->traj_x = e->traj_y = e->traj_z = NULL;
+        free_entity(e);
+    }
+    free(combined);
+}
+
 
 Entity* load_map_binary(const char* filename, Drive* env) {
     FILE* file = fopen(filename, "rb");
     if (!file) return NULL;
     fread(&env->num_objects, sizeof(int), 1, file);
     fread(&env->num_roads, sizeof(int), 1, file);
-    env->num_entities = env->num_objects + env->num_roads;
-    Entity* entities = (Entity*)malloc(env->num_entities * sizeof(Entity));
-    memset(entities, 0, env->num_entities * sizeof(Entity));
+    Entity* entities = (Entity*)calloc(env->num_objects, sizeof(Entity));
+    env->static_road_entities = (StaticRoadEntity*)calloc(env->num_roads, sizeof(StaticRoadEntity));
+    int traffic_light_idx = 0;
     int initial_scenario_length = env->scenario_length;
-    for (int i = 0; i < env->num_entities; i++) {
+    for (int i = 0; i < env->num_objects + env->num_roads; i++) {
+        Entity road_record = {0};
+        Entity* e = i < env->num_objects ? &entities[i] : &road_record;
 	    // Read base entity data
-        fread(&entities[i].type, sizeof(int), 1, file);
+        fread(&e->type, sizeof(int), 1, file);
         int is_v2 = 0;
-        if ((entities[i].type & 256)) {
+        if ((e->type & 256)) {
             is_v2 = 1;
-            entities[i].type -= 256;
+            e->type -= 256;
         }
-        fread(&entities[i].array_size, sizeof(int), 1, file);
+        fread(&e->array_size, sizeof(int), 1, file);
         // Allocate arrays based on type
-        int size = entities[i].array_size;
-        entities[i].traj_x = (float*)malloc(size * sizeof(float));
-        entities[i].traj_y = (float*)malloc(size * sizeof(float));
-        entities[i].traj_z = (float*)malloc(size * sizeof(float));
-        if (entities[i].type == VEHICLE || entities[i].type == PEDESTRIAN || entities[i].type == CYCLIST) {  // Object type
+        int size = e->array_size;
+        e->traj_x = (float*)malloc(size * sizeof(float));
+        e->traj_y = (float*)malloc(size * sizeof(float));
+        e->traj_z = (float*)malloc(size * sizeof(float));
+        if (e->type == VEHICLE || e->type == PEDESTRIAN || e->type == CYCLIST) {  // Object type
             if (initial_scenario_length == 0 && size > env->scenario_length) env->scenario_length = size;
             // Allocate arrays for object-specific data
-            entities[i].traj_vx = (float*)malloc(size * sizeof(float));
-            entities[i].traj_vy = (float*)malloc(size * sizeof(float));
-            entities[i].traj_vz = (float*)malloc(size * sizeof(float));
-            entities[i].traj_heading = (float*)malloc(size * sizeof(float));
-            entities[i].traj_valid = (int*)malloc(size * sizeof(int));
+            e->traj_vx = (float*)malloc(size * sizeof(float));
+            e->traj_vy = (float*)malloc(size * sizeof(float));
+            e->traj_vz = (float*)malloc(size * sizeof(float));
+            e->traj_heading = (float*)malloc(size * sizeof(float));
+            e->traj_valid = (int*)malloc(size * sizeof(int));
         } else {
             // Roads don't use these arrays
-            entities[i].traj_vx = NULL;
-            entities[i].traj_vy = NULL;
-            entities[i].traj_vz = NULL;
-            entities[i].traj_heading = NULL;
-            entities[i].traj_valid = NULL;
+            e->traj_vx = NULL;
+            e->traj_vy = NULL;
+            e->traj_vz = NULL;
+            e->traj_heading = NULL;
+            e->traj_valid = NULL;
         }
         // Read array data
-        fread(entities[i].traj_x, sizeof(float), size, file);
-        fread(entities[i].traj_y, sizeof(float), size, file);
-        fread(entities[i].traj_z, sizeof(float), size, file);
-        if (entities[i].type == VEHICLE || entities[i].type == PEDESTRIAN || entities[i].type == CYCLIST) {  // Object type
-            fread(entities[i].traj_vx, sizeof(float), size, file);
-            fread(entities[i].traj_vy, sizeof(float), size, file);
-            fread(entities[i].traj_vz, sizeof(float), size, file);
-            fread(entities[i].traj_heading, sizeof(float), size, file);
-            fread(entities[i].traj_valid, sizeof(int), size, file);
+        fread(e->traj_x, sizeof(float), size, file);
+        fread(e->traj_y, sizeof(float), size, file);
+        fread(e->traj_z, sizeof(float), size, file);
+        if (e->type == VEHICLE || e->type == PEDESTRIAN || e->type == CYCLIST) {  // Object type
+            fread(e->traj_vx, sizeof(float), size, file);
+            fread(e->traj_vy, sizeof(float), size, file);
+            fread(e->traj_vz, sizeof(float), size, file);
+            fread(e->traj_heading, sizeof(float), size, file);
+            fread(e->traj_valid, sizeof(int), size, file);
 
             // Reasonable defaults, needed for validation runs
-            entities[i].max_speed = 90/3.6f;
-            entities[i].lane_center_reward_coefficient = 2.5e-3;
-            entities[i].comfort_reward_coefficient = 0.01f;
-            entities[i].lane_align_reward_coefficient = 2.5e-2f;
-            entities[i].collision_reward_coefficient = 1.0f;
-            entities[i].offroad_reward_coefficient = 1.0f;
-            entities[i].stop_line_reward_coefficient = 1.0f;
-            entities[i].lane_center_bias = 0.0f;
-            entities[i].goal_radius = 3.0f;
+            e->max_speed = 90/3.6f;
+            e->lane_center_reward_coefficient = 2.5e-3;
+            e->comfort_reward_coefficient = 0.01f;
+            e->lane_align_reward_coefficient = 2.5e-2f;
+            e->collision_reward_coefficient = 1.0f;
+            e->offroad_reward_coefficient = 1.0f;
+            e->stop_line_reward_coefficient = 1.0f;
+            e->lane_center_bias = 0.0f;
+            e->goal_radius = 3.0f;
         }
         // Read remaining scalar fields
-        fread(&entities[i].width, sizeof(float), 1, file);
-        fread(&entities[i].length, sizeof(float), 1, file);
-        fread(&entities[i].height, sizeof(float), 1, file);
-        fread(&entities[i].goal_position_x, sizeof(float), 1, file);
-        fread(&entities[i].goal_position_y, sizeof(float), 1, file);
-        fread(&entities[i].goal_position_z, sizeof(float), 1, file);
-        fread(&entities[i].mark_as_expert, sizeof(int), 1, file);
+        fread(&e->width, sizeof(float), 1, file);
+        fread(&e->length, sizeof(float), 1, file);
+        fread(&e->height, sizeof(float), 1, file);
+        fread(&e->goal_position_x, sizeof(float), 1, file);
+        fread(&e->goal_position_y, sizeof(float), 1, file);
+        fread(&e->goal_position_z, sizeof(float), 1, file);
+        fread(&e->mark_as_expert, sizeof(int), 1, file);
         if (is_v2) {
-            fread(&entities[i].multi_goal_count, sizeof(int), 1, file);
-            if (entities[i].multi_goal_count > 0) {
-                entities[i].multi_goal_position_x = (float*)malloc(entities[i].multi_goal_count * sizeof(float));
-                entities[i].multi_goal_position_y = (float*)malloc(entities[i].multi_goal_count * sizeof(float));
-                entities[i].multi_goal_position_z = (float*)malloc(entities[i].multi_goal_count * sizeof(float));
-                fread(entities[i].multi_goal_position_x, sizeof(float), entities[i].multi_goal_count, file);
-                fread(entities[i].multi_goal_position_y, sizeof(float), entities[i].multi_goal_count, file);
-                fread(entities[i].multi_goal_position_z, sizeof(float), entities[i].multi_goal_count, file);
+            fread(&e->multi_goal_count, sizeof(int), 1, file);
+            if (e->multi_goal_count > 0) {
+                e->multi_goal_position_x = (float*)malloc(e->multi_goal_count * sizeof(float));
+                e->multi_goal_position_y = (float*)malloc(e->multi_goal_count * sizeof(float));
+                e->multi_goal_position_z = (float*)malloc(e->multi_goal_count * sizeof(float));
+                fread(e->multi_goal_position_x, sizeof(float), e->multi_goal_count, file);
+                fread(e->multi_goal_position_y, sizeof(float), e->multi_goal_count, file);
+                fread(e->multi_goal_position_z, sizeof(float), e->multi_goal_count, file);
             }
+        }
+        if (i >= env->num_objects) {
+            StaticRoadEntity* road = &env->static_road_entities[i - env->num_objects];
+            road->type = e->type;
+            road->array_size = e->array_size;
+            road->traj_x = e->traj_x;
+            road->traj_y = e->traj_y;
+            road->traj_z = e->traj_z;
+            road->traffic_light_idx = road->type == TRAFFIC_LIGHT_STOP_LINE ? traffic_light_idx++ : -1;
+            e->traj_x = e->traj_y = e->traj_z = NULL;
+            free_entity(e);
         }
     }
     fclose(file);
@@ -860,7 +974,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
 void set_start_position(Drive* env){
     //InitWindow(800, 600, "GPU Drive");
     //BeginDrawing();
-    for(int i = 0; i < env->num_entities; i++){
+    for(int i = 0; i < env->num_objects; i++){
         int is_active = 0;
         for(int j = 0; j < env->active_agent_count; j++){
             if(env->active_agent_indices[j] == i){
@@ -991,8 +1105,8 @@ void add_entity_to_grid(Drive* env, int grid_index, int entity_idx, int geometry
 void init_topology_graph(Drive* env){
     // Count ROAD_LANE entities
     int road_lane_count = 0;
-    for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type == ROAD_LANE){
+    for(int i = 0; i < env->num_roads; i++){
+        if(env->static_road_entities[i].type == ROAD_LANE){
             road_lane_count++;
         }
     }
@@ -1002,14 +1116,14 @@ void init_topology_graph(Drive* env){
         return;
     }
 
-    // Create graph with all entities as vertices (we'll only use ROAD_LANE indices)
-    env->topology_graph = createGraph(env->num_entities);
+    // Graph vertices use road-local indices (only ROAD_LANE vertices have edges).
+    env->topology_graph = createGraph(env->num_roads);
 
     // Connect ROAD_LANE entities based on geometric connectivity
-    for(int i = 0; i < env->num_entities; i++){
-        if(env->entities[i].type != ROAD_LANE) continue;
+    for(int i = 0; i < env->num_roads; i++){
+        if(env->static_road_entities[i].type != ROAD_LANE) continue;
 
-        Entity* lane_i = &env->entities[i];
+        const StaticRoadEntity* lane_i = &env->static_road_entities[i];
         if(lane_i->array_size < 2) continue; // Need at least 2 points
 
         // Get end point of current lane
@@ -1020,10 +1134,10 @@ void init_topology_graph(Drive* env){
         float end_heading = atan2f(end_vector_y, end_vector_x);
 
         // Find lanes that start near this lane's end
-        for(int j = 0; j < env->num_entities; j++){
-            if(i == j || env->entities[j].type != ROAD_LANE) continue;
+        for(int j = 0; j < env->num_roads; j++){
+            if(i == j || env->static_road_entities[j].type != ROAD_LANE) continue;
 
-            Entity* lane_j = &env->entities[j];
+            const StaticRoadEntity* lane_j = &env->static_road_entities[j];
             if(lane_j->array_size < 2) continue;
 
             // Get start point of potential next lane
@@ -1052,19 +1166,20 @@ void init_topology_graph(Drive* env){
 
 void init_grid_map(Drive* env){
     // Allocate memory for the grid map structure
-    env->grid_map = (GridMap*)malloc(sizeof(GridMap));
+    env->grid_map = (GridMap*)calloc(1, sizeof(GridMap));
 
     // Find top left and bottom right points of the map
-    float top_left_x;
-    float top_left_y;
-    float bottom_right_x;
-    float bottom_right_y;
+    float top_left_x = 0.0f;
+    float top_left_y = 0.0f;
+    float bottom_right_x = 0.0f;
+    float bottom_right_y = 0.0f;
     int first_valid_point = 0;
-    for(int i = 0; i < env->num_entities; i++){
-        if(grid_map_entity_type(env->entities[i].type)){
+    for(int i = 0; i < env->num_roads; i++){
+        if(grid_map_entity_type(env->static_road_entities[i].type)){
             // Check all points in the trajectory for road elements
-            Entity* e = &env->entities[i];
+            const StaticRoadEntity* e = &env->static_road_entities[i];
             for(int j = 0; j < e->array_size; j++){
+                if(!isfinite(e->traj_x[j]) || !isfinite(e->traj_y[j])) continue;
                 if(e->traj_x[j] == INVALID_POSITION) continue;
                 if(e->traj_y[j] == INVALID_POSITION) continue;
                 if(!first_valid_point) {
@@ -1080,6 +1195,12 @@ void init_grid_map(Drive* env){
             }
         }
     }
+
+    // Empty maps have an empty grid; straight roads still need one cell on
+    // their zero-width axis. This also avoids zero-sized grid allocations.
+    if (!first_valid_point) return;
+    if (top_left_x == bottom_right_x) bottom_right_x += GRID_CELL_SIZE;
+    if (bottom_right_y == top_left_y) top_left_y += GRID_CELL_SIZE;
 
     env->grid_map->top_left_x = top_left_x;
     env->grid_map->top_left_y = top_left_y;
@@ -1098,42 +1219,38 @@ void init_grid_map(Drive* env){
     env->grid_map->cell_entities_count = (int*)calloc(grid_cell_count, sizeof(int));
 
     // Calculate number of entities in each grid cell
-    for(int i = 0; i < env->num_entities; i++){
-        if(grid_map_entity_type(env->entities[i].type)){
-            for(int j = 0; j < env->entities[i].array_size - 1; j++){
-                float x_center = (env->entities[i].traj_x[j] + env->entities[i].traj_x[j+1]) / 2;
-                float y_center = (env->entities[i].traj_y[j] + env->entities[i].traj_y[j+1]) / 2;
+    for(int i = 0; i < env->num_roads; i++){
+        if(grid_map_entity_type(env->static_road_entities[i].type)){
+            for(int j = 0; j < env->static_road_entities[i].array_size - 1; j++){
+                float x_center = (env->static_road_entities[i].traj_x[j] + env->static_road_entities[i].traj_x[j+1]) / 2;
+                float y_center = (env->static_road_entities[i].traj_y[j] + env->static_road_entities[i].traj_y[j+1]) / 2;
                 int grid_index = getGridIndex(env, x_center, y_center);
                 if (grid_index < 0 || grid_index >= grid_cell_count) continue;
                 env->grid_map->cell_entities_count[grid_index]++;
             }
         }
     }
-    int cell_entities_insert_index[grid_cell_count];   // Helper array for insertion index
-    memset(cell_entities_insert_index, 0, grid_cell_count * sizeof(int));
+    // The shared map can cover a whole city; keep this scratch array off the stack.
+    int* cell_entities_insert_index = (int*)calloc(grid_cell_count, sizeof(int));
 
     // Initialize grid cells
     for(int grid_index = 0; grid_index < grid_cell_count; grid_index++){
-        env->grid_map->cells[grid_index] = (GridMapEntity*)calloc(env->grid_map->cell_entities_count[grid_index], sizeof(GridMapEntity));
-    }
-    for(int i = 0;i<grid_cell_count;i++){
-        if(cell_entities_insert_index[i] != 0){
-            printf("Error: cell_entities_insert_index[%d] not zero during initialization.\n", i);
-            cell_entities_insert_index[i] = 0;
-        }
+        int count = env->grid_map->cell_entities_count[grid_index];
+        if (count > 0) env->grid_map->cells[grid_index] = (GridMapEntity*)calloc(count, sizeof(GridMapEntity));
     }
 
     // Populate grid cells
-    for(int i = 0; i < env->num_entities; i++){
-        if(grid_map_entity_type(env->entities[i].type)){         // NOTE: Road edges, lines, lanes, and stop lines in grid map
-            for(int j = 0; j < env->entities[i].array_size - 1; j++){
-                float x_center = (env->entities[i].traj_x[j] + env->entities[i].traj_x[j+1]) / 2;
-                float y_center = (env->entities[i].traj_y[j] + env->entities[i].traj_y[j+1]) / 2;
+    for(int i = 0; i < env->num_roads; i++){
+        if(grid_map_entity_type(env->static_road_entities[i].type)){         // NOTE: Road edges, lines, lanes, and stop lines in grid map
+            for(int j = 0; j < env->static_road_entities[i].array_size - 1; j++){
+                float x_center = (env->static_road_entities[i].traj_x[j] + env->static_road_entities[i].traj_x[j+1]) / 2;
+                float y_center = (env->static_road_entities[i].traj_y[j] + env->static_road_entities[i].traj_y[j+1]) / 2;
                 int grid_index = getGridIndex(env, x_center, y_center);
                 add_entity_to_grid(env, grid_index, i, j, cell_entities_insert_index);
             }
         }
     }
+    free(cell_entities_insert_index);
 }
 
 void init_neighbor_offsets(Drive* env) {
@@ -1177,6 +1294,29 @@ void init_neighbor_offsets(Drive* env) {
             steps_to_take++;
         }
     }
+}
+
+// Takes ownership of roads and their coordinate arrays. The initial reference
+// belongs to the caller; environments acquire additional references on attach.
+static StaticRoadMap* create_static_road_map(StaticRoadEntity* roads, int num_roads) {
+    StaticRoadMap* map = (StaticRoadMap*)calloc(1, sizeof(StaticRoadMap));
+    map->ref_count = 1;
+    map->entities = roads;
+    map->num_roads = num_roads;
+    for (int i = 0; i < num_roads; i++) {
+        if (roads[i].type == TRAFFIC_LIGHT_STOP_LINE && roads[i].traffic_light_idx >= map->num_traffic_lights) {
+            map->num_traffic_lights = roads[i].traffic_light_idx + 1;
+        }
+    }
+    Drive builder = {0};
+    builder.static_road_entities = roads;
+    builder.num_roads = num_roads;
+    init_grid_map(&builder);
+    builder.grid_map->vision_range = 21;
+    init_neighbor_offsets(&builder);
+    map->grid_map = builder.grid_map;
+    map->neighbor_offsets = builder.neighbor_offsets;
+    return map;
 }
 
 void move_expert(Drive* env, float* actions, int agent_idx){
@@ -1363,7 +1503,7 @@ int collision_check(Drive* env, int agent_idx) {
     return car_collided_with_index;
 }
 
-int check_lane_aligned(Entity* car, Entity* lane, int geometry_idx) {
+int check_lane_aligned(Entity* car, const StaticRoadEntity* lane, int geometry_idx) {
     // Validate lane geometry length
     if (!lane || lane->array_size < 2) {
         car->lane_heading_angle_diff = 0.0f;
@@ -1410,7 +1550,7 @@ int check_lane_aligned(Entity* car, Entity* lane, int geometry_idx) {
     return (heading_diff < (M_PI / 12.0f)) ? 1 : 0;
 }
 
-float compute_lane_lateral_offset(Entity* car, Entity* lane, int geometry_idx) {
+float compute_lane_lateral_offset(Entity* car, const StaticRoadEntity* lane, int geometry_idx) {
     if (lane->array_size < 3) return -100.0f;
 
     if (geometry_idx == 0) {
@@ -1509,11 +1649,9 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
     int list_size = checkNeighbors(env, agent->x, agent->y, entity_list, MAX_ENTITIES_PER_CELL*25, collision_offsets, 25);
     for (int i = 0; i < list_size ; i++) {
         if(entity_list[i].entity_idx == -1) continue;
-        if(entity_list[i].entity_idx == agent_idx) continue;
-        Entity* entity;
-        entity = &env->entities[entity_list[i].entity_idx];
+        const StaticRoadEntity* entity = &env->static_road_entities[entity_list[i].entity_idx];
 
-        if (env->traffic_lights_enabled && entity->type == TRAFFIC_LIGHT_STOP_LINE && entity->traffic_light_color == TRAFFIC_LIGHT_RED) {
+        if (env->traffic_lights_enabled && entity->type == TRAFFIC_LIGHT_STOP_LINE && road_traffic_light_color(env, entity) == TRAFFIC_LIGHT_RED) {
             int geometry_idx = entity_list[i].geometry_idx;
             float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
@@ -1608,9 +1746,9 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
     } else {
         agent->current_lane_idx = closest_lane_entity_idx;
 
-        int lane_aligned = check_lane_aligned(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
+        int lane_aligned = check_lane_aligned(agent, &env->static_road_entities[closest_lane_entity_idx], closest_lane_geometry_idx);
         agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
-        agent->metrics_array[LANE_LATERAL_OFFSET_IDX] = compute_lane_lateral_offset(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
+        agent->metrics_array[LANE_LATERAL_OFFSET_IDX] = compute_lane_lateral_offset(agent, &env->static_road_entities[closest_lane_entity_idx], closest_lane_geometry_idx);
     }
 
     // Check for vehicle collisions
@@ -1845,6 +1983,9 @@ legacy_select:
         env->expert_static_car_indices[i] = expert_static_car_indices[i];
     }
 finalize:
+    // Collision and partner-observation loops visit active actors, then static
+    // actors. Explicit selection modes must publish the same total as legacy mode.
+    env->num_controllable_agents = env->active_agent_count + env->static_car_count;
     if (env->logs_capacity > 0 && env->active_agent_count > env->logs_capacity) {
         fprintf(stderr,
                 "[set_active_agents] ERROR map=%s active=%d exceeds logs_capacity=%d\n",
@@ -1865,18 +2006,15 @@ void init_goal_positions(Drive* env){
 }
 
 void init_traffic_lights(Drive* env) {
+    if (!env->traffic_light_states && env->num_traffic_lights > 0) {
+        env->traffic_light_states = (TrafficLightState*)calloc(env->num_traffic_lights, sizeof(TrafficLightState));
+    }
     env->traffic_lights_enabled = rand_int_inclusive(0, 4) > 0;
-
-    for (int i = 0; i < env->num_entities; i++) {
-        Entity* e = &env->entities[i];
-        if (e->type != TRAFFIC_LIGHT_STOP_LINE) continue;
-
-        if (env->traffic_lights_enabled) {
-            e->traffic_light_color = rand_int_inclusive(TRAFFIC_LIGHT_OFF, TRAFFIC_LIGHT_GREEN);
-            e->traffic_light_transition_in = sample_traffic_light_transition(e->traffic_light_color);
-        } else {
-            e->traffic_light_color = TRAFFIC_LIGHT_OFF;
-        }
+    for (int i = 0; i < env->num_traffic_lights; i++) {
+        TrafficLightState* state = &env->traffic_light_states[i];
+        state->traffic_light_color = env->traffic_lights_enabled
+            ? rand_int_inclusive(TRAFFIC_LIGHT_OFF, TRAFFIC_LIGHT_GREEN) : TRAFFIC_LIGHT_OFF;
+        state->traffic_light_transition_in = sample_traffic_light_transition(state->traffic_light_color);
     }
 }
 
@@ -1885,22 +2023,22 @@ void update_traffic_lights(Drive* env) {
         return;
     }
 
-    for (int i = 0; i < env->num_entities; i++) {
-        Entity* e = &env->entities[i];
-        if (e->type != TRAFFIC_LIGHT_STOP_LINE || e->traffic_light_color == TRAFFIC_LIGHT_OFF) continue;
+    for (int i = 0; i < env->num_traffic_lights; i++) {
+        TrafficLightState* state = &env->traffic_light_states[i];
+        if (state->traffic_light_color == TRAFFIC_LIGHT_OFF) continue;
 
-        e->traffic_light_transition_in -= TRAFFIC_LIGHT_UPDATE_INTERVAL;
-        if (e->traffic_light_transition_in > 0) continue;
+        state->traffic_light_transition_in -= TRAFFIC_LIGHT_UPDATE_INTERVAL;
+        if (state->traffic_light_transition_in > 0) continue;
 
-        if (e->traffic_light_color == TRAFFIC_LIGHT_RED) {
-            e->traffic_light_color = TRAFFIC_LIGHT_YELLOW;
-        } else if (e->traffic_light_color == TRAFFIC_LIGHT_YELLOW) {
-            e->traffic_light_color = rand_int_inclusive(0, 1) ? TRAFFIC_LIGHT_GREEN : TRAFFIC_LIGHT_RED;
-        } else if (e->traffic_light_color == TRAFFIC_LIGHT_GREEN) {
-            e->traffic_light_color = TRAFFIC_LIGHT_YELLOW;
+        if (state->traffic_light_color == TRAFFIC_LIGHT_RED) {
+            state->traffic_light_color = TRAFFIC_LIGHT_YELLOW;
+        } else if (state->traffic_light_color == TRAFFIC_LIGHT_YELLOW) {
+            state->traffic_light_color = rand_int_inclusive(0, 1) ? TRAFFIC_LIGHT_GREEN : TRAFFIC_LIGHT_RED;
+        } else if (state->traffic_light_color == TRAFFIC_LIGHT_GREEN) {
+            state->traffic_light_color = TRAFFIC_LIGHT_YELLOW;
         }
 
-        e->traffic_light_transition_in = sample_traffic_light_transition(e->traffic_light_color);
+        state->traffic_light_transition_in = sample_traffic_light_transition(state->traffic_light_color);
     }
 }
 
@@ -1909,10 +2047,18 @@ void init(Drive* env){
     env->timestep = 0;
     if (!env->dynamic_map_generation)
         env->entities = load_map_binary(env->map_name, env);
-    init_grid_map(env);
-    if (env->use_goal_generation) init_topology_graph(env);
-    env->grid_map->vision_range = 21;
-    init_neighbor_offsets(env);
+    if (!env->static_road_map) {
+        StaticRoadMap* map = create_static_road_map(env->static_road_entities, env->num_roads);
+        acquire_static_road_map(env, map);
+        release_static_road_map(map);
+    }
+    if (env->use_goal_generation && !env->static_road_map->topology_initialized) {
+        init_topology_graph(env);
+        env->static_road_map->topology_graph = env->topology_graph;
+        env->static_road_map->topology_initialized = 1;
+    }
+    env->topology_graph = env->static_road_map->topology_graph;
+    init_traffic_lights(env);
     env->logs_capacity = 0;
     set_active_agents(env);
     env->logs_capacity = env->active_agent_count;
@@ -2055,7 +2201,7 @@ static void saveReplayToFile(Drive* env) {
 
     int exported_steps = fmin(env->timestep+1, MAX_EXPORT_STEPS);
 
-    for (int i = 0; i < env->num_entities; i++) {
+    for (int i = 0; i < env->num_objects; i++) {
         Entity* e = &env->entities[i];
         fwrite(&e->type, sizeof(int), 1, file);
 
@@ -2097,13 +2243,26 @@ static void saveReplayToFile(Drive* env) {
         fwrite(&mark_as_expert, sizeof(int), 1, file);
     }
 
+    for (int i = 0; i < env->num_roads; i++) {
+        const StaticRoadEntity* road = &env->static_road_entities[i];
+        fwrite(&road->type, sizeof(int), 1, file);
+        fwrite(&road->array_size, sizeof(int), 1, file);
+        fwrite(road->traj_x, sizeof(float), road->array_size, file);
+        fwrite(road->traj_y, sizeof(float), road->array_size, file);
+        fwrite(road->traj_z, sizeof(float), road->array_size, file);
+        // Legacy road records carry unused dimensions, goal and expert fields.
+        float unused[6] = {0};
+        int mark_as_expert = 0;
+        fwrite(unused, sizeof(float), 6, file);
+        fwrite(&mark_as_expert, sizeof(int), 1, file);
+    }
     fclose(file);
 
     saveAgentObservationsReplayToFile(env);
 }
 
 void c_close(Drive* env){
-    for(int i = 0; i < env->num_entities; i++){
+    for(int i = 0; i < env->num_objects; i++){
         free_entity(&env->entities[i]);
     }
     free(env->entities);
@@ -2119,20 +2278,18 @@ void c_close(Drive* env){
     free(env->acceleration_action_counts);
     free(env->steering_action_counts);
     free(env->speed_counts);
-    // GridMap cleanup
-    int grid_cell_count = env->grid_map->grid_cols*env->grid_map->grid_rows;
-    for(int grid_index = 0; grid_index < grid_cell_count; grid_index++){
-        free(env->grid_map->cells[grid_index]);
+    if (env->static_road_map) {
+        release_static_road_map(env->static_road_map);
+    } else {
+        // Also used for maps loaded only to count active agents, before init().
+        free_static_road_entities(env->static_road_entities, env->num_roads);
+        free_grid_map(env->grid_map);
+        free(env->neighbor_offsets);
+        freeTopologyGraph(env->topology_graph);
     }
-    free(env->grid_map->cells);
-    free(env->grid_map->cell_entities_count);
-    free(env->neighbor_offsets);
-
-
-    free(env->grid_map);
+    free(env->traffic_light_states);
     free(env->static_car_indices);
     free(env->expert_static_car_indices);
-    freeTopologyGraph(env->topology_graph);
     // free(env->map_name);
     free(env->ini_file);
     free(env->export_log.traj_x);
@@ -2531,12 +2688,12 @@ void compute_observations(Drive* env) {
                 int geometry_idx = neighbor_entities[k].geometry_idx;
 
                 // Validate entity_idx before accessing
-                if(entity_idx < 0 || entity_idx >= env->num_entities) {
-                    printf("ERROR: Invalid entity_idx %d (max: %d)\n", entity_idx, env->num_entities-1);
+                if(entity_idx < 0 || entity_idx >= env->num_roads) {
+                    printf("ERROR: Invalid entity_idx %d (max: %d)\n", entity_idx, env->num_roads-1);
                     continue;
                 }
 
-                Entity* entity = &env->entities[entity_idx];
+                const StaticRoadEntity* entity = &env->static_road_entities[entity_idx];
 
                 // Validate geometry_idx before accessing
                 if(geometry_idx < 0 || geometry_idx >= entity->array_size - 1) {
@@ -2557,7 +2714,7 @@ void compute_observations(Drive* env) {
                 float length = relative_distance_2d(mid_x, mid_y, end_x, end_y);
                 float line_attribute = 0.1f / MAX_ROAD_SCALE;
                 if (entity->type == TRAFFIC_LIGHT_STOP_LINE) {
-                    line_attribute = traffic_light_observation_value(entity->traffic_light_color);
+                    line_attribute = traffic_light_observation_value(road_traffic_light_color(env, entity));
                 }
                 // Calculate angle from ego to midpoint (vector from ego to midpoint)
                 float dx = end_x - mid_x;
@@ -2594,7 +2751,7 @@ void compute_observations(Drive* env) {
     }
 }
 
-static int find_forward_projection_on_lane(Entity* lane, Entity* agent, int* out_segment_idx, float* out_fraction) {
+static int find_forward_projection_on_lane(const StaticRoadEntity* lane, Entity* agent, int* out_segment_idx, float* out_fraction) {
     int best_idx = -1;
     float best_dist_sq = 1e30f;
 
@@ -2642,12 +2799,12 @@ void compute_new_goal(Drive* env, int agent_idx) {
     Entity* agent = &env->entities[agent_idx];
     int current_lane = agent->current_lane_idx;
 
-    if (current_lane == -1) return; // No current lane
+    if (current_lane < 0 || current_lane >= env->num_roads) return; // No current lane
 
     // Target distance: 40m ahead along the lane topology from agent's current position
     float target_distance = 40.0f;
     int current_entity = current_lane;
-    Entity* lane = &env->entities[current_entity];
+    const StaticRoadEntity* lane = &env->static_road_entities[current_entity];
 
     int initial_segment_idx = 1;
     float initial_fraction = 0.0f;
@@ -2680,7 +2837,7 @@ void compute_new_goal(Drive* env, int agent_idx) {
 
     // Traverse the topology graph starting from the vehicle's position forward
     while (current_entity != -1) {
-        lane = &env->entities[current_entity];
+        lane = &env->static_road_entities[current_entity];
 
         int start_idx = first_lane ? initial_segment_idx : 1;
         // Ensure start_idx is at least 1 to avoid accessing traj_x[i-1] with i=0
@@ -3535,7 +3692,7 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
     DrawLine3D((Vector3){env->grid_map->top_left_x, env->grid_map->bottom_right_y, 0}, (Vector3){env->grid_map->top_left_x, env->grid_map->top_left_y, 0}, PUFF_CYAN);
     DrawLine3D((Vector3){env->grid_map->bottom_right_x, env->grid_map->bottom_right_y, 0}, (Vector3){env->grid_map->bottom_right_x, env->grid_map->top_left_y, 0}, PUFF_CYAN);
     DrawLine3D((Vector3){env->grid_map->top_left_x, env->grid_map->bottom_right_y, 0}, (Vector3){env->grid_map->bottom_right_x, env->grid_map->bottom_right_y, 0}, PUFF_CYAN);
-    for(int i = 0; i < env->num_entities; i++) {
+    for(int i = 0; i < env->num_objects; i++) {
         // Draw objects
         if(env->entities[i].type == VEHICLE || env->entities[i].type == PEDESTRIAN || env->entities[i].type == CYCLIST) {
             // Check if this vehicle is an active agent
@@ -3848,30 +4005,29 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                 }
             }
         }
-        // Draw road elements
-        if(env->entities[i].type <=3 && env->entities[i].type >= 7){
-            continue;
-        }
-        for(int j = 0; j < env->entities[i].array_size - 1; j++) {
+    }
+    // Draw immutable geometry with this environment's traffic-light state.
+    for (int i = 0; i < env->num_roads; i++) {
+        for(int j = 0; j < env->static_road_entities[i].array_size - 1; j++) {
             Vector3 start = {
-                env->entities[i].traj_x[j],
-                env->entities[i].traj_y[j],
+                env->static_road_entities[i].traj_x[j],
+                env->static_road_entities[i].traj_y[j],
                 1
             };
             Vector3 end = {
-                env->entities[i].traj_x[j + 1],
-                env->entities[i].traj_y[j + 1],
+                env->static_road_entities[i].traj_x[j + 1],
+                env->static_road_entities[i].traj_y[j + 1],
                 1
             };
-            if(env->entities[i].type == ROAD_EDGE){
+            if(env->static_road_entities[i].type == ROAD_EDGE){
                 draw_road_edge(env, start.x, start.y, end.x, end.y);
-            } else if (env->entities[i].type == STOP_SIGN) {
+            } else if (env->static_road_entities[i].type == STOP_SIGN) {
                 DrawLine3D(start, end, RED);
-            } else if (env->entities[i].type == CROSSWALK) {
+            } else if (env->static_road_entities[i].type == CROSSWALK) {
                 DrawLine3D(start, end, YELLOW);
-            } else if (env->entities[i].type == TRAFFIC_LIGHT_STOP_LINE) {
-                DrawLine3D(start, end, traffic_light_render_color(env->entities[i].traffic_light_color));
-            } else if (env->entities[i].type == ROAD_LANE) {
+            } else if (env->static_road_entities[i].type == TRAFFIC_LIGHT_STOP_LINE) {
+                DrawLine3D(start, end, traffic_light_render_color(road_traffic_light_color(env, &env->static_road_entities[i])));
+            } else if (env->static_road_entities[i].type == ROAD_LANE) {
                 DrawLine3D(start, end, GRAY);
             }
         }

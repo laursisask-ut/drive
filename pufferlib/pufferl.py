@@ -634,12 +634,15 @@ class PuffeRL:
                     self.optimizer.zero_grad()
                     continue
 
+            profile("train_anchor", epoch)
             behavior_anchor_kl_div = 0
             if self.anchor_policy is not None:
                 with torch.no_grad():
                     regularizer_logits, _ = self.anchor_policy(mb_obs, state)
-                behavior_anchor_kl_div = sum(pufferlib.pytorch.kl_div(p, q).mean() for p, q in zip(regularizer_logits, logits))
+                    behavior_anchor_kl_div = sum(pufferlib.pytorch.kl_div(p, q).mean() for p, q in zip(regularizer_logits, logits))
+                    behavior_anchor_kl_div.item()
 
+            profile("train_misc", epoch)
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.075 * behavior_anchor_kl_div
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
@@ -1133,6 +1136,7 @@ class PuffeRL:
         p.add_row(*fmt_perf("  Forward", c2, delta, profile.train_forward, b2, c2))
         p.add_row(*fmt_perf("  Learn", c2, delta, profile.learn, b2, c2))
         p.add_row(*fmt_perf("  Copy", c2, delta, profile.train_copy, b2, c2))
+        p.add_row(*fmt_perf("  Anchor", c2, delta, profile.train_anchor, b2, c2))
         p.add_row(*fmt_perf("  Misc", c2, delta, profile.train_misc, b2, c2))
 
         l = Table(

@@ -41,6 +41,7 @@ class Drive(pufferlib.PufferEnv):
         seed=1,
         init_steps=0,
         artifact_dir=None,
+        replay_everything=False
     ):
         # env
         self.dt = dt
@@ -148,7 +149,7 @@ class Drive(pufferlib.PufferEnv):
         if artifact_dir is not None:
             replays_dir = os.path.join(artifact_dir, "replays", "0")
         for i in range(num_envs):
-            export_replay = artifact_dir is not None and i == 0
+            export_replay = artifact_dir is not None and (i == 0 or replay_everything)
             if export_replay:
                 replay_dir = os.path.join(replays_dir, f"{os.getpid():05}-{i:02}")
                 os.makedirs(replay_dir, exist_ok=True)
@@ -289,6 +290,10 @@ class Drive(pufferlib.PufferEnv):
 
     def render(self):
         binding.vec_render(self.c_envs, 0)
+
+    def active_agent_positions(self):
+        """Return world XY positions plus environment/entity indices."""
+        return binding.vec_active_agent_positions(self.c_envs)
 
     def close(self):
         binding.vec_close(self.c_envs)

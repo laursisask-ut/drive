@@ -58,8 +58,6 @@ class Entity(Structure):
         ("multi_goal_position_y", POINTER(c_float)),
         ("multi_goal_position_z", POINTER(c_float)),
         ("mark_as_expert", c_int),
-        ("traffic_light_color", c_int),
-        ("traffic_light_transition_in", c_int),
         ("collision_state", c_int),
         ("collided_with_agent_idx", c_int),
         ("metrics_array", c_float * 6),
@@ -108,6 +106,16 @@ class Entity(Structure):
         ("jerk_lat", c_float),
         ("steering_angle", c_float),
         ("wheelbase", c_float),
+    ]
+
+class StaticRoadEntity(Structure):
+    _fields_ = [
+        ("type", c_int),
+        ("array_size", c_int),
+        ("traj_x", POINTER(c_float)),
+        ("traj_y", POINTER(c_float)),
+        ("traj_z", POINTER(c_float)),
+        ("traffic_light_idx", c_int),
     ]
 
 utm_origin_lat = 58.385345
@@ -332,6 +340,11 @@ def alloc_entities(count):
         raise MemoryError("failed to allocate Entity*")
     return cast(buf, POINTER(Entity))
 
+def alloc_static_road_entities(count):
+    buf = libc.calloc(c_size_t(count), c_size_t(sizeof(StaticRoadEntity)))
+    if not buf:
+        raise MemoryError("failed to allocate StaticRoadEntity*")
+    return cast(buf, POINTER(StaticRoadEntity))
 
 def alloc_float_array(values):
     length = len(values)
@@ -473,11 +486,81 @@ def make_spawn_position_queues(lanelets, box):
                 add_spawn_position(stationary_spawn_positions, stationary_spawn_grid, lanelet, s, stationary_pos, min_spawn_distance)
     return moving_spawn_positions, stationary_spawn_positions
 
+def generate_shared_static_road_entities():
+    def add_linestring_segments_in_box(entity_type, linestring, traffic_light_idx=-1):
+        x = []
+        y = []
+        z = []
+        for p in iter_linestring_points_with_spacing(linestring):
+            x.append(p.x)
+            y.append(p.y)
+            z.append(p.z)
+        if x:
+            roads.append((entity_type, x, y, z, traffic_light_idx))
+
+    roads = []
+    for lanelet in lanelet2_map.laneletLayer:
+        if "subtype" not in lanelet.attributes:
+            continue
+        if lanelet.attributes["subtype"] == "road":
+            add_linestring_segments_in_box(4, lanelet.centerline)
+        elif lanelet.attributes["subtype"] == "crosswalk":
+            add_linestring_segments_in_box(8, lanelet.leftBound)
+            add_linestring_segments_in_box(8, lanelet.rightBound)
+
+    seen_traffic_light_lines = set()
+    traffic_light_counter = 0
+    for reg_el in lanelet2_map.regulatoryElementLayer:
+        if reg_el.attributes["subtype"] == "traffic_light":
+            traffic_light_line = reg_el.parameters["ref_line"][0]
+            if traffic_light_line.id not in seen_traffic_light_lines:
+                seen_traffic_light_lines.add(traffic_light_line.id)
+                add_linestring_segments_in_box(9, traffic_light_line, traffic_light_counter)
+                traffic_light_counter += 1
+
+    for linestring in lanelet2_map.lineStringLayer:
+        if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
+            add_linestring_segments_in_box(6, linestring)
+        if ("subtype" in linestring.attributes and linestring.attributes["subtype"] in {"yield_manual", "yield", "yield_stop"}
+            and linestring.id not in seen_traffic_light_lines):
+            add_linestring_segments_in_box(7, linestring)
+
+    entities = alloc_static_road_entities(len(roads))
+
+    for i, (entity_type, x, y, z, traffic_light_idx) in enumerate(roads):
+        ent = entities[i]
+        ent.type = entity_type
+        ent.array_size = len(x)
+        ent.traj_x = alloc_float_array(negate(x))
+        ent.traj_y = alloc_float_array(negate(y))
+        ent.traj_z = alloc_float_array(z)
+        ent.traffic_light_idx = traffic_light_idx
+
+    return entities, len(roads)
+
+# Keep one owning capsule alive across environment resampling. The binding
+# retains a separate C reference for each environment, so either side can be
+# closed first without freeing geometry still in use.
+_shared_static_road_map = None
+
+
+def get_shared_static_road_map():
+    global _shared_static_road_map
+    if _shared_static_road_map is None:
+        from pufferlib.ocean.drive import binding
+
+        roads, count = generate_shared_static_road_entities()
+        address = cast(roads, c_void_p).value or 0
+        owner = binding.create_static_road_map(address, count)
+        _shared_static_road_map = (count, address, owner)
+    return _shared_static_road_map
 
 agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "32"))
 goals_per_agent = int(os.getenv("GOALS_PER_AGENT", "8"))
 
 def generate_map(generation_attempt=0):
+    # Initialize shared geometry before allocating this episode's actors.
+    shared_num_roads, shared_roads_address, shared_road_map = get_shared_static_road_map()
     max_generation_attempts = 100
     if generation_attempt >= max_generation_attempts:
         raise RuntimeError(f"Could not generate a collision-free map after {max_generation_attempts} attempts")
@@ -675,58 +758,15 @@ def generate_map(generation_attempt=0):
     max_y += 100
     render_box = BoundingBox2d(BasicPoint2d(min_x, min_y), BasicPoint2d(max_x, max_y))
 
-    def add_linestring_segments_in_box(entity_type, linestring):
-        x = []
-        y = []
-        z = []
-        for p in iter_linestring_points_with_spacing(linestring):
-            if p.x < render_box.min.x or p.y < render_box.min.y or p.x > render_box.max.x or p.y > render_box.max.y:
-                if x:
-                    roads.append((entity_type, x, y, z))
-                    x = []
-                    y = []
-                    z = []
-            else:
-                x.append(p.x)
-                y.append(p.y)
-                z.append(p.z)
-        if x:
-            roads.append((entity_type, x, y, z))
-
-    roads = []
     render_box_lanelets = lanelet2_map.laneletLayer.search(render_box)
-    crosswalk_lanelets = []
-    for lanelet in render_box_lanelets:
-        if "subtype" not in lanelet.attributes:
-            continue
-        if lanelet.attributes["subtype"] == "road":
-            add_linestring_segments_in_box(4, lanelet.centerline)
-        elif lanelet.attributes["subtype"] == "crosswalk":
-            crosswalk_lanelets.append(lanelet)
-            add_linestring_segments_in_box(8, lanelet.leftBound)
-            add_linestring_segments_in_box(8, lanelet.rightBound)
-
-    for linestring in lanelet2_map.lineStringLayer.search(render_box):
-        if "subtype" not in linestring.attributes:
-            continue
-        if linestring.attributes["subtype"] == "yield_manual":
-            add_linestring_segments_in_box(7, linestring)
-    
-    seen_traffic_light_lines = set()
-    for reg_el in lanelet2_map.regulatoryElementLayer.search(render_box):
-        if reg_el.attributes["subtype"] == "traffic_light":
-            traffic_light_line = reg_el.parameters["ref_line"][0]
-            if traffic_light_line.id not in seen_traffic_light_lines:
-                seen_traffic_light_lines.add(traffic_light_line.id)
-                add_linestring_segments_in_box(9, traffic_light_line)
-
-    for linestring in lanelet2_map.lineStringLayer.search(render_box):
-        if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
-            add_linestring_segments_in_box(6, linestring)
+    crosswalk_lanelets = [
+        lanelet for lanelet in render_box_lanelets
+        if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "crosswalk"
+    ]
 
     num_objects = num_agents + num_stationary_objects + num_walking_pedestrians
     assert num_objects <= 128
-    entities = alloc_entities(len(roads) + num_objects)
+    entities = alloc_entities(num_objects)
 
     for i in range(num_agents):
         _, max_speed, _ = vehicle_samples[i]
@@ -865,72 +905,58 @@ def generate_map(generation_attempt=0):
         ent.height = random.uniform(1.4, 2.2)
         ent.mark_as_expert = 1
 
-    for i, (entity_type, x, y, z) in enumerate(roads):
-        ent = entities[i+num_objects]
-        ent.type = entity_type
-        ent.array_size = len(x)
-        ent.traj_x = alloc_float_array(negate(x))
-        ent.traj_y = alloc_float_array(negate(y))
-        ent.traj_z = alloc_float_array(z)
-
-    # Return raw pointer so C code owns the allocations.
-    return (num_objects, len(roads), addressof(entities.contents))
+    # C takes ownership of actors; roads and their grid are owned by the capsule.
+    return (num_objects, shared_num_roads, addressof(entities.contents),
+            shared_roads_address, shared_road_map)
 
 
 def save_map_binary(map_tuple, path):
-    num_objects, num_roads, entities_addr = map_tuple
-    num_entities = num_objects + num_roads
+    """Serialize split/shared maps using the existing object-then-road format.
+
+    Legacy three-item tuples with a combined Entity array are also accepted.
+    Exporting never mutates the source trajectories or shared road geometry.
+    """
+    num_objects, num_roads, entities_addr = map_tuple[:3]
     entities = cast(c_void_p(entities_addr), POINTER(Entity))
+    roads = cast(c_void_p(map_tuple[3]), POINTER(StaticRoadEntity)) if len(map_tuple) >= 4 else None
 
     with open(path, "wb") as f:
-        f.write(struct.pack("i", num_objects))
-        f.write(struct.pack("i", num_roads))
+        f.write(struct.pack("ii", num_objects, num_roads))
+        for i in range(num_objects + num_roads):
+            is_object = i < num_objects
+            ent = entities[i] if is_object or roads is None else roads[i - num_objects]
+            expand_static = is_object and ent.mark_as_expert and ent.array_size == 1
+            size = 200 if expand_static else ent.array_size
+            f.write(struct.pack("ii", ent.type | 256 if is_object else ent.type, size))
 
-        for i in range(num_entities):
-            ent = entities[i]
-            size = ent.array_size
+            def write_float_array(values):
+                if expand_static:
+                    f.write(struct.pack("f", values[0]) * size)
+                else:
+                    f.write(pack_float_array(values, size))
 
-            if ent.mark_as_expert and size == 1:
-                size = 200
-                ent.traj_x = alloc_float_array([ent.traj_x[0]] * size)
-                ent.traj_y = alloc_float_array([ent.traj_y[0]] * size)
-                ent.traj_z = alloc_float_array([ent.traj_z[0]] * size)
-                ent.traj_vx = alloc_float_array([ent.traj_vx[0]] * size)
-                ent.traj_vy = alloc_float_array([ent.traj_vy[0]] * size)
-                ent.traj_vz = alloc_float_array([ent.traj_vz[0]] * size)
-                ent.traj_heading = alloc_float_array([ent.traj_heading[0]] * size)
-                ent.traj_valid = alloc_int_array([ent.traj_valid[0]] * size)
-
-            if ent.type in {1, 2, 3}:
-                f.write(struct.pack("i", ent.type | 256))
-            else:
-                f.write(struct.pack("i", ent.type))
-            f.write(struct.pack("i", size))
-
-            f.write(pack_float_array(ent.traj_x, size))
-            f.write(pack_float_array(ent.traj_y, size))
-            f.write(pack_float_array(ent.traj_z, size))
-
-            if ent.type in {1, 2, 3}:
-                f.write(pack_float_array(ent.traj_vx, size))
-                f.write(pack_float_array(ent.traj_vy, size))
-                f.write(pack_float_array(ent.traj_vz, size))
-                f.write(pack_float_array(ent.traj_heading, size))
-                f.write(pack_int_array(ent.traj_valid, size))
-
-            f.write(struct.pack("f", ent.width))
-            f.write(struct.pack("f", ent.length))
-            f.write(struct.pack("f", ent.height))
-            f.write(struct.pack("f", ent.goal_position_x))
-            f.write(struct.pack("f", ent.goal_position_y))
-            f.write(struct.pack("f", ent.goal_position_z))
-            f.write(struct.pack("i", ent.mark_as_expert))
-
-            if ent.type in {1, 2, 3}:
+            write_float_array(ent.traj_x)
+            write_float_array(ent.traj_y)
+            write_float_array(ent.traj_z)
+            if is_object:
+                write_float_array(ent.traj_vx)
+                write_float_array(ent.traj_vy)
+                write_float_array(ent.traj_vz)
+                write_float_array(ent.traj_heading)
+                if expand_static:
+                    f.write(struct.pack("i", ent.traj_valid[0]) * size)
+                else:
+                    f.write(pack_int_array(ent.traj_valid, size))
+                f.write(struct.pack("ffffffi", ent.width, ent.length, ent.height,
+                                    ent.goal_position_x, ent.goal_position_y,
+                                    ent.goal_position_z, ent.mark_as_expert))
                 f.write(struct.pack("i", ent.multi_goal_count))
                 f.write(pack_float_array(ent.multi_goal_position_x, ent.multi_goal_count))
                 f.write(pack_float_array(ent.multi_goal_position_y, ent.multi_goal_count))
                 f.write(pack_float_array(ent.multi_goal_position_z, ent.multi_goal_count))
+            else:
+                # Dimensions, goal position and expert flag are unused for roads.
+                f.write(struct.pack("ffffffi", 0, 0, 0, 0, 0, 0, 0))
 
 if __name__ == "__main__":
     #random.seed(1)
