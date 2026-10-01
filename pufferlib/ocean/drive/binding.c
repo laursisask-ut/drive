@@ -352,7 +352,7 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
             Py_DECREF(map);
             return 1;
         }
-        if (num_objects < 1 || num_objects > INT_MAX || num_roads < 0 || num_roads > INT_MAX || !entities) {
+        if (num_objects < 1 || num_objects > MAX_AGENTS || num_roads < 0 || num_roads > INT_MAX || !entities) {
             PyErr_SetString(PyExc_ValueError, "Invalid object/road count or null entity pointer");
             Py_DECREF(map);
             return 1;

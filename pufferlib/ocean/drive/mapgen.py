@@ -4,6 +4,15 @@ import time
 import random
 import json
 import struct
+import hashlib
+import tempfile
+import warnings
+import heapq
+from pathlib import Path
+from zipfile import BadZipFile
+from dataclasses import dataclass
+from itertools import accumulate
+from bisect import bisect_right
 from ctypes import (
     CDLL,
     POINTER,
@@ -18,10 +27,13 @@ from ctypes import (
     sizeof
 )
 
+import numpy as np
+from pufferlib.ocean.drive.pedestrian_routing import DEFAULT_TRAJECTORY_POINTS
+
 from lanelet2.io import Origin, load
 from lanelet2.projection import UtmProjector
-from lanelet2.core import LaneletMap, LineString3d, Point3d, BasicPoint2d, BasicPoint3d, BoundingBox2d, GPSPoint
-from lanelet2.geometry import length, fromArcCoordinates, ArcCoordinates, to2D, interpolatedPointAtDistance, findWithin2d, toArcCoordinates, distance
+from lanelet2.core import LaneletMap, LineString3d, Point3d, BasicPoint2d, BasicPoint3d
+from lanelet2.geometry import length, fromArcCoordinates, ArcCoordinates, to2D, interpolatedPointAtDistance, findWithin2d, toArcCoordinates, distance, inside
 from lanelet2.routing import RoutingGraph
 import lanelet2.traffic_rules
 
@@ -106,6 +118,10 @@ class Entity(Structure):
         ("jerk_lat", c_float),
         ("steering_angle", c_float),
         ("wheelbase", c_float),
+        # Private actuator state; must match ACTION_QUEUE_CAPACITY in drive.h.
+        ("action_delay_steps", c_int),
+        ("action_queue_head", c_int),
+        ("action_queue", (c_float * 2) * 6),
     ]
 
 class StaticRoadEntity(Structure):
@@ -121,26 +137,56 @@ class StaticRoadEntity(Structure):
 utm_origin_lat = 58.385345
 utm_origin_lon = 26.726272
 projector = UtmProjector(Origin(utm_origin_lat, utm_origin_lon), True, False)
-lanelet2_map = load("tartu_large_processed.osm", projector)
+MAP_PATH = Path("tartu_large_processed.osm")
+MAPGEN_CACHE_PATH = MAP_PATH.parent / ".cache" / "mapgen" / f"{MAP_PATH.name}.npz"
+PEDESTRIAN_MAP_PATH = MAP_PATH.with_name("pedestrian.osm")
+PEDESTRIAN_CACHE_PATH = MAPGEN_CACHE_PATH.with_name(f"{PEDESTRIAN_MAP_PATH.name}.npz")
+PEDESTRIAN_SAMPLE_RATE = 0.1
+PEDESTRIAN_TRAJECTORY_POINTS = DEFAULT_TRAJECTORY_POINTS
+PEDESTRIAN_POOL_SIZE = 262144
+PEDESTRIAN_POOL_PATH = MAPGEN_CACHE_PATH.parent / "pedestrian_trajectories"
+SCOOTER_FRACTION = 0.1
+# Width, length, and rider-inclusive height ranges, in metres.
+PEDESTRIAN_DIMENSIONS = ((0.36, 0.6), (0.2, 0.6), (1.4, 2.2))
+SCOOTER_DIMENSIONS = ((0.5, 0.7), (1.2, 1.6), (1.7, 2.3))
+# Bump when the precomputation algorithms or cache layout change.
+MAPGEN_CACHE_VERSION = 2
+lanelet2_map = load(str(MAP_PATH), projector)
 map_lanelets = list(lanelet2_map.laneletLayer)
-map_lanelet_centerline_lengths = [length(to2D(lanelet.centerline)) for lanelet in map_lanelets]
+map_lanelet_cumulative_lengths = tuple(accumulate(length(lanelet.centerline) for lanelet in map_lanelets))
+
+SPAWN_VEHICLE_WIDTH = 2.75
+SPAWN_VEHICLE_LENGTH = 15.0
+# These are additions to the total dimensions, not to each side.
+SPAWN_SAFETY_WIDTH_MARGIN = 0.1
+SPAWN_SAFETY_LENGTH_MARGIN = 2.0
+SPAWN_SAFETY_SIZE = (SPAWN_VEHICLE_WIDTH + SPAWN_SAFETY_WIDTH_MARGIN,
+                     SPAWN_VEHICLE_LENGTH + SPAWN_SAFETY_LENGTH_MARGIN)
+SPAWN_SEARCH_STEP = 1.0
+SPAWN_GRID_CELL_SIZE = 20.0
+SPAWN_BORDER_CLEARANCE = 0.20  # Minimum distance from each vehicle edge, in metres.
+ROAD_BORDER_TYPES = {"road_border", "curbstone", "guard_rail"}
+PARKED_MIN_OVERHANG = 0.20
+PARKED_MAX_BORDER_GAP = 0.50
+PARKED_BORDER_DEVIATION = 0.10  # Maximum bend across a full parking position.
 
 VEHICLE_PROFILES = [
     (0.30, 65, (1.90, 4.82, 1.46)),  # sedans
-    (0.20, 50, (1.90, 4.89, 1.69)),  # Lexus 450h
+    (0.20, 40, (2.50, 5.00, 1.69)),  # Lexus 450h
     (0.12, 55, (2.00, 5.02, 1.78)),  # SUVs
     (0.05, 55, (2.03, 5.88, 1.97)),  # pickup trucks
     (0.07, 55, (1.95, 5.40, 1.97)),  # vans
-    (0.07, 50, (2.55, 12.00, 2.30)), # buses
+    (0.07, 45, (2.55, 10.00, 2.30)), # buses
     (0.03, 55, (2.55, 8.00, 3.60)),  # trucks
-    (0.10, 25, (0.60, 1.80, 1.10)),  # bicycles
+    (0.10, 20, (0.60, 1.80, 1.10)),  # bicycles
     (0.03, 80, (0.80, 2.20, 1.25)),  # motorcycles
     (0.03, 20, (2.30, 6.40, 3.00)),  # street maintenance vehicle
 ]
 
 vehicle_weights = [w for w, _, _ in VEHICLE_PROFILES]
 
-STATIONARY_OBJECT_PROFILES = VEHICLE_PROFILES + [(1.00, 5, (0.40, 0.40, 1.80))]
+# Parked slots contain vehicles; pedestrians have their own fixed population.
+STATIONARY_OBJECT_PROFILES = list(VEHICLE_PROFILES)
 stationary_object_weights = [w for w, _, _ in STATIONARY_OBJECT_PROFILES]
 
 # TODO: Different traffic rules based on vehicle, e.g. different
@@ -205,8 +251,8 @@ def calculate_normal(linestring, i):
     return BasicPoint2d(math.cos(normal_angle), math.sin(normal_angle))
 
 
-def sample_points_along_line(linestring, start_offset, end_offset, speed, sample_rate=0.1):
-    lateral_shift = random.uniform(-1.5, 1.5)
+def sample_points_along_line(linestring, start_offset, end_offset, speed, sample_rate=0.1, rng=random):
+    lateral_shift = rng.uniform(-1.5, 1.5)
     
     points = []
 
@@ -227,7 +273,7 @@ def sample_points_along_line(linestring, start_offset, end_offset, speed, sample
     offset = start_offset
 
     while i + 1 < len(linestring) and offset < end_offset:
-        distance_per_tick = avg_distance_per_tick * random.uniform(0.8, 1.2)
+        distance_per_tick = avg_distance_per_tick * rng.uniform(0.8, 1.2)
         if distance(current_pos, linestring[i + 1]) < distance_per_tick:
             distance_traveled = distance(current_pos, linestring[i + 1])
             i += 1
@@ -250,13 +296,8 @@ def sample_points_along_line(linestring, start_offset, end_offset, speed, sample
 
     return points
 
-pedestrian_crossing_routes_cache = {}
-def get_pedestrian_crossing_route(lanelet):
-    # import matplotlib.pyplot as plt
-    global pedestrian_crossing_routes_cache
-    if lanelet.id in pedestrian_crossing_routes_cache:
-        return random.choice(pedestrian_crossing_routes_cache[lanelet.id])
-    
+def crossing_route_lanelets(lanelet):
+    """Identify the complete crossing corridor, including connected lanelets."""
     start_pos = BasicPoint2d(lanelet.centerline[0].x, lanelet.centerline[0].y)
     end_pos = BasicPoint2d(lanelet.centerline[-1].x, lanelet.centerline[-1].y)
 
@@ -285,15 +326,24 @@ def get_pedestrian_crossing_route(lanelet):
         walked_lanelets.append(following_lanelets[0])
         end_pos = BasicPoint2d(following_lanelets[0].centerline[-1].x, following_lanelets[0].centerline[-1].y)
 
+    return walked_lanelets
+
+
+def build_pedestrian_crossing_routes(lanelet, rng=random):
+    """Build the approach/crossing/exit variants for one crosswalk at startup."""
+    walked_lanelets = crossing_route_lanelets(lanelet)
+    start_pos = BasicPoint2d(walked_lanelets[0].centerline[0].x, walked_lanelets[0].centerline[0].y)
+    end_pos = BasicPoint2d(walked_lanelets[-1].centerline[-1].x, walked_lanelets[-1].centerline[-1].y)
+
     origins = findWithin2d(lanelet2_map.lineStringLayer, start_pos, 3.0)
     origins = [origin for _, origin in origins if "type" in origin.attributes and origin.attributes["type"] in {"curbstone", "road_border", "guard_rail"}]
     if origins:
         origin_road_edge = to2D(origins[0])
         connector = toArcCoordinates(origin_road_edge, start_pos)
 
-        origin_option1 = sample_points_along_line(origin_road_edge, max(connector.length - 20, 0), connector.length, speed=1.4)
+        origin_option1 = sample_points_along_line(origin_road_edge, max(connector.length - 20, 0), connector.length, speed=1.4, rng=rng)
         # plt.plot([p.x for p in origin_option1], [p.y for p in origin_option1], "og", markersize=1)
-        origin_option2 = list(reversed(sample_points_along_line(origin_road_edge, connector.length, connector.length + 20, speed=1.4)))
+        origin_option2 = list(reversed(sample_points_along_line(origin_road_edge, connector.length, connector.length + 20, speed=1.4, rng=rng)))
         # plt.plot([p.x for p in origin_option2], [p.y for p in origin_option2], "o", color="darkgreen", markersize=1)
         origin_choices = [origin_option1, origin_option2]
     else:
@@ -306,9 +356,9 @@ def get_pedestrian_crossing_route(lanelet):
         dest_road_edge = to2D(destinations[0])
         connector = toArcCoordinates(dest_road_edge, end_pos)
 
-        dest_option1 = sample_points_along_line(dest_road_edge, connector.length, connector.length + 20, speed=1.4)
+        dest_option1 = sample_points_along_line(dest_road_edge, connector.length, connector.length + 20, speed=1.4, rng=rng)
         # plt.plot([p.x for p in dest_option1], [p.y for p in dest_option1], "ob", markersize=1)
-        dest_option2 = list(reversed(sample_points_along_line(dest_road_edge, max(connector.length - 20, 0), connector.length, speed=1.4)))
+        dest_option2 = list(reversed(sample_points_along_line(dest_road_edge, max(connector.length - 20, 0), connector.length, speed=1.4, rng=rng)))
         # plt.plot([p.x for p in dest_option2], [p.y for p in dest_option2], "oc", markersize=1)
 
         destination_choices = [dest_option1, dest_option2]
@@ -320,19 +370,36 @@ def get_pedestrian_crossing_route(lanelet):
     for l in walked_lanelets:
         if prev is not None:
             crosswalk.extend(linear_interpolate(to2D(prev.centerline[-1]), to2D(l.centerline[0]), speed=1.4))
-        crosswalk.extend(sample_points_along_line(to2D(l.centerline), 0, math.inf, speed=1.4))
+        crosswalk.extend(sample_points_along_line(to2D(l.centerline), 0, math.inf, speed=1.4, rng=rng))
         prev = l
     # plt.plot([p.x for p in crosswalk], [p.y for p in crosswalk], "or", markersize=1)
 
-    pedestrian_crossing_routes_cache[lanelet.id] = []
+    routes = []
     for origin in origin_choices:
         for destination in destination_choices:
-            pedestrian_crossing_routes_cache[lanelet.id].append(origin + linear_interpolate(origin[-1], crosswalk[0], speed=1.4) + crosswalk +
-                                                                linear_interpolate(crosswalk[-1], destination[0], speed=1.4) + destination)
+            routes.append(tuple(origin + linear_interpolate(origin[-1], crosswalk[0], speed=1.4) + crosswalk +
+                                linear_interpolate(crosswalk[-1], destination[0], speed=1.4) + destination))
 
     # plt.savefig("x.png", dpi=500)
 
-    return random.choice(pedestrian_crossing_routes_cache[lanelet.id])
+    return tuple(routes)
+
+
+def precompute_pedestrian_crossing_routes(lanelets):
+    """Cache every crosswalk without consuming the episode random generator."""
+    rng = random.Random(0)
+    return {
+        lanelet.id: build_pedestrian_crossing_routes(lanelet, rng=rng)
+        for lanelet in sorted(lanelets, key=lambda lanelet: lanelet.id)
+        if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "crosswalk"
+    }
+
+
+def get_pedestrian_crossing_route(lanelet=None):
+    # Sample crosswalks uniformly, then choose one of that crossing's variants.
+    routes = (random.choice(map_pedestrian_crossing_routes) if lanelet is None
+              else pedestrian_crossing_routes_cache[lanelet.id])
+    return random.choice(routes)
 
 def alloc_entities(count):
     buf = libc.calloc(c_size_t(count), c_size_t(sizeof(Entity)))
@@ -347,21 +414,33 @@ def alloc_static_road_entities(count):
     return cast(buf, POINTER(StaticRoadEntity))
 
 def alloc_float_array(values):
+    if isinstance(values, np.ndarray) and values.ndim != 1:
+        raise ValueError("Native float arrays must be one-dimensional")
     length = len(values)
     buf = libc.malloc(c_size_t(length * sizeof(c_float)))
     if not buf:
         raise MemoryError("malloc failed for float array")
-    tmp = (c_float * length)(*values)
-    memmove(buf, tmp, sizeof(tmp))
+    if isinstance(values, np.ndarray):
+        tmp = np.ascontiguousarray(values, dtype=np.float32)
+        memmove(buf, tmp.ctypes.data, tmp.nbytes)
+    else:
+        tmp = (c_float * length)(*values)
+        memmove(buf, tmp, sizeof(tmp))
     return cast(buf, POINTER(c_float))
 
 def alloc_int_array(values):
+    if isinstance(values, np.ndarray) and values.ndim != 1:
+        raise ValueError("Native int arrays must be one-dimensional")
     length = len(values)
     buf = libc.malloc(c_size_t(length * sizeof(c_int)))
     if not buf:
         raise MemoryError("malloc failed for int array")
-    tmp = (c_int * length)(*values)
-    memmove(buf, tmp, sizeof(tmp))
+    if isinstance(values, np.ndarray):
+        tmp = np.ascontiguousarray(values, dtype=np.int32)
+        memmove(buf, tmp.ctypes.data, tmp.nbytes)
+    else:
+        tmp = (c_int * length)(*values)
+        memmove(buf, tmp, sizeof(tmp))
     return cast(buf, POINTER(c_int))
 
 
@@ -385,10 +464,6 @@ def pack_int_array(ptr, length):
 
 def negate(arr):
     return [-value for value in arr]
-
-
-def point_in_box(point, box):
-    return box.min.x <= point.x <= box.max.x and box.min.y <= point.y <= box.max.y
 
 
 def rectangle_corners(x, y, heading, width, length):
@@ -428,63 +503,546 @@ def rectangles_collide(pose_a, size_a, pose_b, size_b):
     return all(projections_overlap(corners_a, corners_b, axis) for axis in axes)
 
 
+def vehicle_safety_size(dimensions):
+    return (dimensions[0] + SPAWN_SAFETY_WIDTH_MARGIN,
+            dimensions[1] + SPAWN_SAFETY_LENGTH_MARGIN)
+
+
 def vehicle_collides(pose, dimensions, placed_vehicles):
-    size = dimensions[:2]
-    return any(rectangles_collide(pose, size, other_pose, other_size) for other_pose, other_size in placed_vehicles)
+    """Check both vehicles' safety boxes; inputs contain their actual dimensions."""
+    size = vehicle_safety_size(dimensions)
+    if isinstance(placed_vehicles, VehicleSpawnIndex):
+        index = placed_vehicles
+        placed_vehicles = (index.vehicles[i] for i in index.nearby_indices(pose, size))
+    return any(rectangles_collide(pose, size, other_pose, vehicle_safety_size(other_size))
+               for other_pose, other_size in placed_vehicles)
 
 
 def sample_dimensions(base_dimensions, variation):
     return tuple(dimension * (1 + random.uniform(-variation, variation)) for dimension in base_dimensions)
 
 
-def add_spawn_position(queue, grid, lanelet, s, pos, min_distance):
-    cell = (int(pos.x // min_distance), int(pos.y // min_distance))
-    has_near_position = any(
-        distance(pos, other_pos) < min_distance
-        for dx in range(-1, 2)
-        for dy in range(-1, 2)
-        for other_pos in grid.get((cell[0] + dx, cell[1] + dy), [])
-    )
-    if has_near_position:
-        return
-    queue.append((lanelet, s))
-    grid.setdefault(cell, []).append(pos)
+def spatial_cells(points):
+    """Grid cells covered by the bounding box of a set of XY tuples."""
+    min_x = math.floor(min(p[0] for p in points) / SPAWN_GRID_CELL_SIZE)
+    max_x = math.floor(max(p[0] for p in points) / SPAWN_GRID_CELL_SIZE)
+    min_y = math.floor(min(p[1] for p in points) / SPAWN_GRID_CELL_SIZE)
+    max_y = math.floor(max(p[1] for p in points) / SPAWN_GRID_CELL_SIZE)
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            yield x, y
 
 
-def make_spawn_position_queues(lanelets, box):
-    spawn_spacing = 12
-    min_spawn_distance = 5
-    candidate_positions = []
+class VehicleSpawnIndex:
+    """Index placed safety boxes so generation only compares nearby actors."""
+
+    def __init__(self):
+        self.vehicles = []
+        self.grid = {}
+
+    def append(self, vehicle):
+        pose, size = vehicle
+        index = len(self.vehicles)
+        self.vehicles.append((pose, size[:2]))
+        for cell in spatial_cells(rectangle_corners(*pose, *vehicle_safety_size(size))):
+            self.grid.setdefault(cell, []).append(index)
+
+    def nearby_indices(self, pose, size):
+        return {index for cell in spatial_cells(rectangle_corners(*pose, *size))
+                for index in self.grid.get(cell, ())}
+
+
+def rectangle_intersects_segments(pose, size, segments):
+    """Intersect closed segments with a rectangle, including contained segments."""
+    x, y, heading = pose
+    width, vehicle_length = size
+    cos_heading, sin_heading = math.cos(heading), math.sin(heading)
+    for start, end in segments:
+        # Transform into the vehicle frame, then clip the segment to its box.
+        sx, sy = start[0] - x, start[1] - y
+        ex, ey = end[0] - x, end[1] - y
+        local_start = (sx * cos_heading + sy * sin_heading,
+                       -sx * sin_heading + sy * cos_heading)
+        local_end = (ex * cos_heading + ey * sin_heading,
+                     -ex * sin_heading + ey * cos_heading)
+        t_min, t_max = 0.0, 1.0
+        for a, b, half_extent in zip(local_start, local_end, (vehicle_length / 2, width / 2)):
+            delta = b - a
+            if abs(delta) < 1e-12:
+                if abs(a) > half_extent:
+                    break
+                continue
+            t1, t2 = (-half_extent - a) / delta, (half_extent - a) / delta
+            t_min = max(t_min, min(t1, t2))
+            t_max = min(t_max, max(t1, t2))
+            if t_min > t_max:
+                break
+        else:
+            return True
+    return False
+
+
+class RoadBorderIndex:
+    """Static spatial index of physical borders; lane markings are excluded."""
+
+    def __init__(self, linestrings):
+        self.segments = []
+        self.segment_border_keys = []
+        self.lines = {}
+        self.grid = {}
+        for line in linestrings:
+            if "type" not in line.attributes or line.attributes["type"] not in ROAD_BORDER_TYPES:
+                continue
+            self.lines[line.id] = line
+            points = [(p.x, p.y) for p in line]
+            for local_index, segment in enumerate(zip(points, points[1:])):
+                index = len(self.segments)
+                self.segments.append(segment)
+                self.segment_border_keys.append((line.id, local_index))
+                for cell in spatial_cells(segment):
+                    self.grid.setdefault(cell, []).append(index)
+
+    def collides(self, pose, size, clearance=0.0, ignore_border_section=None):
+        # Expand every side, including front/rear, before querying nearby cells.
+        size = (size[0] + 2 * clearance, size[1] + 2 * clearance)
+        corners = rectangle_corners(*pose, *size)
+        indices = {index for cell in spatial_cells(corners) for index in self.grid.get(cell, ())}
+        if ignore_border_section is not None:
+            border_id, start, end = ignore_border_section
+            indices = {i for i in indices if not (
+                self.segment_border_keys[i][0] == border_id
+                and start <= self.segment_border_keys[i][1] < end
+            )}
+        return rectangle_intersects_segments(pose, size, (self.segments[i] for i in indices))
+
+
+@dataclass(frozen=True)
+class SpawnPosition:
+    lanelet: object
+    offset: float
+    # Map coordinates and forward road heading. Simulation XY is negated later.
+    pose: tuple
+
+
+@dataclass(frozen=True)
+class ParkedSpawnPosition:
+    border_id: int
+    pose: tuple  # Center on the physical border, heading along its local tangent.
+    outward_sign: int  # +1 means left of the tangent; -1 means right.
+    border_min: float  # Border's outward-coordinate range across a 15 m footprint.
+    border_max: float
+    first_segment: int = 0
+    end_segment: int = 1  # Exclusive; other parts of a looping border remain obstacles.
+
+
+def precompute_parked_spawn_positions(lanelets, borders):
+    """Sample physical borders, using road polygons only to identify the outside."""
+    roads = LaneletMap()
     for lanelet in lanelets:
-        if "subtype" not in lanelet.attributes or lanelet.attributes["subtype"] != "road" or len(lanelet.centerline) < 3:
+        if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "road":
+            roads.add(lanelet)
+    positions = []
+    half_length = SPAWN_VEHICLE_LENGTH / 2
+    for border_id, border in sorted(borders.lines.items()):
+        points = [(p.x, p.y) for p in border]
+        if len(points) < 2:
+            continue
+        offsets = [0.0]
+        for first, second in zip(points, points[1:]):
+            offsets.append(offsets[-1] + math.dist(first, second))
+
+        def point_at(s):
+            index = min(bisect_right(offsets, s) - 1, len(points) - 2)
+            span = offsets[index + 1] - offsets[index]
+            fraction = (s - offsets[index]) / span if span else 0.0
+            return tuple(a + fraction * (b - a) for a, b in zip(points[index], points[index + 1]))
+
+        s = half_length
+        while s <= offsets[-1] - half_length:
+            start, end = point_at(s - half_length), point_at(s + half_length)
+            x, y = point_at(s)
+            heading = math.atan2(end[1] - start[1], end[0] - start[0])
+            nx, ny = -math.sin(heading), math.cos(heading)
+            window = [start, end, *points[bisect_right(offsets, s - half_length):
+                                        bisect_right(offsets, s + half_length)]]
+            lateral = [(px - x) * nx + (py - y) * ny for px, py in window]
+            if max(lateral) - min(lateral) > PARKED_BORDER_DEVIATION:
+                s += SPAWN_SEARCH_STEP
+                continue
+
+            # Neither the linestring direction nor a lane's travel direction
+            # reliably identifies the land side. Require road on exactly one side
+            # at both ends and the middle, rejecting internal/intersection lines.
+            sides = []
+            for px, py in (start, (x, y), end):
+                nearby = [lane for _, lane in findWithin2d(roads.laneletLayer, BasicPoint2d(px, py), 1.0)]
+                left = any(inside(lane, BasicPoint2d(px + nx, py + ny)) for lane in nearby)
+                right = any(inside(lane, BasicPoint2d(px - nx, py - ny)) for lane in nearby)
+                sides.append(-1 if left and not right else 1 if right and not left else 0)
+            if sides[0] == 0 or len(set(sides)) != 1:
+                s += SPAWN_SEARCH_STEP
+                continue
+            outward_sign = sides[0]
+            outward = [value * outward_sign for value in lateral]
+            positions.append(ParkedSpawnPosition(
+                border_id, (x, y, heading), outward_sign, min(outward), max(outward),
+                max(0, bisect_right(offsets, s - half_length) - 1),
+                min(len(points) - 1, bisect_right(offsets, s + half_length)),
+            ))
+            s += SPAWN_SAFETY_SIZE[1] + 0.01
+    return tuple(positions)
+
+
+def sample_parked_spawn_pose(position, dimensions, placed_vehicles, borders):
+    """Allow curb overhang or fully outside parking, with at most a 50 cm gap."""
+    width, vehicle_length = dimensions[:2]
+    if vehicle_length > SPAWN_VEHICLE_LENGTH:
+        return None
+    # A millimetre of slack protects the limits after native float32 conversion.
+    low = position.border_max + PARKED_MIN_OVERHANG - width / 2 + 0.001
+    high = position.border_min + PARKED_MAX_BORDER_GAP + width / 2 - 0.001
+    if low > high:
+        return None
+    outward_offset = random.uniform(low, high)
+    x, y, heading = position.pose
+    dx = -math.sin(heading) * position.outward_sign * outward_offset
+    dy = math.cos(heading) * position.outward_sign * outward_offset
+    pose = (x + dx, y + dy, heading)
+    # Permit crossing the selected curb, but do not cross or jump over another
+    # physical border (for example, the opposite edge of a narrow traffic island).
+    sweep_pose = (x + dx / 2, y + dy / 2, heading)
+    sweep_size = (width + abs(outward_offset), vehicle_length)
+    if (borders.collides(sweep_pose, sweep_size, ignore_border_section=(
+            position.border_id, position.first_segment, position.end_segment,
+        ))
+            or vehicle_collides(pose, dimensions, placed_vehicles)):
+        return None
+    return pose
+
+
+def rectangle_fits_lanelet(lanelet, pose, size, boundary_segments):
+    if not all(inside(lanelet, BasicPoint2d(x, y)) for x, y in rectangle_corners(*pose, *size)):
+        return False
+    # Corner containment alone misses a curved/concave border cutting into the
+    # footprint. Touching a lane marking is fine; entering the box is not.
+    interior_size = (size[0] - 1e-7, size[1] - 1e-7)
+    return not rectangle_intersects_segments(pose, interior_size, boundary_segments)
+
+
+def precompute_spawn_positions(lanelets, borders):
+    """Pack non-overlapping 17 x 2.85 m safety boxes across all straight lanes.
+
+    Scan at one-metre resolution where a candidate does not fit. The accepted
+    centerline poses are deterministic and shared by every generated episode.
+    """
+    positions = []
+    occupied_cells = {}
+    vehicle_size = (SPAWN_VEHICLE_WIDTH, SPAWN_VEHICLE_LENGTH)
+    for lanelet in sorted(lanelets, key=lambda lanelet: lanelet.id):
+        attributes = lanelet.attributes
+        if ("subtype" not in attributes or attributes["subtype"] != "road"
+                or "turn_direction" not in attributes or attributes["turn_direction"] != "straight"
+                or len(lanelet.centerline) < 2):
             continue
         line = to2D(lanelet.centerline)
         line_length = length(line)
-        if line_length < spawn_spacing:
+        boundary = [(p.x, p.y) for p in lanelet.polygon2d()]
+        boundary_segments = list(zip(boundary, boundary[1:] + boundary[:1]))
+        s = SPAWN_VEHICLE_LENGTH / 2
+        while s <= line_length - SPAWN_VEHICLE_LENGTH / 2:
+            pos = interpolatedPointAtDistance(line, s)
+            near = interpolatedPointAtDistance(line, s + 0.05)
+            pose = (pos.x, pos.y, math.atan2(near.y - pos.y, near.x - pos.x))
+            cells = tuple(spatial_cells(rectangle_corners(*pose, *SPAWN_SAFETY_SIZE)))
+            neighbors = {index for cell in cells for index in occupied_cells.get(cell, ())}
+            if (any(rectangles_collide(pose, SPAWN_SAFETY_SIZE, positions[i].pose, SPAWN_SAFETY_SIZE)
+                    for i in neighbors)
+                    or not rectangle_fits_lanelet(lanelet, pose, vehicle_size, boundary_segments)
+                    or borders.collides(pose, vehicle_size, clearance=SPAWN_BORDER_CLEARANCE)):
+                s += SPAWN_SEARCH_STEP
+                continue
+            index = len(positions)
+            positions.append(SpawnPosition(lanelet, s, pose))
+            for cell in cells:
+                occupied_cells.setdefault(cell, []).append(index)
+            # A small gap also keeps touching safety boxes from colliding.
+            s += SPAWN_SAFETY_SIZE[1] + 0.01
+    return tuple(positions)
+
+
+def sample_spawn_pose(position, dimensions, placed_vehicles, borders, lateral_range=(-1.5, 1.5)):
+    """Keep 20 cm to physical borders and disjoint vehicle safety boxes after offsets."""
+    x, y, heading = position.pose
+    normal_x, normal_y = -math.sin(heading), math.cos(heading)
+    # Keep the centerline as a fallback when a sampled offset is obstructed.
+    offsets = [random.uniform(*lateral_range) for _ in range(12)] + [0.0]
+    for offset in offsets:
+        pose = (x + normal_x * offset, y + normal_y * offset, heading)
+        # Check the entire lateral sweep so a large offset cannot jump a curb.
+        swept_pose = (x + normal_x * offset / 2, y + normal_y * offset / 2, heading)
+        swept_size = (dimensions[0] + abs(offset), dimensions[1])
+        if (not borders.collides(swept_pose, swept_size, clearance=SPAWN_BORDER_CLEARANCE)
+                and not vehicle_collides(pose, dimensions, placed_vehicles)):
+            return pose
+    return None
+
+
+def mapgen_cache_metadata(map_path):
+    digest = hashlib.sha256()
+    with open(map_path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "version": MAPGEN_CACHE_VERSION,
+        "map_sha256": digest.hexdigest(),
+        "origin": [utm_origin_lat, utm_origin_lon],
+        "spawn_size": [SPAWN_VEHICLE_WIDTH, SPAWN_VEHICLE_LENGTH],
+        "safety_size": list(SPAWN_SAFETY_SIZE),
+        "safety_margin": [SPAWN_SAFETY_WIDTH_MARGIN, SPAWN_SAFETY_LENGTH_MARGIN],
+        "search_step": SPAWN_SEARCH_STEP,
+        "border_clearance": SPAWN_BORDER_CLEARANCE,
+        "border_types": sorted(ROAD_BORDER_TYPES),
+        "parked_min_overhang": PARKED_MIN_OVERHANG,
+        "parked_max_border_gap": PARKED_MAX_BORDER_GAP,
+        "parked_border_deviation": PARKED_BORDER_DEVIATION,
+    }
+
+
+def read_mapgen_cache(cache_path, metadata, lanelets, borders):
+    """Restore numeric cache data against the freshly loaded lanelet map."""
+    with np.load(cache_path, allow_pickle=False) as data:
+        if json.loads(data["metadata"].item()) != metadata:
+            raise ValueError("Mapgen cache is out of date")
+        spawn_ids = data["spawn_ids"]
+        spawn_offsets = data["spawn_offsets"]
+        spawn_poses = data["spawn_poses"]
+        parked_border_ids = data["parked_border_ids"]
+        parked_data = data["parked_data"]
+        parked_segments = data["parked_segments"]
+        crosswalk_ids = data["crosswalk_ids"]
+        crosswalk_offsets = data["crosswalk_offsets"]
+        route_offsets = data["route_offsets"]
+        point_indices = data["point_indices"]
+        point_xy = data["point_xy"]
+
+    integer_arrays = (spawn_ids, parked_border_ids, crosswalk_ids, crosswalk_offsets, route_offsets, point_indices)
+    if any(a.ndim != 1 or a.dtype.kind not in "iu" for a in integer_arrays):
+        raise ValueError("Invalid mapgen cache indices")
+    if (spawn_offsets.shape != spawn_ids.shape or spawn_poses.shape != (len(spawn_ids), 3)
+            or point_xy.ndim != 2 or point_xy.shape[1] != 2
+            or any(a.dtype.kind != "f" or not np.isfinite(a).all()
+                   for a in (spawn_offsets, spawn_poses, point_xy))
+            or np.any(spawn_offsets < 0)):
+        raise ValueError("Invalid mapgen cache coordinates")
+    if (parked_data.shape != (len(parked_border_ids), 6) or parked_data.dtype.kind != "f"
+            or not np.isfinite(parked_data).all()
+            or not set(parked_border_ids).issubset(borders.lines)
+            or not np.isin(parked_data[:, 3], [-1, 1]).all()
+            or np.any(parked_data[:, 4] > parked_data[:, 5])):
+        raise ValueError("Invalid mapgen parking cache")
+    if (parked_segments.shape != (len(parked_border_ids), 2) or parked_segments.dtype.kind not in "iu"
+            or np.any(parked_segments[:, 0] < 0)
+            or np.any(parked_segments[:, 1] <= parked_segments[:, 0])
+            or any(end >= len(borders.lines[int(border_id)]) for border_id, (_, end)
+                   in zip(parked_border_ids, parked_segments))):
+        raise ValueError("Invalid mapgen parking border sections")
+    if (crosswalk_offsets.shape != (len(crosswalk_ids) + 1,) or len(route_offsets) == 0
+            or crosswalk_offsets[0] != 0 or route_offsets[0] != 0
+            or crosswalk_offsets[-1] != len(route_offsets) - 1
+            or route_offsets[-1] != len(point_indices)
+            or np.any(crosswalk_offsets[1:] <= crosswalk_offsets[:-1])
+            or np.any(route_offsets[1:] < route_offsets[:-1] + 2)
+            or np.any(point_indices < 0) or np.any(point_indices >= len(point_xy))):
+        raise ValueError("Invalid mapgen cache route offsets")
+    expected_crosswalks = {lanelet.id for lanelet in lanelets
+                          if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "crosswalk"}
+    if len(set(crosswalk_ids)) != len(crosswalk_ids) or set(crosswalk_ids) != expected_crosswalks:
+        raise ValueError("Incomplete mapgen crossing cache")
+
+    lanelets_by_id = {lanelet.id: lanelet for lanelet in lanelets}
+    positions = tuple(SpawnPosition(lanelets_by_id[int(lane_id)], float(offset), tuple(map(float, pose)))
+                      for lane_id, offset, pose in zip(spawn_ids, spawn_offsets, spawn_poses))
+    # Share points across route variants, just as the in-memory builder does.
+    points = [BasicPoint2d(float(x), float(y)) for x, y in point_xy]
+    routes = [tuple(points[index] for index in point_indices[start:end])
+              for start, end in zip(route_offsets[:-1], route_offsets[1:])]
+    crossings = {int(lane_id): tuple(routes[start:end]) for lane_id, start, end in
+                 zip(crosswalk_ids, crosswalk_offsets[:-1], crosswalk_offsets[1:])}
+    parked = tuple(ParkedSpawnPosition(int(border_id), tuple(map(float, row[:3])), int(row[3]),
+                                       float(row[4]), float(row[5]), int(section[0]), int(section[1]))
+                   for border_id, row, section in zip(parked_border_ids, parked_data, parked_segments))
+    return positions, crossings, parked
+
+
+def write_mapgen_cache(cache_path, metadata, positions, crossings, parked):
+    """Atomically publish portable arrays, with no pickled Python objects."""
+    point_ids = {}
+    point_xy = []
+    point_indices = []
+    route_offsets = [0]
+    crosswalk_offsets = [0]
+    crosswalk_ids = sorted(crossings)
+    for lane_id in crosswalk_ids:
+        for route in crossings[lane_id]:
+            for point in route:
+                index = point_ids.get(id(point))
+                if index is None:
+                    index = len(point_xy)
+                    point_ids[id(point)] = index
+                    point_xy.append((point.x, point.y))
+                point_indices.append(index)
+            route_offsets.append(len(point_indices))
+        crosswalk_offsets.append(len(route_offsets) - 1)
+
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=cache_path.parent, prefix=cache_path.name + ".",
+                                         suffix=".tmp", delete=False) as out:
+            temporary_path = Path(out.name)
+            np.savez(
+                out, metadata=json.dumps(metadata, sort_keys=True),
+                spawn_ids=np.asarray([p.lanelet.id for p in positions], dtype=np.int64),
+                spawn_offsets=np.asarray([p.offset for p in positions], dtype=np.float64),
+                spawn_poses=np.asarray([p.pose for p in positions], dtype=np.float64).reshape(-1, 3),
+                parked_border_ids=np.asarray([p.border_id for p in parked], dtype=np.int64),
+                parked_data=np.asarray([(*p.pose, p.outward_sign, p.border_min, p.border_max)
+                                        for p in parked], dtype=np.float64).reshape(-1, 6),
+                parked_segments=np.asarray([(p.first_segment, p.end_segment) for p in parked],
+                                           dtype=np.int64).reshape(-1, 2),
+                crosswalk_ids=np.asarray(crosswalk_ids, dtype=np.int64),
+                crosswalk_offsets=np.asarray(crosswalk_offsets, dtype=np.int64),
+                route_offsets=np.asarray(route_offsets, dtype=np.int64),
+                point_indices=np.asarray(point_indices, dtype=np.int64),
+                point_xy=np.asarray(point_xy, dtype=np.float64).reshape(-1, 2),
+            )
+        os.replace(temporary_path, cache_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def load_or_build_mapgen_cache(map_path, cache_path, lanelets, borders):
+    """Reuse preprocessing across runs until map contents or cache settings change."""
+    metadata = mapgen_cache_metadata(map_path)
+    try:
+        return read_mapgen_cache(cache_path, metadata, lanelets, borders)
+    except (OSError, ValueError, TypeError, KeyError, EOFError, BadZipFile):
+        pass  # Missing, stale or incomplete caches are disposable.
+
+    positions = precompute_spawn_positions(lanelets, borders)
+    crossings = precompute_pedestrian_crossing_routes(lanelets)
+    parked = precompute_parked_spawn_positions(lanelets, borders)
+    try:
+        write_mapgen_cache(cache_path, metadata, positions, crossings, parked)
+    except OSError as error:
+        warnings.warn(f"Could not save mapgen cache {cache_path}: {error}", RuntimeWarning)
+    return positions, crossings, parked
+
+
+# Load the persistent cache at startup; only a cache miss runs precomputation.
+road_border_index = RoadBorderIndex(lanelet2_map.lineStringLayer)
+map_spawn_positions, pedestrian_crossing_routes_cache, map_parked_spawn_positions = load_or_build_mapgen_cache(
+    MAP_PATH, MAPGEN_CACHE_PATH, map_lanelets, road_border_index,
+)
+map_pedestrian_crossing_routes = tuple(pedestrian_crossing_routes_cache.values())
+
+PEDESTRIANS_PER_ROUTE = 4
+_pedestrian_network = None
+_pedestrian_trajectory_pool = None
+
+
+def get_pedestrian_network():
+    global _pedestrian_network
+    if _pedestrian_network is None:
+        from pufferlib.ocean.drive.pedestrian_routing import load_pedestrian_network
+        _pedestrian_network = load_pedestrian_network(
+            PEDESTRIAN_MAP_PATH, projector, (utm_origin_lat, utm_origin_lon),
+            PEDESTRIAN_CACHE_PATH,
+        )
+    return _pedestrian_network
+
+
+def get_pedestrian_trajectory_pool():
+    global _pedestrian_trajectory_pool
+    if _pedestrian_trajectory_pool is None:
+        from pufferlib.ocean.drive.pedestrian_trajectories import load_trajectory_pool
+        _pedestrian_trajectory_pool = load_trajectory_pool(
+            PEDESTRIAN_MAP_PATH, (utm_origin_lat, utm_origin_lon),
+            PEDESTRIAN_POOL_PATH, get_pedestrian_network,
+            size=PEDESTRIAN_POOL_SIZE, max_points=PEDESTRIAN_TRAJECTORY_POINTS,
+            sample_rate=PEDESTRIAN_SAMPLE_RATE, scooter_fraction=SCOOTER_FRACTION,
+        )
+    return _pedestrian_trajectory_pool
+
+
+def sample_limited_routes(routes, count, weights=None):
+    """Sample route slots without replacement, allowing small groups of up to four."""
+    if count > len(routes) * PEDESTRIANS_PER_ROUTE:
+        raise RuntimeError(f"Requested {count} pedestrian routes, but only "
+                           f"{len(routes) * PEDESTRIANS_PER_ROUTE} route slots are available")
+    if weights is None:
+        slots = random.sample(range(len(routes) * PEDESTRIANS_PER_ROUTE), count)
+        return [routes[slot // PEDESTRIANS_PER_ROUTE] for slot in slots]
+    # Exponential priorities give weighted sampling without replacement. Each
+    # corridor has a fixed number of slots, regardless of its length or lane count.
+    priorities = ((-math.log1p(-random.random()) / max(weight, 1e-6), i, slot)
+                  for i, weight in enumerate(weights) for slot in range(PEDESTRIANS_PER_ROUTE))
+    return [routes[i] for _, i, _ in heapq.nsmallest(count, priorities)]
+
+
+def pedestrian_route_plans(count):
+    """Sample starts across physical pedestrian corridors, then choose a direction."""
+    network = get_pedestrian_network()
+    corridors = sample_limited_routes(network.corridors, count, network.corridor_lengths)
+    return [random.choice(corridor) for corridor in corridors]
+
+
+def build_pedestrian_route(start_lane, start_offset):
+    network = get_pedestrian_network()
+    goal_lane, goal_offset = network.sample_position()
+    points = network.trajectory(start_lane, start_offset, goal_lane, goal_offset,
+                                speed=random.uniform(0.8, 1.8),
+                                sample_rate=PEDESTRIAN_SAMPLE_RATE,
+                                max_points=PEDESTRIAN_TRAJECTORY_POINTS)
+    return points, network.point(goal_lane, goal_offset)
+
+
+def pedestrian_motion(points):
+    """Native coordinates negate map x/y; velocities are metres per second."""
+    from pufferlib.ocean.drive.pedestrian_routing import pedestrian_motion as motion
+    return motion(points, PEDESTRIAN_SAMPLE_RATE)
+
+
+def generate_pedestrians(count, placed_vehicles):
+    """Sample distinct cached replays, checking footprints and corridor capacity."""
+    if count == 0:
+        return []
+    pool = get_pedestrian_trajectory_pool()
+    scooters = round(count * pool.metadata['scooter_fraction'])
+    remaining = [count - scooters, scooters]
+    pedestrians = []
+    corridor_counts = {}
+    for index in random.sample(range(pool.size), pool.size):
+        kind = int(pool.kinds[index])
+        corridor = int(pool.corridors[index])
+        if not remaining[kind] or corridor_counts.get(corridor, 0) >= PEDESTRIANS_PER_ROUTE:
             continue
-        s = spawn_spacing / 2
-        while s <= line_length - spawn_spacing / 2:
-            pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
-            if point_in_box(pos, box):
-                candidate_positions.append((lanelet, s, pos))
-            s += spawn_spacing
-    random.shuffle(candidate_positions)
-    moving_spawn_positions = []
-    stationary_spawn_positions = []
-    moving_spawn_grid = {}
-    stationary_spawn_grid = {}
-    for lanelet, s, pos in candidate_positions:
-        if routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
-            add_spawn_position(moving_spawn_positions, moving_spawn_grid, lanelet, s, pos, min_spawn_distance)
+        sequence = pool.trajectory(index)
+        dimensions = tuple(random.uniform(*bounds) for bounds in
+                           (SCOOTER_DIMENSIONS if kind else PEDESTRIAN_DIMENSIONS))
+        pose = (-float(sequence[0, 0]), -float(sequence[1, 0]), float(sequence[4, 0]) - math.pi)
+        if vehicle_collides(pose, dimensions, placed_vehicles):
             continue
-        if lanelet.attributes["turn_direction"] != "straight" or random.random() < 1 / 2:
-            add_spawn_position(moving_spawn_positions, moving_spawn_grid, lanelet, s, pos, min_spawn_distance)
-        else:
-            line = to2D(lanelet.rightBound)
-            stationary_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
-            if point_in_box(stationary_pos, box):
-                add_spawn_position(stationary_spawn_positions, stationary_spawn_grid, lanelet, s, stationary_pos, min_spawn_distance)
-    return moving_spawn_positions, stationary_spawn_positions
+        placed_vehicles.append((pose, dimensions[:2]))
+        pedestrians.append((sequence, dimensions, pool.goals[index]))
+        corridor_counts[corridor] = corridor_counts.get(corridor, 0) + 1
+        remaining[kind] -= 1
+        if len(pedestrians) == count:
+            return pedestrians
+    raise RuntimeError(f"Only found {len(pedestrians)} of {count} collision-free pedestrian/scooter starts")
+
 
 def generate_shared_static_road_entities():
     def add_linestring_segments_in_box(entity_type, linestring, traffic_light_idx=-1):
@@ -519,7 +1077,7 @@ def generate_shared_static_road_entities():
                 traffic_light_counter += 1
 
     for linestring in lanelet2_map.lineStringLayer:
-        if "type" in linestring.attributes and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}:
+        if "type" in linestring.attributes and linestring.attributes["type"] in ROAD_BORDER_TYPES:
             add_linestring_segments_in_box(6, linestring)
         if ("subtype" in linestring.attributes and linestring.attributes["subtype"] in {"yield_manual", "yield", "yield_stop"}
             and linestring.id not in seen_traffic_light_lines):
@@ -555,52 +1113,26 @@ def get_shared_static_road_map():
         _shared_static_road_map = (count, address, owner)
     return _shared_static_road_map
 
-agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "32"))
+MAX_GENERATED_ACTORS = 10240  # Must match MAX_AGENTS in drive.h.
+agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "4096"))
+stationary_objects_per_generated_map = 2048
+pedestrians_per_generated_map = 4096
 goals_per_agent = int(os.getenv("GOALS_PER_AGENT", "8"))
 
-def generate_map(generation_attempt=0):
+def generate_map():
     # Initialize shared geometry before allocating this episode's actors.
     shared_num_roads, shared_roads_address, shared_road_map = get_shared_static_road_map()
-    max_generation_attempts = 100
-    if generation_attempt >= max_generation_attempts:
-        raise RuntimeError(f"Could not generate a collision-free map after {max_generation_attempts} attempts")
-
     num_agents = agents_per_generated_map
-    num_stationary_objects = random.randint(16, 48)
-    num_walking_pedestrians = random.randint(16, 48)
+    num_stationary_objects = stationary_objects_per_generated_map
+    num_walking_pedestrians = pedestrians_per_generated_map
+    if num_agents + num_stationary_objects + num_walking_pedestrians > MAX_GENERATED_ACTORS:
+        raise ValueError(f"Generated population exceeds native limit of {MAX_GENERATED_ACTORS} actors")
 
-    max_center_sampling_attempts = 1000
-    for _ in range(max_center_sampling_attempts):
-        if os.getenv("CENTER_LAT") is not None:
-            lat = float(os.getenv("CENTER_LAT"))
-            lon = float(os.getenv("CENTER_LON"))
-            center = to2D(projector.forward(GPSPoint(lat, lon)))
-        else:
-            center_lanelet = random.choices(
-                map_lanelets,
-                weights=map_lanelet_centerline_lengths,
-                k=1,
-            )[0]
-            centerline = to2D(center_lanelet.centerline)
-            center_offset = random.uniform(0.0, length(centerline))
-            center = interpolatedPointAtDistance(centerline, center_offset)
-
-        spawn_distance = 250
-
-        spawn_box = BoundingBox2d(
-            BasicPoint2d(center.x - spawn_distance, center.y - spawn_distance),
-            BasicPoint2d(center.x + spawn_distance, center.y + spawn_distance)
-        )
-
-        spawn_box_lanelets = lanelet2_map.laneletLayer.search(spawn_box)
-
-        moving_spawn_position_queue, stationary_spawn_position_queue = make_spawn_position_queues(spawn_box_lanelets, spawn_box)
-
-        if len(moving_spawn_position_queue) >= num_agents:
-            num_stationary_objects = min(num_stationary_objects, len(stationary_spawn_position_queue))
-            break
-    else:
-        raise RuntimeError(f"Could not find {num_agents} moving spawn positions after {max_center_sampling_attempts} attempts")
+    if len(map_spawn_positions) < num_agents:
+        raise RuntimeError(f"Requested {num_agents} vehicles, but the map has only {len(map_spawn_positions)} valid spawn positions")
+    # Moving vehicles and parked vehicles have independent lane/border pools.
+    spawn_position_queue = random.sample(map_spawn_positions, len(map_spawn_positions))
+    parked_position_queue = random.sample(map_parked_spawn_positions, len(map_parked_spawn_positions))
 
     vehicle_samples = random.choices(VEHICLE_PROFILES, weights=vehicle_weights, k=num_agents)
     vehicle_dimensions = [sample_dimensions(sample[2], 0.1) for sample in vehicle_samples]
@@ -610,31 +1142,20 @@ def generate_map(generation_attempt=0):
     spawn_headings = []
     spawn_vx = []
     spawn_vy = []
-    placed_vehicles = []
-    spawn_attempts = 0
-    max_spawn_attempts = max(len(moving_spawn_position_queue) * 4, num_agents)
+    placed_vehicles = VehicleSpawnIndex()
     i = 0
-    while i < num_agents and moving_spawn_position_queue and spawn_attempts <= max_spawn_attempts:
+    while i < num_agents and spawn_position_queue:
         is_initially_parked = random.uniform(0, 1) < 0.05
-        
-        spawn_lanelet, spawn_offset = moving_spawn_position_queue.pop()
-        lanelet, s = spawn_lanelet, spawn_offset
-
-        line = to2D(lanelet.centerline)
-
-        spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
-
-        near = interpolatedPointAtDistance(line, s+1)
-        heading = math.atan2(near.y - spawn_pos.y, near.x - spawn_pos.x)+math.pi
-
-        if is_initially_parked:
-            spawn_pos.x += math.cos(heading+math.pi/2)
-            spawn_pos.y += math.sin(heading+math.pi/2)
-
-        vehicle_pose = (spawn_pos.x, spawn_pos.y, heading)
-        if vehicle_collides(vehicle_pose, vehicle_dimensions[i], placed_vehicles):
-            spawn_attempts += 1
+        position = spawn_position_queue.pop()
+        lanelet, s = position.lanelet, position.offset
+        vehicle_pose = sample_spawn_pose(
+            position, vehicle_dimensions[i], placed_vehicles, road_border_index,
+            lateral_range=(-1.5, 0.0) if is_initially_parked else (-1.5, 1.5),
+        )
+        if vehicle_pose is None:
             continue
+        spawn_pos = BasicPoint2d(*vehicle_pose[:2])
+        heading = vehicle_pose[2] + math.pi
 
         speed_limit = 50
         if "speed_limit" in lanelet.attributes:
@@ -687,19 +1208,9 @@ def generate_map(generation_attempt=0):
             if not can_add_more_goals:
                 break
 
-        if os.getenv("ONLY_WITHIN_BOUNDARY") == "1":
-            all_in_boundary = True
-            for gp in agent_goal_positions:
-                if not point_in_box(gp, spawn_box):
-                    all_in_boundary = False
-                    break
-            if not all_in_boundary:
-                moving_spawn_position_queue.insert(0, (spawn_lanelet, spawn_offset))
-                spawn_attempts += 1
-                if spawn_attempts > max_spawn_attempts:
-                    break
-                continue
-
+        # Every requested policy vehicle must be eligible for native control.
+        if distance(spawn_pos, agent_goal_positions[0]) < 2.1:
+            continue
         spawn_positions.append(spawn_pos)
         spawn_headings.append(heading)
         spawn_vy.append(math.sin(heading)*initial_speed)
@@ -709,7 +1220,7 @@ def generate_map(generation_attempt=0):
         i += 1
 
     if i < num_agents:
-        return generate_map(generation_attempt + 1)
+        raise RuntimeError(f"Ran out of spawn positions after placing {i} of {num_agents} vehicles")
 
     candidate_stationary_samples = random.choices(
         STATIONARY_OBJECT_PROFILES,
@@ -720,21 +1231,18 @@ def generate_map(generation_attempt=0):
     stationary_spawn_positions = []
     stationary_spawn_headings = []
     for sample in candidate_stationary_samples:
-        if not stationary_spawn_position_queue:
-            break
-
         dimensions = sample_dimensions(sample[2], 0.2)
-        lanelet, s = stationary_spawn_position_queue.pop()
-        line = to2D(lanelet.rightBound)
-        spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
-        near = interpolatedPointAtDistance(line, s + 1)
-        road_heading = math.atan2(near.y - spawn_pos.y, near.x - spawn_pos.x)
-        road_normal = BasicPoint2d(math.cos(road_heading + math.pi / 2), math.sin(road_heading + math.pi / 2))
-        spawn_pos += road_normal * random.uniform(-4, 0.25)
-        heading = road_heading + random.choice([math.pi, 0]) + random.uniform(-0.5, 0.5)
-        vehicle_pose = (spawn_pos.x, spawn_pos.y, heading)
-        if vehicle_collides(vehicle_pose, dimensions, placed_vehicles):
-            continue
+        vehicle_pose = None
+        while parked_position_queue:
+            position = parked_position_queue.pop()
+            vehicle_pose = sample_parked_spawn_pose(position, dimensions, placed_vehicles, road_border_index)
+            if vehicle_pose is not None:
+                break
+        if vehicle_pose is None:
+            raise RuntimeError(f"Ran out of spawn positions after placing "
+                               f"{len(stationary_spawn_positions)} of {num_stationary_objects} parked vehicles")
+        spawn_pos = BasicPoint2d(*vehicle_pose[:2])
+        heading = vehicle_pose[2] + math.pi
 
         stationary_vehicle_dimensions.append(dimensions)
         stationary_spawn_positions.append(spawn_pos)
@@ -742,30 +1250,10 @@ def generate_map(generation_attempt=0):
         placed_vehicles.append((vehicle_pose, dimensions[:2]))
 
     num_stationary_objects = len(stationary_spawn_positions)
-
-    min_x = 1e9
-    max_x = -1e9
-    min_y = 1e9
-    max_y = -1e9
-    for point in spawn_positions + stationary_spawn_positions + [goal for goals in goal_positions for goal in goals]:
-        min_x = min(min_x, point.x)
-        max_x = max(max_x, point.x)
-        min_y = min(min_y, point.y)
-        max_y = max(max_y, point.y)
-    min_x -= 100
-    min_y -= 100
-    max_x += 100
-    max_y += 100
-    render_box = BoundingBox2d(BasicPoint2d(min_x, min_y), BasicPoint2d(max_x, max_y))
-
-    render_box_lanelets = lanelet2_map.laneletLayer.search(render_box)
-    crosswalk_lanelets = [
-        lanelet for lanelet in render_box_lanelets
-        if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "crosswalk"
-    ]
+    pedestrians = generate_pedestrians(num_walking_pedestrians, placed_vehicles)
 
     num_objects = num_agents + num_stationary_objects + num_walking_pedestrians
-    assert num_objects <= 128
+    assert num_objects <= MAX_GENERATED_ACTORS
     entities = alloc_entities(num_objects)
 
     for i in range(num_agents):
@@ -833,81 +1321,126 @@ def generate_map(generation_attempt=0):
         #ent.goal_position_z = ent.traj_z
         ent.mark_as_expert = 1
 
-    spawn_lanelets = random.choices(render_box_lanelets, weights=[length(l.centerline) for l in render_box_lanelets], k=num_walking_pedestrians)
-
-    for i in range(num_walking_pedestrians):
-        speed_multiplier = random.choice([1, 1, 1, 1, 2, 2, 3, 4])
-
-        if random.uniform(0, 1) < 0.4:
-            lanelet = spawn_lanelets[i]
-            while routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
-                lanelet = routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet)
-            line = to2D(lanelet.rightBound)
-            start_offset = random.uniform(0, 0.5) * length(line)
-            end_offset = min(start_offset + 200, length(line))
-            s = start_offset
-            distance_from_road = random.uniform(3, 8)
-            points = [fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))]
-            speed = random.uniform(0.5, 1.4)
-            while s <= end_offset:
-                segment_start = fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))
-                s += random.uniform(1, 4)
-                segment_end = fromArcCoordinates(line, ArcCoordinates(s, -distance_from_road))
-                points.extend(linear_interpolate(segment_start, segment_end, speed=speed))
-        elif not crosswalk_lanelets or random.uniform(0, 1) < 0.3:
-            lanelet = spawn_lanelets[i]
-            while routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet):
-                lanelet = routing_graph.adjacentRight(lanelet) or routing_graph.right(lanelet)
-            line = to2D(lanelet.rightBound)
-            s = random.uniform(0.1, 0.9) * length(line)
-            
-            spawn_pos = fromArcCoordinates(line, ArcCoordinates(s, 0.0))
-            near = interpolatedPointAtDistance(line, s+1)
-            road_heading = math.atan2(near.y - spawn_pos.y, near.x - spawn_pos.x)
-            road_normal = BasicPoint2d(math.cos(road_heading+math.pi/2), math.sin(road_heading+math.pi/2))
-
-            points = linear_interpolate(spawn_pos - random.uniform(0, 2) * road_normal, spawn_pos + random.uniform(15, 20) * road_normal, speed=1.4)
-        else:
-            lanelet = random.choice(crosswalk_lanelets)
-            points = get_pedestrian_crossing_route(lanelet)
-        if speed_multiplier > 1:
-            points = [points[j] for j in range(0, len(points), speed_multiplier)]
-        if random.choice([True, False]):
-            points = list(reversed(points))
-        points = points[random.randint(0, len(points)//2):]
-        points = points[:400]
-
-        heading = [0]
-        vx = [0]
-        vy = [0]
-        prev = points[0]
-        for point in points[1:]:
-            dx = point.x - prev.x
-            dy = point.y - prev.y
-            heading.append(math.atan2(dy, dx)+math.pi)
-            vx.append(dx)
-            vy.append(dy)
-            prev = point
-
+    for i, (sequence, dimensions, goal) in enumerate(pedestrians):
         ent = entities[i+num_agents+num_stationary_objects]
         ent.type = 1
-        ent.array_size = len(points)
-        ent.traj_valid = alloc_int_array([1] * len(points))
-        ent.traj_x = alloc_float_array([-p.x for p in points])
-        ent.traj_y = alloc_float_array([-p.y for p in points])
-        ent.traj_z = alloc_float_array([0 for p in points]) # TODO: Height dimension
-        ent.traj_heading = alloc_float_array(heading)
-        ent.traj_vx = alloc_float_array(vx)
-        ent.traj_vy = alloc_float_array(vy)
-        ent.traj_vz = alloc_float_array([0 for p in points])
-        ent.width = random.uniform(0.36, 0.6)
-        ent.length = random.uniform(0.2, 0.6)
-        ent.height = random.uniform(1.4, 2.2)
+        ent.array_size = sequence.shape[1]
+        zeros = np.zeros(ent.array_size, dtype=np.float32)
+        ent.traj_valid = alloc_int_array(np.ones(ent.array_size, dtype=np.int32))
+        ent.traj_x = alloc_float_array(sequence[0])
+        ent.traj_y = alloc_float_array(sequence[1])
+        ent.traj_z = alloc_float_array(zeros)
+        ent.traj_heading = alloc_float_array(sequence[4])
+        ent.traj_vx = alloc_float_array(sequence[2])
+        ent.traj_vy = alloc_float_array(sequence[3])
+        ent.traj_vz = alloc_float_array(zeros)
+        ent.width, ent.length, ent.height = dimensions
+        ent.goal_position_x = -goal[0]
+        ent.goal_position_y = -goal[1]
         ent.mark_as_expert = 1
 
     # C takes ownership of actors; roads and their grid are owned by the capsule.
     return (num_objects, shared_num_roads, addressof(entities.contents),
             shared_roads_address, shared_road_map)
+
+
+def save_map_pdf(map_tuple, path="generated_map.pdf"):
+    """Draw the full map and initial actor poses as a zoomable vector PDF."""
+    # Plotting is only needed for export; keep it out of training startup.
+    from matplotlib.collections import LineCollection, PolyCollection
+    from matplotlib.figure import Figure
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    num_objects, num_roads, entities_addr = map_tuple[:3]
+    entities = cast(c_void_p(entities_addr), POINTER(Entity))
+    roads = cast(c_void_p(map_tuple[3]), POINTER(StaticRoadEntity)) if len(map_tuple) >= 4 else None
+
+    road_styles = {
+        4: ("Lane centerlines", "#9aafc0", 0.025),
+        8: ("Crosswalks", "#b39ac9", 0.04),
+        6: ("Physical road borders", "#454b52", 0.03),
+    }
+    road_lines = {kind: [] for kind in road_styles}
+    for i in range(num_roads):
+        road = roads[i] if roads is not None else entities[num_objects + i]
+        if road.type in road_lines and road.array_size >= 2:
+            x = np.ctypeslib.as_array(road.traj_x, shape=(road.array_size,))
+            y = np.ctypeslib.as_array(road.traj_y, shape=(road.array_size,))
+            # Undo the simulator's coordinate negation for a north-up map.
+            road_lines[road.type].append(-np.column_stack((x, y)))
+
+    vehicles = []
+    stationary = []
+    pedestrians = []
+    scooters = []
+    for i in range(num_objects):
+        ent = entities[i]
+        if ent.array_size < 1 or not ent.traj_valid[0]:
+            continue
+        x, y = -ent.traj_x[0], -ent.traj_y[0]
+        # Pedestrians and scooters are expert actors with cached trajectories;
+        # parked vehicles have a single stored pose, like controlled vehicles.
+        if ent.mark_as_expert and ent.array_size > 1:
+            (scooters if ent.length > 1. else pedestrians).append((x, y))
+        else:
+            footprints = stationary if ent.mark_as_expert else vehicles
+            footprints.append(rectangle_corners(
+                x, y, ent.traj_heading[0] - math.pi, ent.width, ent.length,
+            ))
+
+    figure = Figure(figsize=(20, 20), facecolor="white")
+    ax = figure.add_axes((0.06, 0.06, 0.90, 0.84))
+    legend = []
+    for kind, (label, color, linewidth) in road_styles.items():
+        ax.add_collection(LineCollection(
+            road_lines[kind], colors=color, linewidths=linewidth, zorder=1,
+        ))
+        legend.append(Line2D([], [], color=color, linewidth=1, label=label))
+
+    # This map is loaded only for PDF export, outside the generation hot path.
+    pedestrian_color = "#808080"
+    ax.add_collection(LineCollection(
+        get_pedestrian_network().lines, colors=pedestrian_color,
+        linewidths=0.15, alpha=0.25, zorder=1.5,
+    ))
+    legend.append(Line2D([], [], color=pedestrian_color, linewidth=1, alpha=0.25,
+                         label="Pedestrian centerlines"))
+
+    for footprints, color, label in (
+        (vehicles, "#0072b2", "Controlled vehicles"),
+        (stationary, "#d55e00", "Parked vehicles"),
+    ):
+        ax.add_collection(PolyCollection(
+            footprints, facecolors=color, edgecolors="none", zorder=2,
+        ))
+        legend.append(Patch(facecolor=color, label=f"{label} ({len(footprints):,})"))
+    for actors, color, marker, label in (
+        (pedestrians, "#009e73", "o", "Pedestrians"),
+        (scooters, "#cc79a7", "^", "Electric scooters"),
+    ):
+        if actors:
+            positions = np.asarray(actors)
+            ax.scatter(positions[:, 0], positions[:, 1], s=0.15,
+                       color=color, marker=marker, edgecolors="none", zorder=3)
+        legend.append(Line2D([], [], marker=marker, linestyle="none", color=color,
+                            markersize=5, label=f"{label} ({len(actors):,})"))
+
+    ax.autoscale_view()
+    ax.margins(0.01)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Easting from map origin (m)")
+    ax.set_ylabel("Northing from map origin (m)")
+    ax.tick_params(labelsize=9)
+    ax.spines[["top", "right"]].set_visible(False)
+    figure.suptitle("Generated map — initial actor positions", y=0.985, fontsize=18)
+    figure.legend(handles=legend, loc="upper center", bbox_to_anchor=(0.5, 0.963),
+                  ncol=3, frameon=False, fontsize=11)
+    figure.text(0.5, 0.02,
+                "Vehicle footprints are to scale; pedestrian and scooter markers are enlarged for visibility. "
+                "Zoom in to inspect placement.",
+                ha="center", fontsize=10, color="#555555")
+    figure.savefig(path, format="pdf")
 
 
 def save_map_binary(map_tuple, path):
@@ -959,11 +1492,10 @@ def save_map_binary(map_tuple, path):
                 f.write(struct.pack("ffffffi", 0, 0, 0, 0, 0, 0, 0))
 
 if __name__ == "__main__":
-    #random.seed(1)
-    for _ in range(4):
-        generate_map()
     t1 = time.time()
     map_data = generate_map()
     t2 = time.time()
     print(f"took {(t2-t1)*1000:.2f} ms")
     save_map_binary(map_data, "dynamic.bin")
+    save_map_pdf(map_data, "generated_map.pdf")
+    print("Saved dynamic.bin and generated_map.pdf")

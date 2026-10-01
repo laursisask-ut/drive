@@ -27,7 +27,7 @@ class Drive(pufferlib.PufferEnv):
         resample_frequency=91,
         map_dir="resources/drive/binaries",
         num_maps=100,
-        num_agents=512,
+        num_agents=agents_per_generated_map,
         action_type="discrete",
         dynamics_model="classic",
         dynamic_map_generation=True,
@@ -124,7 +124,9 @@ class Drive(pufferlib.PufferEnv):
         self.all_maps_exactly_once = all_maps_exactly_once
 
         if self.dynamic_map_generation:
-            assert num_agents % agents_per_generated_map == 0
+            if num_agents <= 0 or num_agents % agents_per_generated_map:
+                raise ValueError(f"num_agents must be a positive multiple of {agents_per_generated_map} "
+                                 "for generated maps")
             num_envs = num_agents // agents_per_generated_map
             map_ids = [0] * num_envs
             agent_offsets = list(range(0, num_agents+agents_per_generated_map, agents_per_generated_map))
@@ -501,15 +503,15 @@ def process_all_maps():
         #     print(f"Error processing {map_path.name}: {e}")
 
 
-def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
+def test_performance(timeout=10, atn_cache=1024, num_agents=agents_per_generated_map):
     import time
 
     env = Drive(num_agents=num_agents)
     env.reset()
     tick = 0
-    num_agents = 1024
+    num_agents = env.num_agents
     actions = np.stack(
-        [np.random.randint(0, space.n + 1, (atn_cache, num_agents)) for space in env.single_action_space], axis=-1
+        [np.random.randint(0, space.n, (atn_cache, num_agents)) for space in env.single_action_space], axis=-1
     )
 
     start = time.time()

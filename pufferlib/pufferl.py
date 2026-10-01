@@ -242,13 +242,16 @@ class PuffeRL:
         # Torch compile
         self.uncompiled_policy = policy
         self.policy = policy
+        self.policy_eval = policy.forward_eval
         if config["compile"]:
             self.policy = torch.compile(policy, mode=config["compile_mode"])
-            self.policy.forward_eval = torch.compile(policy, mode=config["compile_mode"])
+            self.policy_eval = torch.compile(policy.forward_eval, mode=config["compile_mode"])
             pufferlib.pytorch.sample_logits = torch.compile(
                 pufferlib.pytorch.sample_logits, mode=config["compile_mode"]
             )
-        self.anchor_policy = None if anchor_policy is None else torch.compile(anchor_policy)
+        self.anchor_policy = anchor_policy
+        if anchor_policy is not None and config["compile"]:
+            self.anchor_policy = torch.compile(anchor_policy, mode=config["compile_mode"])
 
         # Optimizer
         if config["optimizer"] == "adam":
@@ -288,11 +291,12 @@ class PuffeRL:
 
         # Automatic mixed precision
         precision = config["precision"]
-        self.amp_context = contextlib.nullcontext()
-        if config.get("amp", True) and config["device"] == "cuda":
-            self.amp_context = torch.amp.autocast(device_type="cuda", dtype=getattr(torch, precision))
         if precision not in ("float32", "bfloat16"):
             raise pufferlib.APIUsageError(f"Invalid precision: {precision}: use float32 or bfloat16")
+        self.amp_context = contextlib.nullcontext
+        if config.get("amp", True) and config["device"] == "cuda":
+            amp_dtype = getattr(torch, precision)
+            self.amp_context = lambda: torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
 
         # Initializations
         self.config = config
@@ -417,7 +421,7 @@ class PuffeRL:
             batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
 
             profile("eval_forward", epoch)
-            with torch.no_grad(), self.amp_context:
+            with torch.no_grad(), self.amp_context():
                 state = dict(
                     reward=r,
                     done=d,
@@ -439,7 +443,7 @@ class PuffeRL:
                     state["lstm_h"] = lstm_h
                     state["lstm_c"] = lstm_c
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                logits, value = self.policy_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -513,7 +517,6 @@ class PuffeRL:
 
         for mb in range(self.total_minibatches):
             profile("train_misc", epoch, nest=True)
-            self.amp_context.__enter__()
 
             shape = self.values.shape
             advantages = torch.zeros(shape, device=device)
@@ -578,8 +581,9 @@ class PuffeRL:
                     lstm_c=None,
                 )
 
-            logits, newvalue = self.policy(mb_obs, state)
-            actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
+            with self.amp_context():
+                logits, newvalue = self.policy(mb_obs, state)
+                actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile("train_misc", epoch)
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
@@ -637,13 +641,12 @@ class PuffeRL:
             profile("train_anchor", epoch)
             behavior_anchor_kl_div = 0
             if self.anchor_policy is not None:
-                with torch.no_grad():
+                with torch.no_grad(), self.amp_context():
                     regularizer_logits, _ = self.anchor_policy(mb_obs, state)
                     behavior_anchor_kl_div = sum(pufferlib.pytorch.kl_div(p, q).mean() for p, q in zip(regularizer_logits, logits))
 
             profile("train_misc", epoch)
-            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.075 * behavior_anchor_kl_div
-            self.amp_context.__enter__()  # TODO: AMP needs some debugging
+            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.025 * behavior_anchor_kl_div
 
             # This breaks vloss clipping?
             if config["use_rnn"]:
@@ -669,9 +672,10 @@ class PuffeRL:
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
-                losses["grad_norm"] += grad_norm.item()
+                grad_norm = grad_norm.item()
+                losses["grad_norm"] += grad_norm
                 grad_norm_steps += 1
-                if self.is_grad_finite():
+                if np.isfinite(grad_norm):
                     self.optimizer.step()
                 else:
                     print("Gradient is not finite, skipping parameter update!")
@@ -1064,7 +1068,8 @@ class PuffeRL:
             state = None
 
         for _ in range(max_scenario_length):
-            logits, _value = self.policy.forward_eval(torch.as_tensor(observations).to(device), state)
+            with self.amp_context():
+                logits, _value = self.policy_eval(torch.as_tensor(observations).to(device), state)
             actions = torch.stack([l.argmax(dim=-1) for l in logits], dim=-1)
             observations, _rewards, _terminals, _truncations, info = env.step(actions.cpu())
 

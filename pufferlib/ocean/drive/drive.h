@@ -39,6 +39,8 @@
 
 // Actions
 #define NOOP 0
+#define MAX_ACTION_DELAY_STEPS 5
+#define ACTION_QUEUE_CAPACITY (MAX_ACTION_DELAY_STEPS + 1)
 
 // Dynamics Models
 #define CLASSIC 0
@@ -64,7 +66,7 @@
 
 // Max road segment observation entities
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 200
-#define MAX_AGENTS 128
+#define MAX_AGENTS 10240  // Total actors: 4096 policy vehicles + 2048 parked + 4096 pedestrians.
 #define MAX_VISIBLE_AGENTS 64
 // Observation Space Constants
 #define MAX_SPEED 27.7f
@@ -82,6 +84,7 @@
 #define MAX_ROAD_SEGMENT_LENGTH 100.0f
 
 #define MAX_EXPORT_STEPS 1000
+#define MAX_REPLAY_AGENTS 64  // First controlled-agent slots in each recorded map.
 #define REPLAY_ACTION_COMPONENT_COUNT 2
 #define REPLAY_ACTION_ACCELERATION_IDX 0
 #define REPLAY_ACTION_STEERING_IDX 1
@@ -247,6 +250,12 @@ struct Entity {
     float jerk_lat;
     float steering_angle;
     float wheelbase;
+
+    // Private actuator state; delay is fixed for an episode. Discrete indices
+    // and continuous commands both fit exactly in these two-component rows.
+    int action_delay_steps;
+    int action_queue_head;
+    float action_queue[ACTION_QUEUE_CAPACITY][2];
 };
 
 typedef struct StaticRoadEntity StaticRoadEntity;
@@ -414,6 +423,8 @@ typedef struct StaticRoadMap {
 } StaticRoadMap;
 
 struct ReplayExportLog {
+    int capacity;
+    int num_agents;
     float* traj_x;
     float* traj_y;
     float* traj_z;
@@ -666,10 +677,11 @@ static inline void record_reward_component(Drive* env, int agent_slot, int compo
 
     if (env->export_replay_enabled &&
         env->export_log.reward_components != NULL &&
-        env->timestep < MAX_EXPORT_STEPS &&
+        agent_slot < env->export_log.num_agents &&
+        env->timestep < env->export_log.capacity &&
         component < REPLAY_REWARD_COMPONENT_COUNT) {
         size_t export_idx =
-            ((size_t)agent_slot * MAX_EXPORT_STEPS + (size_t)env->timestep) * REPLAY_REWARD_COMPONENT_COUNT +
+            ((size_t)agent_slot * env->export_log.capacity + (size_t)env->timestep) * REPLAY_REWARD_COMPONENT_COUNT +
             (size_t)component;
         env->export_log.reward_components[export_idx] += reward;
     }
@@ -738,14 +750,34 @@ static inline void record_discrete_classic_action(
 
     if (!env->export_replay_enabled ||
         env->export_log.action_indices == NULL ||
-        env->timestep >= MAX_EXPORT_STEPS) {
+        agent_slot >= env->export_log.num_agents ||
+        env->timestep >= env->export_log.capacity) {
         return;
     }
 
     size_t export_idx =
-        ((size_t)agent_slot * MAX_EXPORT_STEPS + (size_t)env->timestep) * REPLAY_ACTION_COMPONENT_COUNT;
+        ((size_t)agent_slot * env->export_log.capacity + (size_t)env->timestep) * REPLAY_ACTION_COMPONENT_COUNT;
     env->export_log.action_indices[export_idx + REPLAY_ACTION_ACCELERATION_IDX] = acceleration_index;
     env->export_log.action_indices[export_idx + REPLAY_ACTION_STEERING_IDX] = steering_index;
+}
+
+
+static void record_replay_trajectories(Drive* env) {
+    if (!env->export_replay_enabled || !env->export_log.traj_x ||
+        env->timestep < 0 || env->timestep >= env->export_log.capacity) return;
+
+    // Replay slots match agent_XX.bin / observation rows, rather than entity IDs.
+    for (int slot = 0; slot < env->export_log.num_agents; slot++) {
+        const Entity* e = &env->entities[env->active_agent_indices[slot]];
+        size_t index = (size_t)slot * env->export_log.capacity + env->timestep;
+        env->export_log.traj_x[index] = e->x;
+        env->export_log.traj_y[index] = e->y;
+        env->export_log.traj_z[index] = e->z;
+        env->export_log.traj_vx[index] = e->vx;
+        env->export_log.traj_vy[index] = e->vy;
+        env->export_log.traj_vz[index] = e->vz;
+        env->export_log.heading[index] = e->heading;
+    }
 }
 
 
@@ -971,6 +1003,41 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     return entities;
 }
 
+static void clear_action_queue(const Drive* env, Entity* agent) {
+    float longitudinal = 0.0f, lateral = 0.0f;
+    if (env->action_type != 1) {
+        longitudinal = env->dynamics_model == CLASSIC ? 3.0f : 2.0f;
+        lateral = env->dynamics_model == CLASSIC ? 6.0f : 1.0f;
+    }
+    agent->action_queue_head = 0;
+    for (int i = 0; i < ACTION_QUEUE_CAPACITY; i++) {
+        agent->action_queue[i][0] = longitudinal;
+        agent->action_queue[i][1] = lateral;
+    }
+}
+
+static void reset_action_delay(const Drive* env, Entity* agent) {
+    // Rejection avoids modulo bias, so each delay from 0 through 5 is equally likely.
+    const unsigned int choices = MAX_ACTION_DELAY_STEPS + 1;
+    const unsigned int limit = (unsigned int)RAND_MAX - ((unsigned int)RAND_MAX + 1u) % choices;
+    unsigned int sample;
+    do {
+        sample = (unsigned int)rand();
+    } while (sample > limit);
+    agent->action_delay_steps = sample % choices;
+    clear_action_queue(env, agent);
+}
+
+static void delay_agent_action(Entity* agent, float action[2]) {
+    int head = agent->action_queue_head;
+    agent->action_queue[head][0] = action[0];
+    agent->action_queue[head][1] = action[1];
+    int delayed = (head + ACTION_QUEUE_CAPACITY - agent->action_delay_steps) % ACTION_QUEUE_CAPACITY;
+    action[0] = agent->action_queue[delayed][0];
+    action[1] = agent->action_queue[delayed][1];
+    agent->action_queue_head = (head + 1) % ACTION_QUEUE_CAPACITY;
+}
+
 void set_start_position(Drive* env){
     //InitWindow(800, 600, "GPU Drive");
     //BeginDrawing();
@@ -1037,17 +1104,9 @@ void set_start_position(Drive* env){
         e->jerk_lat = 0.0f;
         e->steering_angle = 0.0f;
         if (e->wheelbase == 0.0f) e->wheelbase = 0.6f * e->length;
-
-        if (env->export_log.traj_x) {
-            env->export_log.traj_x[i*MAX_EXPORT_STEPS+step] = e->x;
-            env->export_log.traj_y[i*MAX_EXPORT_STEPS+step] = e->y;
-            env->export_log.traj_z[i*MAX_EXPORT_STEPS+step] = e->z;
-            env->export_log.traj_vx[i*MAX_EXPORT_STEPS+step] = e->vx;
-            env->export_log.traj_vy[i*MAX_EXPORT_STEPS+step] = e->vy;
-            env->export_log.traj_vz[i*MAX_EXPORT_STEPS+step] = e->vz;
-            env->export_log.heading[i*MAX_EXPORT_STEPS+step] = e->heading;
-        }
+        if (is_active) reset_action_delay(env, e);
     }
+    record_replay_trajectories(env);
     //EndDrawing();
 }
 
@@ -1479,7 +1538,7 @@ int collision_check(Drive* env, int agent_idx) {
 
     if (agent->respawn_timestep != -1) return car_collided_with_index; // Skip respawning entities
 
-    for(int i = 0; i < MAX_AGENTS; i++){
+    for(int i = 0; i < env->num_controllable_agents; i++){
         int index = -1;
         if(i < env->active_agent_count){
             index = env->active_agent_indices[i];
@@ -1926,6 +1985,7 @@ legacy_select:
     }
     int first_agent_id = env->num_objects-1;
     float distance_to_goal = valid_active_agent(env, first_agent_id);
+    int first_agent_selected = distance_to_goal > 0;
     if(distance_to_goal){
         env->active_agent_count = 1;
         active_agent_indices[0] = first_agent_id;
@@ -1935,7 +1995,10 @@ legacy_select:
         env->active_agent_count = 0;
         env->num_controllable_agents = 0;
     }
-    for(int i = 0; i < env->num_objects-1 && env->num_controllable_agents < MAX_AGENTS; i++){
+    for(int i = 0; i < env->num_objects && env->num_controllable_agents < MAX_AGENTS; i++){
+        // The last actor is selected first only when it is policy-eligible.
+        // Otherwise include it here, particularly when it is an expert pedestrian.
+        if (i == first_agent_id && first_agent_selected) continue;
 
         // Check if the entity type is controllable
         int is_type_controllable;
@@ -2081,12 +2144,12 @@ static void saveAgentObservationsReplayToFile(Drive* env) {
     int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
 
-    float (*obs)[MAX_EXPORT_STEPS][max_obs] = (float(*)[MAX_EXPORT_STEPS][max_obs]) env->export_log.observations;
-    float (*reward_components)[MAX_EXPORT_STEPS][REPLAY_REWARD_COMPONENT_COUNT] =
-        (float(*)[MAX_EXPORT_STEPS][REPLAY_REWARD_COMPONENT_COUNT]) env->export_log.reward_components;
-    int (*action_indices)[MAX_EXPORT_STEPS][REPLAY_ACTION_COMPONENT_COUNT] =
-        (int(*)[MAX_EXPORT_STEPS][REPLAY_ACTION_COMPONENT_COUNT]) env->export_log.action_indices;
-    int exported_steps = fmin(env->timestep+1, MAX_EXPORT_STEPS);
+    float (*obs)[env->export_log.capacity][max_obs] = (float(*)[env->export_log.capacity][max_obs]) env->export_log.observations;
+    float (*reward_components)[env->export_log.capacity][REPLAY_REWARD_COMPONENT_COUNT] =
+        (float(*)[env->export_log.capacity][REPLAY_REWARD_COMPONENT_COUNT]) env->export_log.reward_components;
+    int (*action_indices)[env->export_log.capacity][REPLAY_ACTION_COMPONENT_COUNT] =
+        (int(*)[env->export_log.capacity][REPLAY_ACTION_COMPONENT_COUNT]) env->export_log.action_indices;
+    int exported_steps = fmin(env->timestep+1, env->export_log.capacity);
     size_t obs_count = (size_t)exported_steps * (size_t)max_obs;
     size_t uncompressed_bytes = obs_count * sizeof(float);
     if (uncompressed_bytes > INT_MAX) {
@@ -2126,7 +2189,7 @@ static void saveAgentObservationsReplayToFile(Drive* env) {
         return;
     }
 
-    for (int i = 0; i < env->active_agent_count; i++) {
+    for (int i = 0; i < env->export_log.num_agents; i++) {
         char file_name[256];
         sprintf(file_name, "%s/agent_%02d.bin", env->replay_dir, i);
 
@@ -2190,30 +2253,30 @@ static void saveReplayToFile(Drive* env) {
     char file_name[256];
     sprintf(file_name, "%s/%s", env->replay_dir, "replay.bin");
 
-    FILE* file = fopen(file_name, "w");
+    FILE* file = fopen(file_name, "wb");
     if (file == NULL) {
         fprintf(stderr, "failed to open replay file for writing\n");
         return;
     }
 
-    fwrite(&env->num_objects, sizeof(int), 1, file);
+    fwrite(&env->export_log.num_agents, sizeof(int), 1, file);
     fwrite(&env->num_roads, sizeof(int), 1, file);
 
-    int exported_steps = fmin(env->timestep+1, MAX_EXPORT_STEPS);
+    int exported_steps = fmin(env->timestep+1, env->export_log.capacity);
 
-    for (int i = 0; i < env->num_objects; i++) {
-        Entity* e = &env->entities[i];
+    for (int i = 0; i < env->export_log.num_agents; i++) {
+        Entity* e = &env->entities[env->active_agent_indices[i]];
         fwrite(&e->type, sizeof(int), 1, file);
 
         if (e->type == VEHICLE || e->type == PEDESTRIAN || e->type == CYCLIST) {
             fwrite(&exported_steps, sizeof(int), 1, file);
-            fwrite(env->export_log.traj_x + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
-            fwrite(env->export_log.traj_y + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
-            fwrite(env->export_log.traj_z + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
-            fwrite(env->export_log.traj_vx + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
-            fwrite(env->export_log.traj_vy + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
-            fwrite(env->export_log.traj_vz + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
-            fwrite(env->export_log.heading + i * MAX_EXPORT_STEPS, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.traj_x + i * env->export_log.capacity, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.traj_y + i * env->export_log.capacity, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.traj_z + i * env->export_log.capacity, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.traj_vx + i * env->export_log.capacity, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.traj_vy + i * env->export_log.capacity, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.traj_vz + i * env->export_log.capacity, sizeof(float), exported_steps, file);
+            fwrite(env->export_log.heading + i * env->export_log.capacity, sizeof(float), exported_steps, file);
             for (int t = 0; t < exported_steps; t++) {
                 int valid = 1;
                 fwrite(&valid, sizeof(int), 1, file);
@@ -2342,6 +2405,22 @@ float normalize_value(float value, float min, float max){
 
 void move_dynamics(Drive* env, int action_idx, int agent_idx){
     Entity* agent = &env->entities[agent_idx];
+    float action[2];
+    if (env->action_type == 1) {
+        const float (*issued)[2] = (const float(*)[2])env->actions;
+        action[0] = issued[action_idx][0];
+        action[1] = issued[action_idx][1];
+    } else {
+        const int (*issued)[2] = (const int(*)[2])env->actions;
+        action[0] = issued[action_idx][0];
+        action[1] = issued[action_idx][1];
+        if (env->dynamics_model == CLASSIC) {
+            // Logs/replays describe the issued policy action, as before. Only
+            // the dynamics consume a delayed command; the input buffer is read-only.
+            record_discrete_classic_action(env, action_idx, issued[action_idx][0], issued[action_idx][1]);
+        }
+    }
+    delay_agent_action(agent, action);
 
     if (env->dynamics_model == CLASSIC) {
         // Classic dynamics model
@@ -2349,18 +2428,14 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         float steering = 0.0f;
 
         if (env->action_type == 1) { // continuous
-            float (*action_array_f)[2] = (float(*)[2])env->actions;
-            acceleration = action_array_f[action_idx][0];
-            steering = action_array_f[action_idx][1];
+            acceleration = action[0];
+            steering = action[1];
 
             acceleration *= ACCELERATION_VALUES[6];
             steering *= STEERING_VALUES[12];
         } else { // discrete
-            int (*action_array)[2] = (int(*)[2])env->actions;
-            int acceleration_index = action_array[action_idx][0];
-            int steering_index = action_array[action_idx][1];
-
-            record_discrete_classic_action(env, action_idx, acceleration_index, steering_index);
+            int acceleration_index = (int)action[0];
+            int steering_index = (int)action[1];
             acceleration = ACCELERATION_VALUES[acceleration_index];
             steering = STEERING_VALUES[steering_index];
         }
@@ -2434,11 +2509,9 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         // Extract action components
         float a_long, a_lat;
         if (env->action_type == 1) { // continuous
-            float (*action_array_f)[2] = (float(*)[2])env->actions;
-
             // Asymmetric scaling for longitudinal jerk to match discrete action space
             // Discrete: JERK_LONG = [-15, -4, 0, 4] (more braking than acceleration)
-            float a_long_action = action_array_f[action_idx][0];  // [-1, 1]
+            float a_long_action = action[0];  // [-1, 1]
             if (a_long_action < 0) {
                 a_long = a_long_action * (-JERK_LONG[0]);  // Negative: [-1, 0] → [-15, 0] (braking)
             } else {
@@ -2446,11 +2519,10 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
             }
 
             // Symmetric scaling for lateral jerk
-            a_lat = action_array_f[action_idx][1] * JERK_LAT[2];
+            a_lat = action[1] * JERK_LAT[2];
         } else { // discrete
-            int (*action_array)[2] = (int(*)[2])env->actions;
-            int a_long_idx = action_array[action_idx][0];
-            int a_lat_idx = action_array[action_idx][1];
+            int a_long_idx = (int)action[0];
+            int a_lat_idx = (int)action[1];
             a_long = JERK_LONG[a_long_idx];
             a_lat = JERK_LAT[a_lat_idx];
         }
@@ -2529,7 +2601,96 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
     return;
 }
 
+// A separate actor index is rebuilt from current positions for each observation
+// update. Road geometry stays in the shared, immutable GridMap.
+#define ACTOR_OBSERVATION_CELL_SIZE 50.0f
+#define ACTOR_OBSERVATION_BUCKETS 16384  // Power of two; hash collisions are harmless.
+#define ACTOR_OBSERVATION_WORDS ((MAX_AGENTS + 63) / 64)
+
+typedef struct {
+    int heads[ACTOR_OBSERVATION_BUCKETS];
+    int next[MAX_AGENTS];
+    int usable;
+} ActorObservationGrid;
+
+static inline int observation_actor_index(const Drive* env, int rank) {
+    return rank < env->active_agent_count
+        ? env->active_agent_indices[rank]
+        : env->static_car_indices[rank - env->active_agent_count];
+}
+
+static int actor_observation_cell(float position, int* cell) {
+    double value = floor((double)position / ACTOR_OBSERVATION_CELL_SIZE);
+    // Fall back to the original scan if coordinates cannot be indexed safely.
+    if (!isfinite(value) || value <= INT_MIN || value >= INT_MAX) return 0;
+    *cell = (int)value;
+    return 1;
+}
+
+static inline unsigned actor_observation_bucket(int x, int y) {
+    return ((uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u)
+        & (ACTOR_OBSERVATION_BUCKETS - 1);
+}
+
+static void build_actor_observation_grid(const Drive* env, ActorObservationGrid* grid) {
+    grid->usable = 0;
+    // For small scenarios a direct scan costs less than constructing the grid.
+    if (env->num_controllable_agents <= 128) return;
+    assert(env->num_controllable_agents <= MAX_AGENTS);
+    memset(grid->heads, -1, sizeof(grid->heads));
+    for (int rank = 0; rank < env->num_controllable_agents; rank++) {
+        const Entity* entity = &env->entities[observation_actor_index(env, rank)];
+        int x, y;
+        if (!actor_observation_cell(entity->x, &x) || !actor_observation_cell(entity->y, &y)) return;
+        unsigned bucket = actor_observation_bucket(x, y);
+        grid->next[rank] = grid->heads[bucket];
+        grid->heads[bucket] = rank;
+    }
+    grid->usable = 1;
+}
+
+static int nearby_observation_actors(const Drive* env, const ActorObservationGrid* grid,
+                                    const Entity* ego, int* indices) {
+    int count = 0;
+    if (ego->hide_other_vehicles || ego->respawn_timestep != -1) return 0;
+    int min_x, max_x, min_y, max_y;
+    if (!grid->usable ||
+        !actor_observation_cell(ego->x - ACTOR_OBSERVATION_CELL_SIZE, &min_x) ||
+        !actor_observation_cell(ego->x + ACTOR_OBSERVATION_CELL_SIZE, &max_x) ||
+        !actor_observation_cell(ego->y - ACTOR_OBSERVATION_CELL_SIZE, &min_y) ||
+        !actor_observation_cell(ego->y + ACTOR_OBSERVATION_CELL_SIZE, &max_y)) {
+        for (int rank = 0; rank < env->num_controllable_agents; rank++)
+            indices[count++] = observation_actor_index(env, rank);
+        return count;
+    }
+
+    // Bits represent the original active-then-background order. This preserves
+    // observation ordering and the 63-partner cutoff, and deduplicates buckets
+    // when two neighboring cells hash to the same bucket.
+    uint64_t candidates[ACTOR_OBSERVATION_WORDS] = {0};
+    for (int y = min_y; y <= max_y; y++) {
+        for (int x = min_x; x <= max_x; x++) {
+            unsigned bucket = actor_observation_bucket(x, y);
+            for (int rank = grid->heads[bucket]; rank != -1; rank = grid->next[rank])
+                candidates[rank / 64] |= UINT64_C(1) << (rank % 64);
+        }
+    }
+    int words = (env->num_controllable_agents + 63) / 64;
+    for (int word = 0; word < words; word++) {
+        uint64_t bits = candidates[word];
+        while (bits) {
+            int rank = word * 64 + __builtin_ctzll(bits);
+            indices[count++] = observation_actor_index(env, rank);
+            bits &= bits - 1;
+        }
+    }
+    return count;
+}
+
 void compute_observations(Drive* env) {
+    ActorObservationGrid actor_grid;
+    build_actor_observation_grid(env, &actor_grid);
+    int nearby_actors[MAX_AGENTS];
     int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs*env->active_agent_count*sizeof(float));
@@ -2616,14 +2777,9 @@ void compute_observations(Drive* env) {
         // Relative Pos of other cars
         int obs_idx = ego_dim;
         int cars_seen = 0;
-        for(int j = 0; j < MAX_AGENTS && !ego_entity->hide_other_vehicles && cars_seen < MAX_VISIBLE_AGENTS - 1; j++) {
-            int index = -1;
-            if(j < env->active_agent_count){
-                index = env->active_agent_indices[j];
-            } else if (j < env->num_controllable_agents){
-                index = env->static_car_indices[j - env->active_agent_count];
-            }
-            if(index == -1) continue;
+        int nearby_count = nearby_observation_actors(env, &actor_grid, ego_entity, nearby_actors);
+        for(int j = 0; j < nearby_count && cars_seen < MAX_VISIBLE_AGENTS - 1; j++) {
+            int index = nearby_actors[j];
             if(env->entities[index].type > 3) break;
             if(index == env->active_agent_indices[i]) continue;  // Skip self, but don't increment obs_idx
             Entity* other_entity = &env->entities[index];
@@ -2744,8 +2900,9 @@ void compute_observations(Drive* env) {
         // Set the entire block to 0 at once
         memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
 
-        if (env->export_replay_enabled && env->export_log.observations && env->timestep < MAX_EXPORT_STEPS) {
-            float (*export_obs)[MAX_EXPORT_STEPS][max_obs] = (float (*)[MAX_EXPORT_STEPS][max_obs]) env->export_log.observations;
+        if (env->export_replay_enabled && env->export_log.observations &&
+            i < env->export_log.num_agents && env->timestep < env->export_log.capacity) {
+            float (*export_obs)[env->export_log.capacity][max_obs] = (float (*)[env->export_log.capacity][max_obs]) env->export_log.observations;
             memcpy(&export_obs[i][env->timestep][0], obs, max_obs * sizeof(float));
         }
     }
@@ -2892,30 +3049,36 @@ void c_reset(Drive* env){
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
 
     if (env->export_replay_enabled && env->export_log.traj_x == NULL) {
-        env->export_log.traj_x = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
-        env->export_log.traj_y = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
-        env->export_log.traj_z = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
-        env->export_log.traj_vx = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
-        env->export_log.traj_vy = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
-        env->export_log.traj_vz = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
-        env->export_log.heading = calloc(env->num_objects * MAX_EXPORT_STEPS, sizeof(float));
+        env->export_log.num_agents = env->active_agent_count < MAX_REPLAY_AGENTS
+            ? env->active_agent_count : MAX_REPLAY_AGENTS;
+        env->export_log.capacity = env->scenario_length < MAX_EXPORT_STEPS - 2
+            ? env->scenario_length + 2 : MAX_EXPORT_STEPS;
+        if (env->export_log.capacity < 1) env->export_log.capacity = 1;
+        size_t actor_steps = (size_t)env->export_log.num_agents * env->export_log.capacity;
+        env->export_log.traj_x = calloc(actor_steps, sizeof(float));
+        env->export_log.traj_y = calloc(actor_steps, sizeof(float));
+        env->export_log.traj_z = calloc(actor_steps, sizeof(float));
+        env->export_log.traj_vx = calloc(actor_steps, sizeof(float));
+        env->export_log.traj_vy = calloc(actor_steps, sizeof(float));
+        env->export_log.traj_vz = calloc(actor_steps, sizeof(float));
+        env->export_log.heading = calloc(actor_steps, sizeof(float));
 
         int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
         int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
-        env->export_log.observations = calloc(env->active_agent_count * max_obs * MAX_EXPORT_STEPS, sizeof(float));
+        env->export_log.observations = calloc(actor_steps * max_obs, sizeof(float));
         env->export_log.reward_components =
-            calloc(env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_REWARD_COMPONENT_COUNT, sizeof(float));
+            calloc(actor_steps * REPLAY_REWARD_COMPONENT_COUNT, sizeof(float));
         env->export_log.action_indices =
-            malloc(env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_ACTION_COMPONENT_COUNT * sizeof(int));
+            malloc(actor_steps * REPLAY_ACTION_COMPONENT_COUNT * sizeof(int));
     }
     if (env->export_replay_enabled && env->export_log.reward_components != NULL) {
         memset(
             env->export_log.reward_components,
             0,
-            env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_REWARD_COMPONENT_COUNT * sizeof(float));
+            (size_t)env->export_log.num_agents * env->export_log.capacity * REPLAY_REWARD_COMPONENT_COUNT * sizeof(float));
     }
     if (env->export_replay_enabled && env->export_log.action_indices != NULL) {
-        size_t action_count = (size_t)env->active_agent_count * MAX_EXPORT_STEPS * REPLAY_ACTION_COMPONENT_COUNT;
+        size_t action_count = (size_t)env->export_log.num_agents * env->export_log.capacity * REPLAY_ACTION_COMPONENT_COUNT;
         for (size_t i = 0; i < action_count; i++) {
             env->export_log.action_indices[i] = -1;
         }
@@ -2987,6 +3150,7 @@ void respawn_agent(Drive* env, int agent_idx){
     env->entities[agent_idx].jerk_lat = 0.0f;
     env->entities[agent_idx].steering_angle = 0.0f;
     env->entities[agent_idx].multi_goal_idx = 0;
+    clear_action_queue(env, &env->entities[agent_idx]);
 }
 
 float compute_distance_to_goal(Entity* e) {
@@ -3208,19 +3372,7 @@ void c_step(Drive* env){
         env->logs[i].avg_displacement_error = current_ade;
     }
 
-    if (env->export_replay_enabled && env->timestep < MAX_EXPORT_STEPS) {
-        for (int i = 0; i < env->num_objects; i++) {
-            int export_idx = i*MAX_EXPORT_STEPS+env->timestep;
-            Entity* e = &env->entities[i];
-            env->export_log.traj_x[export_idx] = e->x;
-            env->export_log.traj_y[export_idx] = e->y;
-            env->export_log.traj_z[export_idx] = e->z;
-            env->export_log.traj_vx[export_idx] = e->vx;
-            env->export_log.traj_vy[export_idx] = e->vy;
-            env->export_log.traj_vz[export_idx] = e->vz;
-            env->export_log.heading[export_idx] = e->heading;
-        }
-    }
+    record_replay_trajectories(env);
 
     compute_observations(env);
 }
