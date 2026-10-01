@@ -258,7 +258,6 @@ int eval_gif(const char* map_name, const char* policy_name, const char* model_pa
     int effective_deterministic_selection = deterministic_selection
         ? 1
         : conf.deterministic_agent_selection;
-    printf("control all agents before allocation is %d\n", conf.control_all_agents);
 
     Drive env = {
         .dynamics_model = conf.dynamics_model,
