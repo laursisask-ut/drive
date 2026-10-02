@@ -1,4 +1,5 @@
 #include "torch_model.h"
+#include "observation.h"
 
 #include <torch/cuda.h>
 #include <torch/torch.h>
@@ -244,7 +245,7 @@ torch::Tensor road_one_hot(const torch::Tensor& road_objects) {
         torch::indexing::Slice(),
         6});
     torch::Tensor road_onehot =
-        torch::one_hot(road_categorical.to(torch::kLong), 7).to(torch::kFloat32);
+        torch::one_hot(road_categorical.to(torch::kLong), 8).to(torch::kFloat32);
     return torch::cat({road_continuous, road_onehot}, 2);
 }
 
@@ -267,7 +268,7 @@ struct DrivePolicyImpl : torch::nn::Module {
         road_encoder = register_module(
             "road_encoder",
             torch::nn::Sequential(
-                torch::nn::Linear(13, input_size),
+                torch::nn::Linear(14, input_size),
                 torch::nn::LayerNorm(torch::nn::LayerNormOptions({input_size})),
                 torch::nn::Linear(input_size, input_size)));
         partner_encoder = register_module(
@@ -427,18 +428,16 @@ TORCH_MODULE(SceneEncoderBlock);
 struct SceneEncoderImpl : torch::nn::Module {
     SceneEncoderImpl(int64_t ego_dim_, int64_t hidden_dim_, int num_blocks)
         : ego_dim(ego_dim_), hidden_dim(hidden_dim_) {
-        ego_state_indices = {2, 3, 4, 5, 6, 13, 14, 15};
-        if (ego_dim == 23) {
-            ego_state_indices.insert(ego_state_indices.end(), {20, 21, 22});
-        }
-        goal_indices = {0, 1, 18, 19};
-        next_goal_indices = {16, 17};
-        reward_pref_indices = {7, 8, 9, 10, 11, 12};
+        for (int i = 7; i < 12; i++) ego_state_indices.push_back(i);
+        for (int i = 18; i < ego_dim; i++) ego_state_indices.push_back(i);
+        goal_indices = {12, 13, 16, 17};
+        next_goal_indices = {14, 15};
+        for (int i = 0; i < 7; i++) reward_pref_indices.push_back(i);
 
         map_proj = register_module(
             "map_proj",
             torch::nn::Sequential(
-                torch::nn::Linear(13, hidden_dim),
+                torch::nn::Linear(14, hidden_dim),
                 torch::nn::ReLU()));
         vehicle_proj = register_module(
             "vehicle_proj",
@@ -717,6 +716,9 @@ extern "C" TorchModel* torch_model_load(
         std::string name(model_name);
         if (name == "Drive") {
             int64_t ego_dim = dim1(state, "policy.ego_encoder.0.weight");
+            if (ego_dim != drive_ego_features(dynamics_model)) {
+                throw std::runtime_error("Drive checkpoint uses an incompatible observation layout; retrain for ego history");
+            }
             int64_t input_size = dim0(state, "policy.ego_encoder.0.weight");
             int64_t hidden_size = dim0(state, "policy.shared_embedding.1.weight");
             int64_t action_size = dim0(state, "policy.actor.weight");
@@ -736,7 +738,12 @@ extern "C" TorchModel* torch_model_load(
         } else if (name == "Wayformer") {
             int64_t hidden_dim = dim0(state, "encoder.map_proj.0.weight");
             int64_t ego_state_dim = dim1(state, "encoder.ego_state_proj.0.weight");
-            int64_t ego_dim = ego_state_dim == 11 ? 23 : 20;
+            int64_t ego_dim = drive_ego_features(dynamics_model);
+            // Seven preferences, four goal features and two next-goal features
+            // have their existing tokens; everything else is in the ego token.
+            if (ego_state_dim != ego_dim - 13) {
+                throw std::runtime_error("Wayformer checkpoint uses an incompatible observation layout; retrain for ego history");
+            }
             int64_t action_size = dim0(state, "decoder.actor.weight");
             int encoder_blocks = count_indexed_prefix(state, "encoder.blocks.");
             int decoder_blocks = count_indexed_prefix(state, "decoder.blocks.");

@@ -29,6 +29,9 @@ from ctypes import (
 
 import numpy as np
 from pufferlib.ocean.drive.pedestrian_routing import DEFAULT_TRAJECTORY_POINTS
+from pufferlib.ocean.drive.obstacle_spawns import load_obstacle_positions
+from pufferlib.ocean.drive.observation import HISTORY_CAPACITY
+from pufferlib.ocean.drive.road_types import STOP_SIGN, TRAFFIC_LIGHT_STOP_LINE, RIGHT_HAND_STOP_LINE, TRAFFIC_LIGHT_YIELD_FLAG, stop_line_fallback_type
 
 from lanelet2.io import Origin, load
 from lanelet2.projection import UtmProjector
@@ -122,6 +125,8 @@ class Entity(Structure):
         ("action_delay_steps", c_int),
         ("action_queue_head", c_int),
         ("action_queue", (c_float * 2) * 6),
+        ("ego_history_head", c_int),
+        ("ego_history", (c_float * 7) * HISTORY_CAPACITY),
     ]
 
 class StaticRoadEntity(Structure):
@@ -132,6 +137,7 @@ class StaticRoadEntity(Structure):
         ("traj_y", POINTER(c_float)),
         ("traj_z", POINTER(c_float)),
         ("traffic_light_idx", c_int),
+        ("traffic_light_off_type", c_int),
     ]
 
 utm_origin_lat = 58.385345
@@ -139,6 +145,10 @@ utm_origin_lon = 26.726272
 projector = UtmProjector(Origin(utm_origin_lat, utm_origin_lon), True, False)
 MAP_PATH = Path("tartu_large_processed.osm")
 MAPGEN_CACHE_PATH = MAP_PATH.parent / ".cache" / "mapgen" / f"{MAP_PATH.name}.npz"
+OBSTACLE_CACHE_PATH = MAPGEN_CACHE_PATH.with_name(f"{MAP_PATH.name}.obstacles.npz")
+OBSTACLE_POOL_SIZE = 131072
+OBSTACLE_MAX_ROAD_DISTANCE = 10.0
+OBSTACLE_MAX_AREA = 0.3  # Footprint in square metres, after native float32 conversion.
 PEDESTRIAN_MAP_PATH = MAP_PATH.with_name("pedestrian.osm")
 PEDESTRIAN_CACHE_PATH = MAPGEN_CACHE_PATH.with_name(f"{PEDESTRIAN_MAP_PATH.name}.npz")
 PEDESTRIAN_SAMPLE_RATE = 0.1
@@ -946,7 +956,13 @@ road_border_index = RoadBorderIndex(lanelet2_map.lineStringLayer)
 map_spawn_positions, pedestrian_crossing_routes_cache, map_parked_spawn_positions = load_or_build_mapgen_cache(
     MAP_PATH, MAPGEN_CACHE_PATH, map_lanelets, road_border_index,
 )
+print("map_spawn_positions", len(map_spawn_positions))
+print("map_parked_spawn_positions", len(map_parked_spawn_positions))
 map_pedestrian_crossing_routes = tuple(pedestrian_crossing_routes_cache.values())
+map_obstacle_positions = load_obstacle_positions(
+    MAP_PATH, (utm_origin_lat, utm_origin_lon), OBSTACLE_CACHE_PATH, map_lanelets,
+    count=OBSTACLE_POOL_SIZE, max_distance=OBSTACLE_MAX_ROAD_DISTANCE,
+)
 
 PEDESTRIANS_PER_ROUTE = 4
 _pedestrian_network = None
@@ -1044,6 +1060,43 @@ def generate_pedestrians(count, placed_vehicles):
     raise RuntimeError(f"Only found {len(pedestrians)} of {count} collision-free pedestrian/scooter starts")
 
 
+def sample_obstacle_dimensions():
+    while True:
+        width, obstacle_length = map(float, np.float32([
+            random.uniform(0.2, 0.6), random.uniform(0.2, 0.6)]))
+        if width * obstacle_length <= OBSTACLE_MAX_AREA:
+            return width, obstacle_length, random.uniform(0.05, 0.8)
+
+
+def generate_obstacles(count, placed_vehicles):
+    """Sample cached points without replacement, rejecting occupied footprints."""
+    if count < 0 or count > len(map_obstacle_positions):
+        raise ValueError("Requested obstacles exceed the cached spawn pool")
+    obstacles = []
+    remaining = len(map_obstacle_positions)
+    swaps = {}
+    for _ in range(count):
+        dimensions = sample_obstacle_dimensions()
+        while remaining:
+            # Lazy Fisher-Yates avoids shuffling all 128K points for 1K obstacles.
+            choice = random.randrange(remaining)
+            index = swaps.get(choice, choice)
+            remaining -= 1
+            swaps[choice] = swaps.get(remaining, remaining)
+            swaps.pop(remaining, None)
+            x, y = map_obstacle_positions[index]
+            pose = (float(x), float(y), random.uniform(-math.pi, math.pi))
+            if (road_border_index.collides(pose, dimensions[:2])
+                    or vehicle_collides(pose, dimensions, placed_vehicles)):
+                continue
+            placed_vehicles.append((pose, dimensions[:2]))
+            obstacles.append((pose, dimensions))
+            break
+        else:
+            raise RuntimeError(f"Only found {len(obstacles)} of {count} collision-free obstacle spawns")
+    return obstacles
+
+
 def generate_shared_static_road_entities():
     def add_linestring_segments_in_box(entity_type, linestring, traffic_light_idx=-1):
         x = []
@@ -1054,7 +1107,8 @@ def generate_shared_static_road_entities():
             y.append(p.y)
             z.append(p.z)
         if x:
-            roads.append((entity_type, x, y, z, traffic_light_idx))
+            off_type = stop_line_fallback_type(linestring.attributes) if entity_type == TRAFFIC_LIGHT_STOP_LINE else 0
+            roads.append((entity_type, x, y, z, traffic_light_idx, off_type))
 
     roads = []
     for lanelet in lanelet2_map.laneletLayer:
@@ -1071,6 +1125,8 @@ def generate_shared_static_road_entities():
     for reg_el in lanelet2_map.regulatoryElementLayer:
         if reg_el.attributes["subtype"] == "traffic_light":
             traffic_light_line = reg_el.parameters["ref_line"][0]
+            if "subtype" in traffic_light_line.attributes and traffic_light_line.attributes["subtype"] == "yield_right":
+                continue
             if traffic_light_line.id not in seen_traffic_light_lines:
                 seen_traffic_light_lines.add(traffic_light_line.id)
                 add_linestring_segments_in_box(9, traffic_light_line, traffic_light_counter)
@@ -1079,13 +1135,16 @@ def generate_shared_static_road_entities():
     for linestring in lanelet2_map.lineStringLayer:
         if "type" in linestring.attributes and linestring.attributes["type"] in ROAD_BORDER_TYPES:
             add_linestring_segments_in_box(6, linestring)
+        if ("type" in linestring.attributes and linestring.attributes["type"] == "stop_line"
+            and "subtype" in linestring.attributes and linestring.attributes["subtype"] == "yield_right"):
+            add_linestring_segments_in_box(RIGHT_HAND_STOP_LINE, linestring)
         if ("subtype" in linestring.attributes and linestring.attributes["subtype"] in {"yield_manual", "yield", "yield_stop"}
             and linestring.id not in seen_traffic_light_lines):
             add_linestring_segments_in_box(7, linestring)
 
     entities = alloc_static_road_entities(len(roads))
 
-    for i, (entity_type, x, y, z, traffic_light_idx) in enumerate(roads):
+    for i, (entity_type, x, y, z, traffic_light_idx, off_type) in enumerate(roads):
         ent = entities[i]
         ent.type = entity_type
         ent.array_size = len(x)
@@ -1093,6 +1152,7 @@ def generate_shared_static_road_entities():
         ent.traj_y = alloc_float_array(negate(y))
         ent.traj_z = alloc_float_array(z)
         ent.traffic_light_idx = traffic_light_idx
+        ent.traffic_light_off_type = off_type
 
     return entities, len(roads)
 
@@ -1113,10 +1173,11 @@ def get_shared_static_road_map():
         _shared_static_road_map = (count, address, owner)
     return _shared_static_road_map
 
-MAX_GENERATED_ACTORS = 10240  # Must match MAX_AGENTS in drive.h.
-agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "4096"))
+MAX_GENERATED_ACTORS = 16384  # Must match MAX_AGENTS in drive.h.
+agents_per_generated_map = int(os.getenv("AGENTS_PER_MAP", "5120"))
 stationary_objects_per_generated_map = 2048
-pedestrians_per_generated_map = 4096
+pedestrians_per_generated_map = 8192
+obstacles_per_generated_map = 1024
 goals_per_agent = int(os.getenv("GOALS_PER_AGENT", "8"))
 
 def generate_map():
@@ -1125,7 +1186,8 @@ def generate_map():
     num_agents = agents_per_generated_map
     num_stationary_objects = stationary_objects_per_generated_map
     num_walking_pedestrians = pedestrians_per_generated_map
-    if num_agents + num_stationary_objects + num_walking_pedestrians > MAX_GENERATED_ACTORS:
+    num_obstacles = obstacles_per_generated_map
+    if num_agents + num_stationary_objects + num_walking_pedestrians + num_obstacles > MAX_GENERATED_ACTORS:
         raise ValueError(f"Generated population exceeds native limit of {MAX_GENERATED_ACTORS} actors")
 
     if len(map_spawn_positions) < num_agents:
@@ -1251,8 +1313,9 @@ def generate_map():
 
     num_stationary_objects = len(stationary_spawn_positions)
     pedestrians = generate_pedestrians(num_walking_pedestrians, placed_vehicles)
+    obstacles = generate_obstacles(num_obstacles, placed_vehicles)
 
-    num_objects = num_agents + num_stationary_objects + num_walking_pedestrians
+    num_objects = num_agents + num_stationary_objects + num_walking_pedestrians + num_obstacles
     assert num_objects <= MAX_GENERATED_ACTORS
     entities = alloc_entities(num_objects)
 
@@ -1339,6 +1402,23 @@ def generate_map():
         ent.goal_position_y = -goal[1]
         ent.mark_as_expert = 1
 
+    for i, (pose, dimensions) in enumerate(obstacles, num_agents + num_stationary_objects + num_walking_pedestrians):
+        ent = entities[i]
+        ent.type = 1  # Existing generic actor format keeps policy observations compatible.
+        ent.array_size = 1
+        ent.traj_valid = alloc_int_array([1])
+        ent.traj_x = alloc_float_array([-pose[0]])
+        ent.traj_y = alloc_float_array([-pose[1]])
+        ent.traj_z = alloc_float_array([0])
+        ent.traj_heading = alloc_float_array([pose[2] + math.pi])
+        ent.traj_vx = alloc_float_array([0])
+        ent.traj_vy = alloc_float_array([0])
+        ent.traj_vz = alloc_float_array([0])
+        ent.width, ent.length, ent.height = dimensions
+        ent.goal_position_x = ent.traj_x[0]
+        ent.goal_position_y = ent.traj_y[0]
+        ent.mark_as_expert = 1
+
     # C takes ownership of actors; roads and their grid are owned by the capsule.
     return (num_objects, shared_num_roads, addressof(entities.contents),
             shared_roads_address, shared_road_map)
@@ -1374,6 +1454,7 @@ def save_map_pdf(map_tuple, path="generated_map.pdf"):
     stationary = []
     pedestrians = []
     scooters = []
+    obstacles = []
     for i in range(num_objects):
         ent = entities[i]
         if ent.array_size < 1 or not ent.traj_valid[0]:
@@ -1381,7 +1462,9 @@ def save_map_pdf(map_tuple, path="generated_map.pdf"):
         x, y = -ent.traj_x[0], -ent.traj_y[0]
         # Pedestrians and scooters are expert actors with cached trajectories;
         # parked vehicles have a single stored pose, like controlled vehicles.
-        if ent.mark_as_expert and ent.array_size > 1:
+        if ent.mark_as_expert and ent.height < 1. and ent.width * ent.length <= OBSTACLE_MAX_AREA:
+            obstacles.append((x, y))
+        elif ent.mark_as_expert and ent.array_size > 1:
             (scooters if ent.length > 1. else pedestrians).append((x, y))
         else:
             footprints = stationary if ent.mark_as_expert else vehicles
@@ -1418,6 +1501,7 @@ def save_map_pdf(map_tuple, path="generated_map.pdf"):
     for actors, color, marker, label in (
         (pedestrians, "#009e73", "o", "Pedestrians"),
         (scooters, "#cc79a7", "^", "Electric scooters"),
+        (obstacles, "#666666", "s", "Small obstacles"),
     ):
         if actors:
             positions = np.asarray(actors)
@@ -1437,7 +1521,7 @@ def save_map_pdf(map_tuple, path="generated_map.pdf"):
     figure.legend(handles=legend, loc="upper center", bbox_to_anchor=(0.5, 0.963),
                   ncol=3, frameon=False, fontsize=11)
     figure.text(0.5, 0.02,
-                "Vehicle footprints are to scale; pedestrian and scooter markers are enlarged for visibility. "
+                "Vehicle footprints are to scale; pedestrian, scooter, and obstacle markers are enlarged. "
                 "Zoom in to inspect placement.",
                 ha="center", fontsize=10, color="#555555")
     figure.savefig(path, format="pdf")
@@ -1459,8 +1543,11 @@ def save_map_binary(map_tuple, path):
             is_object = i < num_objects
             ent = entities[i] if is_object or roads is None else roads[i - num_objects]
             expand_static = is_object and ent.mark_as_expert and ent.array_size == 1
-            size = 200 if expand_static else ent.array_size
-            f.write(struct.pack("ii", ent.type | 256 if is_object else ent.type, size))
+            size = PEDESTRIAN_TRAJECTORY_POINTS if expand_static else ent.array_size
+            raw_type = ent.type | 256 if is_object else ent.type
+            if ent.type == TRAFFIC_LIGHT_STOP_LINE and getattr(ent, "traffic_light_off_type", 0) == STOP_SIGN:
+                raw_type |= TRAFFIC_LIGHT_YIELD_FLAG
+            f.write(struct.pack("ii", raw_type, size))
 
             def write_float_array(values):
                 if expand_static:

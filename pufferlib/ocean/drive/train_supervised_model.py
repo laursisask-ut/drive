@@ -17,35 +17,56 @@ from pufferlib.ocean.torch import Wayformer
 class PregeneratedDataset(Dataset):
     def __init__(self, archive_path):
         super().__init__()
-        data = np.load(archive_path)
-        self.inputs = torch.from_numpy(data["inputs"]).to(torch.float32)
-        self.actions = torch.from_numpy(data["actions"]).to(torch.int64)
-        assert self.inputs.size(0) == self.actions.size(0)
+        with np.load(archive_path) as data:
+            inputs = data["inputs"]
+            if inputs.ndim != 3 or inputs.shape[-1] != 1936:
+                raise ValueError("Wrong input shape: regenerate supervised_data.npz with create_supervised_data.py")
+            self.inputs = torch.from_numpy(inputs).to(torch.float32)
+            # Hide reward preferences and all history in both splits, keeping the full shape.
+            self.inputs[..., :7] = 0
+            self.inputs[..., 20:95] = 0
+            self.actions = torch.from_numpy(data["actions"]).to(torch.int64)
+            self.waypoints = torch.from_numpy(data["waypoints"]).to(torch.float32)
+            self.waypoint_masks = torch.from_numpy(data["waypoint_masks"]).to(torch.bool)
+        assert self.inputs.shape[:2] == self.actions.shape[:2]
 
     def __len__(self):
         return self.inputs.size(0)
 
     def __getitem__(self, index):
-        return self.inputs[index], self.actions[index]
+        return self.inputs[index], self.actions[index], self.waypoints[index], self.waypoint_masks[index]
 
 class FlattenedDataset(Dataset):
     def __init__(self, nested_dataset):
         super().__init__()
         self.nested_dataset = nested_dataset
+        self.steps = nested_dataset[0][0].shape[0] if len(nested_dataset) else 0
 
     def __len__(self):
-        return len(self.nested_dataset) * 90
+        return len(self.nested_dataset) * self.steps
 
     def __getitem__(self, index):
-        inputs, actions = self.nested_dataset[index // 90]
-        return inputs[index % 90], actions[index % 90]
+        inputs, actions, waypoints, waypoint_mask = self.nested_dataset[index // self.steps]
+        return inputs[index % self.steps], actions[index % self.steps], waypoints[index % self.steps], waypoint_mask[index % self.steps]
 
 def main():
     torch.manual_seed(2027)
+    torch.set_float32_matmul_precision("high")
     random.seed(2026)
 
-    model = Wayformer(ego_dim=20, action_dim=[7, 13])
+    model = Wayformer(ego_dim=95, action_dim=[7, 13])
     #model.load_state_dict(torch.load("/home/laur/Dev/PufferDrive/experiments/puffer_drive_n1uaeele/model_puffer_drive_003577.pt"))
+
+    # Zero-input weights stay zero during training, so deployment ignores these
+    # features too. Preferences enter through both a token and FiLM conditioning.
+    history_columns = [
+        i for i, obs_index in enumerate(model.encoder.ego_state_indices)
+        if 20 <= obs_index < 95
+    ]
+    with torch.no_grad():
+        model.encoder.ego_state_proj[0].weight[:, history_columns] = 0
+        model.encoder.reward_pref_proj[0].weight.zero_()
+        model.encoder.reward_film[0].weight.zero_()
 
     epochs = int(os.environ.get("EPOCHS", "10"))
     batch_size = int(os.environ.get("BATCH_SIZE", 1024))
@@ -57,8 +78,8 @@ def main():
     model = model.to(device)
     original_model = model
     model = torch.compile(model)
-    optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.05)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
     dataset = PregeneratedDataset("supervised_data.npz")
     train_dataset, val_dataset = random_split(dataset, [0.9, 0.1])
@@ -74,7 +95,7 @@ def main():
         train_steering_accuracy_sum = 0
         train_updates = 0
         bar = tqdm(train_loader)
-        for inputs, target_actions in bar:
+        for inputs, target_actions, _waypoints, _waypoint_masks in bar:
             inputs = inputs.to(device)
             target_actions = target_actions.to(device)
             model.train()
@@ -111,7 +132,7 @@ def main():
             accel_y_true = []
             steering_preds = []
             steering_y_true = []
-            for inputs, target_actions in val_loader:
+            for inputs, target_actions, _waypoints, _waypoint_masks in val_loader:
                 inputs = inputs.to(device)
                 target_actions = target_actions.to(device)
                 (predicted_accel, predicted_steering), _value = model(inputs)
@@ -135,20 +156,21 @@ def main():
             accel_confusion_matrix = wandb.plot.confusion_matrix(
                 preds=accel_preds,
                 y_true=accel_y_true,
-                class_names=[-4.0, -2.667, -1.333, 0.0, 1.333, 2.667],
+                class_names=[-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0],
                 title="Acceleration Confusion Matrix"
             )
 
             steering_confusion_matrix = wandb.plot.confusion_matrix(
                 preds=steering_preds,
                 y_true=steering_y_true,
-                class_names=[-0.667, -0.5, -0.333, -0.167, -0.08, -0.035, 0.0, 0.035, 0.08, 0.167, 0.333, 0.500, 0.667],
+                class_names=[-0.667, -0.5, -0.333, -0.167, -0.08, -0.01, 0.0, 0.01, 0.08, 0.167, 0.333, 0.500, 0.667],
                 title="Steering Confusion Matrix"
             )
 
             wandb.log({
                 "epoch": epoch,
                 "train_loss": train_loss_sum / train_updates,
+                "validation_loss": (loss_sum / len(val_loader)).item(),
                 "train_accel_accuracy": train_accel_accuracy_sum / train_updates,
                 "validation_accel_accuracy": val_accel_accuracy_sum / len(val_loader),
                 "train_steering_accuracy": train_steering_accuracy_sum / train_updates,

@@ -8,6 +8,7 @@ import time
 import pufferlib
 from pufferlib.ocean.drive import binding
 from pufferlib.ocean.drive.mapgen import generate_map, agents_per_generated_map
+from pufferlib.ocean.drive.observation import ego_features
 
 
 class Drive(pufferlib.PufferEnv):
@@ -66,21 +67,10 @@ class Drive(pufferlib.PufferEnv):
             scenario_length = self.scenario_length = self.resample_frequency = resample_frequency
 
         # Observation space calculation
-        if dynamics_model == "classic":
-            ego_features = 20
-        elif dynamics_model == "jerk":
-            ego_features = 23
-        else:
-            raise ValueError(f"dynamics_model must be 'classic' or 'jerk'. Got: {dynamics_model}")
+        self.ego_features = ego_features(dynamics_model)
+        self.num_obs = self.ego_features + (63 * 7 + 200 * 7)
 
-        self.ego_features = ego_features
-        partner_features = 7
-        road_features = 7
-        max_partner_objects = 63
-        max_road_objects = 200
-        self.num_obs = ego_features + max_partner_objects * partner_features + max_road_objects * road_features
-
-        self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
+        self.single_observation_space = gymnasium.spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_obs,), dtype=np.float32)
         self.init_steps = init_steps
         self.artifact_dir = artifact_dir
         self.start_time = time.monotonic()
@@ -220,7 +210,7 @@ class Drive(pufferlib.PufferEnv):
             )
         env_ids = []
         seed = np.random.randint(0, 2**32 - 1)
-        export_replay = [self.artifact_dir is not None and random.random() < 0.0004 for _ in range(num_envs)]
+        export_replay = [self.artifact_dir is not None and random.random() < 0.01 for _ in range(num_envs)]
         if any(export_replay):
             wall_time = int(time.monotonic() - self.start_time)
             replays_dir = os.path.join(self.artifact_dir, "replays", str(wall_time))

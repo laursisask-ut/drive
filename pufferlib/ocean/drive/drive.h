@@ -13,6 +13,7 @@
 #include <time.h>
 #include "error.h"
 #include <lz4.h>
+#include "observation.h"
 
 // Entity Types
 #define NONE 0
@@ -25,6 +26,9 @@
 #define STOP_SIGN 7
 #define CROSSWALK 8
 #define TRAFFIC_LIGHT_STOP_LINE 9
+#define RIGHT_HAND_STOP_LINE 11
+#define MAP_ENTITY_TYPE_MASK 0xFF
+#define MAP_TRAFFIC_LIGHT_YIELD_FLAG 0x200
 
 #define TRAFFIC_LIGHT_OFF 0
 #define TRAFFIC_LIGHT_RED 1
@@ -66,7 +70,7 @@
 
 // Max road segment observation entities
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 200
-#define MAX_AGENTS 10240  // Total actors: 4096 policy vehicles + 2048 parked + 4096 pedestrians.
+#define MAX_AGENTS 16384  // 5120 policy vehicles + 2048 parked + 8192 pedestrians + 1024 obstacles.
 #define MAX_VISIBLE_AGENTS 64
 // Observation Space Constants
 #define MAX_SPEED 27.7f
@@ -115,8 +119,8 @@ static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 
 // Classic action space (for CLASSIC dynamics model)
-static const float ACCELERATION_VALUES[7] = {-4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f};
-static const float STEERING_VALUES[13] = {-0.667f, -0.500f, -0.333f, -0.167f, -0.08f, -0.035f, 0.000f, 0.035f, 0.08f, 0.167f, 0.333f, 0.500f, 0.667f};
+static const float ACCELERATION_VALUES[7] = {-4.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 4.0f};
+static const float STEERING_VALUES[13] = {-0.667f, -0.500f, -0.333f, -0.167f, -0.08f, -0.01f, 0.000f, 0.01f, 0.08f, 0.167f, 0.333f, 0.500f, 0.667f};
 
 static const float offsets[4][2] = {
         {-1, 1},  // top-left
@@ -256,6 +260,10 @@ struct Entity {
     int action_delay_steps;
     int action_queue_head;
     float action_queue[ACTION_QUEUE_CAPACITY][2];
+
+    // Ring of pre-action states and normalized commands selected by the policy.
+    int ego_history_head;
+    float ego_history[EGO_HISTORY_CAPACITY][7];
 };
 
 typedef struct StaticRoadEntity StaticRoadEntity;
@@ -266,6 +274,7 @@ struct StaticRoadEntity {
     float* traj_y;
     float* traj_z;
     int traffic_light_idx;
+    int traffic_light_off_type; // STOP_SIGN for yield rules, NONE for priority.
 };
 
 typedef struct TrafficLightState TrafficLightState;
@@ -314,7 +323,7 @@ static inline int rand_int_inclusive(int min_value, int max_value) {
 }
 
 static inline int grid_map_entity_type(int type) {
-    return type >= ROAD_LANE && type <= TRAFFIC_LIGHT_STOP_LINE;
+    return (type >= ROAD_LANE && type <= TRAFFIC_LIGHT_STOP_LINE) || type == RIGHT_HAND_STOP_LINE;
 }
 
 static inline int sample_traffic_light_transition(int color) {
@@ -505,10 +514,16 @@ struct Drive {
 
 static int road_traffic_light_color(const Drive* env, const StaticRoadEntity* road) {
     int idx = road->traffic_light_idx;
-    if (!env->traffic_light_states || idx < 0 || idx >= env->num_traffic_lights) {
+    if (!env->traffic_lights_enabled || !env->traffic_light_states || idx < 0 || idx >= env->num_traffic_lights) {
         return TRAFFIC_LIGHT_OFF;
     }
     return env->traffic_light_states[idx].traffic_light_color;
+}
+
+static int effective_road_type(const Drive* env, const StaticRoadEntity* road) {
+    if (road->type == TRAFFIC_LIGHT_STOP_LINE && road_traffic_light_color(env, road) == TRAFFIC_LIGHT_OFF)
+        return road->traffic_light_off_type;
+    return road->type;
 }
 
 typedef struct {
@@ -892,7 +907,8 @@ static void split_legacy_entities(Drive* env) {
     for (int i = 0; i < env->num_roads; i++) {
         Entity* e = &combined[env->num_objects + i];
         StaticRoadEntity* road = &env->static_road_entities[i];
-        road->type = e->type;
+        road->type = e->type & MAP_ENTITY_TYPE_MASK;
+        road->traffic_light_off_type = (e->type & MAP_TRAFFIC_LIGHT_YIELD_FLAG) ? STOP_SIGN : NONE;
         road->array_size = e->array_size;
         road->traj_x = e->traj_x;
         road->traj_y = e->traj_y;
@@ -919,11 +935,9 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         Entity* e = i < env->num_objects ? &entities[i] : &road_record;
 	    // Read base entity data
         fread(&e->type, sizeof(int), 1, file);
-        int is_v2 = 0;
-        if ((e->type & 256)) {
-            is_v2 = 1;
-            e->type -= 256;
-        }
+        int is_v2 = (e->type & 256) != 0;
+        int light_off_type = (e->type & MAP_TRAFFIC_LIGHT_YIELD_FLAG) ? STOP_SIGN : NONE;
+        e->type &= MAP_ENTITY_TYPE_MASK;
         fread(&e->array_size, sizeof(int), 1, file);
         // Allocate arrays based on type
         int size = e->array_size;
@@ -995,6 +1009,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             road->traj_y = e->traj_y;
             road->traj_z = e->traj_z;
             road->traffic_light_idx = road->type == TRAFFIC_LIGHT_STOP_LINE ? traffic_light_idx++ : -1;
+            road->traffic_light_off_type = light_off_type;
             e->traj_x = e->traj_y = e->traj_z = NULL;
             free_entity(e);
         }
@@ -1036,6 +1051,27 @@ static void delay_agent_action(Entity* agent, float action[2]) {
     action[0] = agent->action_queue[delayed][0];
     action[1] = agent->action_queue[delayed][1];
     agent->action_queue_head = (head + 1) % ACTION_QUEUE_CAPACITY;
+}
+
+static void record_ego_history(Entity* agent, float longitudinal, float lateral) {
+    float* sample = agent->ego_history[agent->ego_history_head];
+    sample[0] = agent->x;
+    sample[1] = agent->y;
+    sample[2] = agent->heading_x;
+    sample[3] = agent->heading_y;
+    sample[4] = hypotf(agent->vx, agent->vy);
+    sample[5] = longitudinal;
+    sample[6] = lateral;
+    agent->ego_history_head = (agent->ego_history_head + 1) % EGO_HISTORY_CAPACITY;
+}
+
+static void reset_ego_history(Entity* agent) {
+    agent->ego_history_head = 0;
+    // Clamp unavailable history to the initial state, with neutral controls.
+    record_ego_history(agent, 0.0f, 0.0f);
+    for (int i = 1; i < EGO_HISTORY_CAPACITY; i++)
+        memcpy(agent->ego_history[i], agent->ego_history[0], sizeof(agent->ego_history[0]));
+    agent->ego_history_head = 0;
 }
 
 void set_start_position(Drive* env){
@@ -1104,7 +1140,10 @@ void set_start_position(Drive* env){
         e->jerk_lat = 0.0f;
         e->steering_angle = 0.0f;
         if (e->wheelbase == 0.0f) e->wheelbase = 0.6f * e->length;
-        if (is_active) reset_action_delay(env, e);
+        if (is_active) {
+            reset_action_delay(env, e);
+            reset_ego_history(e);
+        }
     }
     record_replay_trajectories(env);
     //EndDrawing();
@@ -1663,6 +1702,32 @@ float point_to_segment_distance_2d(float px, float py, float x1, float y1, float
     return sqrtf((px - closestX) * (px - closestX) + (py - closestY) * (py - closestY));
 }
 
+static int stop_line_overlaps_vehicle(const StaticRoadEntity* line, const Entity* vehicle,
+                                      float x, float y, float cosine, float sine) {
+    float half_length = vehicle->length * 0.5f;
+    float half_width = vehicle->width * 0.5f;
+    float corners[4][2];
+    for (int i = 0; i < 4; i++) {
+        corners[i][0] = offsets[i][0] * half_length;
+        corners[i][1] = offsets[i][1] * half_width;
+    }
+    float start[2];
+    for (int i = 0; i < line->array_size; i++) {
+        float dx = line->traj_x[i] - x, dy = line->traj_y[i] - y;
+        float end[2] = {dx * cosine + dy * sine, -dx * sine + dy * cosine};
+        // A short segment can be wholly inside the box without crossing an edge.
+        if (fabsf(end[0]) <= half_length && fabsf(end[1]) <= half_width) return 1;
+        if (i > 0) {
+            for (int k = 0; k < 4; k++) {
+                if (check_line_intersection(corners[k], corners[(k + 1) % 4], start, end)) return 1;
+            }
+        }
+        start[0] = end[0];
+        start[1] = end[1];
+    }
+    return 0;
+}
+
 float normalize_heading(float heading){
     if(heading > M_PI) heading -= 2*M_PI;
     if(heading < -M_PI) heading += 2*M_PI;
@@ -1693,6 +1758,8 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
     float half_width = agent->width/2.0f;
     float cos_heading = cosf(agent->heading);
     float sin_heading = sinf(agent->heading);
+    int previous_index = (agent->ego_history_head + EGO_HISTORY_CAPACITY - 1) % EGO_HISTORY_CAPACITY;
+    const float* previous_pose = agent->ego_history[previous_index];
     float min_distance = (float)INT16_MAX;
 
     int closest_lane_entity_idx = -1;
@@ -1711,15 +1778,11 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
         const StaticRoadEntity* entity = &env->static_road_entities[entity_list[i].entity_idx];
 
         if (env->traffic_lights_enabled && entity->type == TRAFFIC_LIGHT_STOP_LINE && road_traffic_light_color(env, entity) == TRAFFIC_LIGHT_RED) {
-            int geometry_idx = entity_list[i].geometry_idx;
-            float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
-            float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
-            for (int k = 0; k < 4; k++) {
-                int next = (k + 1) % 4;
-                if (check_line_intersection(corners[k], corners[next], start, end)) {
-                    collided = RED_TRAFFIC_LIGHT_CROSSED;
-                    break;
-                }
+            // Test entry into the whole line, regardless of its previous color.
+            if (stop_line_overlaps_vehicle(entity, agent, agent->x, agent->y, cos_heading, sin_heading) &&
+                !stop_line_overlaps_vehicle(entity, agent, agent->prev_x, agent->prev_y,
+                                           previous_pose[2], previous_pose[3])) {
+                collided = RED_TRAFFIC_LIGHT_CROSSED;
             }
         }
 
@@ -2141,7 +2204,7 @@ void init(Drive* env){
 }
 
 static void saveAgentObservationsReplayToFile(Drive* env) {
-    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
+    int ego_dim = drive_ego_features(env->dynamics_model);
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
 
     float (*obs)[env->export_log.capacity][max_obs] = (float(*)[env->export_log.capacity][max_obs]) env->export_log.observations;
@@ -2308,7 +2371,10 @@ static void saveReplayToFile(Drive* env) {
 
     for (int i = 0; i < env->num_roads; i++) {
         const StaticRoadEntity* road = &env->static_road_entities[i];
-        fwrite(&road->type, sizeof(int), 1, file);
+        int raw_type = road->type;
+        if (road->type == TRAFFIC_LIGHT_STOP_LINE && road->traffic_light_off_type == STOP_SIGN)
+            raw_type |= MAP_TRAFFIC_LIGHT_YIELD_FLAG;
+        fwrite(&raw_type, sizeof(int), 1, file);
         fwrite(&road->array_size, sizeof(int), 1, file);
         fwrite(road->traj_x, sizeof(float), road->array_size, file);
         fwrite(road->traj_y, sizeof(float), road->array_size, file);
@@ -2370,7 +2436,7 @@ void c_close(Drive* env){
 
 void allocate(Drive* env){
     init(env);
-    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
+    int ego_dim = drive_ego_features(env->dynamics_model);
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
     env->actions = (float*)calloc(env->active_agent_count*2, sizeof(float));
@@ -2420,6 +2486,22 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
             record_discrete_classic_action(env, action_idx, issued[action_idx][0], issued[action_idx][1]);
         }
     }
+    // Preserve the selected command before delay, gains, or actuator limits.
+    // Continuous actions already use these normalized units.
+    float longitudinal = action[0], lateral = action[1];
+    if (env->action_type != 1) {
+        if (env->dynamics_model == CLASSIC) {
+            longitudinal = ACCELERATION_VALUES[(int)action[0]] / 4.0f;
+            lateral = STEERING_VALUES[(int)action[1]] / 0.667f;
+        } else {
+            longitudinal = JERK_LONG[(int)action[0]];
+            longitudinal /= longitudinal < 0 ? 15.0f : 4.0f;
+            lateral = JERK_LAT[(int)action[1]] / 4.0f;
+        }
+    }
+    agent->prev_x = agent->x;
+    agent->prev_y = agent->y;
+    record_ego_history(agent, longitudinal, lateral);
     delay_agent_action(agent, action);
 
     if (env->dynamics_model == CLASSIC) {
@@ -2448,9 +2530,6 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         float heading = agent->heading;
         float vx = agent->vx;
         float vy = agent->vy;
-
-        agent->prev_x = x;
-        agent->prev_y = y;
 
         float friction_coefficient = agent->friction_coefficient;
         if (agent->friction_coefficient == 0.0f) friction_coefficient = 1.0f;
@@ -2495,7 +2574,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         agent->vx = new_vx;
         agent->vy = new_vy;
 
-        int comfort_violations = (acceleration > 3.0f) + (fabsf(a_lat) > 3.0f);
+        int comfort_violations = (fabsf(acceleration) > 3.0f) + (fabsf(a_lat) > 3.0f);
         if (comfort_violations > 0) {
             int comfort_bin = clipped_scaled_bin(agent->comfort_reward_coefficient, 10000.0f, COEFFICIENT_COUNT_BINS);
             env->comfort_violation_counts[comfort_bin] += comfort_violations;
@@ -2687,11 +2766,74 @@ static int nearby_observation_actors(const Drive* env, const ActorObservationGri
     return count;
 }
 
+// Pure observation conversion: repeated calls never advance history.
+static void write_ego_observation(const Entity* e, int dynamics_model, float* obs) {
+    const float c = e->heading_x, s = e->heading_y;
+    // Safety penalties, comfort, then lane-following preferences.
+    obs[0] = e->collision_reward_coefficient;
+    obs[1] = e->offroad_reward_coefficient;
+    obs[2] = e->stop_line_reward_coefficient;
+    obs[3] = e->comfort_reward_coefficient;
+    obs[4] = e->lane_center_reward_coefficient;
+    obs[5] = e->lane_align_reward_coefficient;
+    obs[6] = e->lane_center_bias;
+    // Current speed, speed limit, and vehicle dimensions.
+    obs[7] = hypotf(e->vx, e->vy) / MAX_SPEED;
+    obs[8] = e->max_speed == 0.0f ? 1.0f : fminf(e->max_speed / MAX_SPEED, 1.0f);
+    obs[9] = e->width / MAX_VEH_WIDTH;
+    obs[10] = e->length / MAX_VEH_LEN;
+    // Goal geometry and remaining-goal flags.
+    obs[11] = e->goal_radius / 3.0f;
+    float dx = e->goal_position_x - e->x, dy = e->goal_position_y - e->y;
+    obs[12] = (dx * c + dy * s) * 0.005f;
+    obs[13] = (-dx * s + dy * c) * 0.005f;
+    int next = e->multi_goal_idx + 1;
+    if (next < e->multi_goal_count) {
+        dx = e->multi_goal_position_x[next] - e->x;
+        dy = e->multi_goal_position_y[next] - e->y;
+    }
+    obs[14] = (dx * c + dy * s) * 0.005f;
+    obs[15] = (-dx * s + dy * c) * 0.005f;
+    int remaining = e->reached_final_goal ? 0 : e->multi_goal_count > 0
+        ? e->multi_goal_count - e->multi_goal_idx : 1;
+    obs[16] = remaining >= 2;
+    obs[17] = remaining >= 1;
+    // Current lane-relative pose.
+    obs[18] = e->lane_heading_angle_diff;
+    obs[19] = e->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f
+        ? e->metrics_array[LANE_LATERAL_OFFSET_IDX] / 4.0f : 0.0f;
+    // Ten past poses (XY and heading cos/sin), speeds and selected commands.
+    for (int k = 0; k < 10; k++) {
+        int index = (e->ego_history_head + EGO_HISTORY_CAPACITY - 1 - k) % EGO_HISTORY_CAPACITY;
+        const float* h = e->ego_history[index];
+        dx = h[0] - e->x;
+        dy = h[1] - e->y;
+        obs[20 + 2*k] = (dx * c + dy * s) * 0.02f;
+        obs[20 + 2*k + 1] = (-dx * s + dy * c) * 0.02f;
+        obs[40 + 2*k] = h[2] * c + h[3] * s;
+        obs[40 + 2*k + 1] = h[3] * c - h[2] * s;
+        obs[60 + k] = h[4] / MAX_SPEED;
+        obs[75 + 2*k] = h[5];
+        obs[75 + 2*k + 1] = h[6];
+    }
+    // Speeds 20, 30, 40, 50 and 60 steps ago, adjacent to recent speeds.
+    for (int k = 0; k < 5; k++) {
+        int lag = 20 + 10*k;
+        int index = (e->ego_history_head + EGO_HISTORY_CAPACITY - lag) % EGO_HISTORY_CAPACITY;
+        obs[70 + k] = e->ego_history[index][4] / MAX_SPEED;
+    }
+    if (dynamics_model == JERK) {
+        obs[95] = e->steering_angle / M_PI;
+        obs[95 + 1] = e->a_long < 0 ? e->a_long / (-JERK_LONG[0]) : e->a_long / JERK_LONG[3];
+        obs[95 + 2] = e->a_lat / JERK_LAT[2];
+    }
+}
+
 void compute_observations(Drive* env) {
     ActorObservationGrid actor_grid;
     build_actor_observation_grid(env, &actor_grid);
     int nearby_actors[MAX_AGENTS];
-    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
+    int ego_dim = drive_ego_features(env->dynamics_model);
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs*env->active_agent_count*sizeof(float));
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
@@ -2702,77 +2844,7 @@ void compute_observations(Drive* env) {
 
         float cos_heading = ego_entity->heading_x;
         float sin_heading = ego_entity->heading_y;
-        float ego_speed = sqrtf(ego_entity->vx*ego_entity->vx + ego_entity->vy*ego_entity->vy);
-
-        // Set goal distances
-        float goal_x = ego_entity->goal_position_x - ego_entity->x;
-        float goal_y = ego_entity->goal_position_y - ego_entity->y;
-
-        // Rotate to ego vehicle's frame
-        float rel_goal_x = goal_x*cos_heading + goal_y*sin_heading;
-        float rel_goal_y = -goal_x*sin_heading + goal_y*cos_heading;
-
-        obs[0] = rel_goal_x* 0.005f;
-        obs[1] = rel_goal_y* 0.005f;
-        obs[2] = ego_speed / MAX_SPEED;
-        obs[3] = ego_entity->width / MAX_VEH_WIDTH;
-        obs[4] = ego_entity->length / MAX_VEH_LEN;
-        obs[5] = ego_entity->stop_line_reward_coefficient;
-
-        if (ego_entity->max_speed == 0.0f) {
-            obs[6] = 1.0f;
-        } else {
-            obs[6] = fminf(ego_entity->max_speed / MAX_SPEED, 1.0f);
-        }
-
-        obs[7] = ego_entity->lane_center_reward_coefficient / 7.5e-4f;
-        obs[8] = ego_entity->comfort_reward_coefficient / 0.1f;
-        obs[9] = ego_entity->lane_align_reward_coefficient / 2.5e-2f;
-        obs[10] = ego_entity->collision_reward_coefficient;
-        obs[11] = ego_entity->offroad_reward_coefficient;
-        obs[12] = ego_entity->lane_center_bias / 0.5f;
-
-        obs[13] = ego_entity->lane_heading_angle_diff;
-        if (ego_entity->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f) {
-            obs[14] = ego_entity->metrics_array[LANE_LATERAL_OFFSET_IDX] / 4.0f;
-        } else {
-            obs[14] = 0.0f;
-        }
-        obs[15] = ego_entity->height / MAX_VEH_HEIGHT;
-
-        int next_goal_idx = ego_entity->multi_goal_idx + 1;
-        if (next_goal_idx < ego_entity->multi_goal_count) {
-            float next_goal_x = ego_entity->multi_goal_position_x[next_goal_idx] - ego_entity->x;
-            float next_goal_y = ego_entity->multi_goal_position_y[next_goal_idx] - ego_entity->y;
-
-            obs[16] = (next_goal_x * cos_heading + next_goal_y * sin_heading) * 0.005f;
-            obs[17] = (-next_goal_x * sin_heading + next_goal_y * cos_heading) * 0.005f;
-        } else {
-            obs[16] = rel_goal_x * 0.005f;
-            obs[17] = rel_goal_y * 0.005f;
-        }
-
-        obs[18] = ego_entity->goal_radius / 3.0f;
-
-        int remaining_goals;
-        if (ego_entity->multi_goal_count > 0) {
-            remaining_goals = ego_entity->multi_goal_count - ego_entity->multi_goal_idx;
-        } else if (ego_entity->reached_final_goal) {
-            remaining_goals = 0;
-        } else {
-            remaining_goals = 1;
-        }
-        if (remaining_goals > 3) {
-            remaining_goals = 3;
-        }
-        obs[19] = (remaining_goals - 1) / 2.0f;
-
-        if (env->dynamics_model == JERK) {
-            obs[20] = ego_entity->steering_angle / M_PI;
-            // Asymmetric normalization for a_long to match action space
-            obs[21] = (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
-            obs[22] = ego_entity->a_lat / JERK_LAT[2];
-        }
+        write_ego_observation(ego_entity, env->dynamics_model, obs);
 
         // Relative Pos of other cars
         int obs_idx = ego_dim;
@@ -2850,6 +2922,8 @@ void compute_observations(Drive* env) {
                 }
 
                 const StaticRoadEntity* entity = &env->static_road_entities[entity_idx];
+                int road_type = effective_road_type(env, entity);
+                if (road_type == NONE) continue;
 
                 // Validate geometry_idx before accessing
                 if(geometry_idx < 0 || geometry_idx >= entity->array_size - 1) {
@@ -2868,8 +2942,8 @@ void compute_observations(Drive* env) {
                 float x_obs = rel_x*cos_heading + rel_y*sin_heading;
                 float y_obs = -rel_x*sin_heading + rel_y*cos_heading;
                 float length = relative_distance_2d(mid_x, mid_y, end_x, end_y);
-                float line_attribute = 0.1f / MAX_ROAD_SCALE;
-                if (entity->type == TRAFFIC_LIGHT_STOP_LINE) {
+                float line_attribute = 0.0f;
+                if (road_type == TRAFFIC_LIGHT_STOP_LINE) {
                     line_attribute = traffic_light_observation_value(road_traffic_light_color(env, entity));
                 }
                 // Calculate angle from ego to midpoint (vector from ego to midpoint)
@@ -2891,7 +2965,7 @@ void compute_observations(Drive* env) {
                 obs[obs_idx + 3] = line_attribute;
                 obs[obs_idx + 4] = cos_angle;
                 obs[obs_idx + 5] = sin_angle;
-                obs[obs_idx + 6] = entity->type - 4.0f;
+                obs[obs_idx + 6] = road_type - 4.0f;
                 obs_idx += 7;
                 road_obs_count++;
             }
@@ -3063,7 +3137,7 @@ void c_reset(Drive* env){
         env->export_log.traj_vz = calloc(actor_steps, sizeof(float));
         env->export_log.heading = calloc(actor_steps, sizeof(float));
 
-        int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
+        int ego_dim = drive_ego_features(env->dynamics_model);
         int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
         env->export_log.observations = calloc(actor_steps * max_obs, sizeof(float));
         env->export_log.reward_components =
@@ -3131,6 +3205,8 @@ void c_reset(Drive* env){
 void respawn_agent(Drive* env, int agent_idx){
     env->entities[agent_idx].x = env->entities[agent_idx].traj_x[0];
     env->entities[agent_idx].y = env->entities[agent_idx].traj_y[0];
+    env->entities[agent_idx].prev_x = env->entities[agent_idx].x;
+    env->entities[agent_idx].prev_y = env->entities[agent_idx].y;
     env->entities[agent_idx].heading = env->entities[agent_idx].traj_heading[0];
     env->entities[agent_idx].heading_x = cosf(env->entities[agent_idx].heading);
     env->entities[agent_idx].heading_y = sinf(env->entities[agent_idx].heading);
@@ -3151,6 +3227,7 @@ void respawn_agent(Drive* env, int agent_idx){
     env->entities[agent_idx].steering_angle = 0.0f;
     env->entities[agent_idx].multi_goal_idx = 0;
     clear_action_queue(env, &env->entities[agent_idx]);
+    reset_ego_history(&env->entities[agent_idx]);
 }
 
 float compute_distance_to_goal(Entity* e) {
@@ -3247,6 +3324,12 @@ void c_step(Drive* env){
                     int joint_bin_idx = coef1_bin * COLLISION_COUNT_BINS + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
                     env->collision_counts[joint_bin_idx]++;
                 }
+            } else if (!e->hide_other_vehicles && collision_state == VEHICLE_COLLISION) {
+                // Continuing contact costs 1% per step, without another collision event.
+                float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
+                float collision_reward = -0.01f * e->collision_reward_coefficient * (1 + 0.1f * speed);
+                env->rewards[i] += collision_reward;
+                record_reward_component(env, i, REWARD_COMPONENT_COLLISION, collision_reward);
             } else if (collision_state == OFFROAD && prev_collision_state != OFFROAD) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float offroad_reward = -e->offroad_reward_coefficient * (1 + 0.1 * speed);
@@ -3259,8 +3342,8 @@ void c_step(Drive* env){
                 if (e->offroad_reward_coefficient >= 0.5f) {
                     env->terminals[i] = 1;
                 }
-            } else if (collision_state == RED_TRAFFIC_LIGHT_CROSSED &&
-                    prev_collision_state != RED_TRAFFIC_LIGHT_CROSSED) {
+            } else if (collision_state == RED_TRAFFIC_LIGHT_CROSSED) {
+                // Geometry already requires new overlap with a specific red line.
                 float stop_line_reward = -e->stop_line_reward_coefficient;
                 env->rewards[i] = stop_line_reward;
                 env->logs[i].stop_line_rate = 1.0f;
@@ -3535,7 +3618,7 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
         return;
     }
 
-    int ego_dim = (env->dynamics_model == JERK) ? 23 : 20;
+    int ego_dim = drive_ego_features(env->dynamics_model);
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
     float* agent_obs = &observations[agent_index][0];
@@ -3546,8 +3629,8 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
     float px = env->entities[active_idx].x;
     float py = env->entities[active_idx].y;
     // draw goal
-    float goal_x = agent_obs[0] * 200;
-    float goal_y = agent_obs[1] * 200;
+    float goal_x = agent_obs[12] * 200;
+    float goal_y = agent_obs[13] * 200;
     if(mode == 0 ){
         DrawSphere((Vector3){goal_x, goal_y, 1}, 0.5f, LIGHTGREEN);
         DrawCircle3D((Vector3){goal_x, goal_y, 0.1f}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f, Fade(LIGHTGREEN, 0.3f));
@@ -4066,6 +4149,14 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                     continue;
                 }
 
+                if (is_expert && size.x * size.y <= 0.300001f && size.z < 1.0f) {
+                    // Small stationary objects use their real box, without a vehicle model.
+                    Vector3 center = {0, 0, size.z / 2.0f - position.z};
+                    DrawCube(center, size.x, size.y, size.z, GRAY);
+                    DrawCubeWires(center, size.x, size.y, size.z, DARKGRAY);
+                    rlPopMatrix();
+                    continue;
+                }
                 DrawModelEx(car_model, (Vector3){0, 0, 0}, (Vector3){1, 0, 0}, 90.0f, scale, WHITE);
                 {
                     float cos_heading = env->entities[i].heading_x;
@@ -4160,6 +4251,8 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
     }
     // Draw immutable geometry with this environment's traffic-light state.
     for (int i = 0; i < env->num_roads; i++) {
+        int road_type = effective_road_type(env, &env->static_road_entities[i]);
+        if (road_type == NONE) continue;
         for(int j = 0; j < env->static_road_entities[i].array_size - 1; j++) {
             Vector3 start = {
                 env->static_road_entities[i].traj_x[j],
@@ -4171,15 +4264,17 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                 env->static_road_entities[i].traj_y[j + 1],
                 1
             };
-            if(env->static_road_entities[i].type == ROAD_EDGE){
+            if(road_type == ROAD_EDGE){
                 draw_road_edge(env, start.x, start.y, end.x, end.y);
-            } else if (env->static_road_entities[i].type == STOP_SIGN) {
+            } else if (road_type == STOP_SIGN) {
                 DrawLine3D(start, end, RED);
-            } else if (env->static_road_entities[i].type == CROSSWALK) {
+            } else if (road_type == RIGHT_HAND_STOP_LINE) {
+                DrawLine3D(start, end, (Color){255, 182, 193, 255});
+            } else if (road_type == CROSSWALK) {
                 DrawLine3D(start, end, YELLOW);
-            } else if (env->static_road_entities[i].type == TRAFFIC_LIGHT_STOP_LINE) {
+            } else if (road_type == TRAFFIC_LIGHT_STOP_LINE) {
                 DrawLine3D(start, end, traffic_light_render_color(road_traffic_light_color(env, &env->static_road_entities[i])));
-            } else if (env->static_road_entities[i].type == ROAD_LANE) {
+            } else if (road_type == ROAD_LANE) {
                 DrawLine3D(start, end, GRAY);
             }
         }

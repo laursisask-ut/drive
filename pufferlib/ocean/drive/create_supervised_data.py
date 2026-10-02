@@ -6,6 +6,7 @@ import itertools
 from multiprocessing import Pool
 
 import numpy as np
+from pufferlib.ocean.drive.road_types import STOP_SIGN, RIGHT_HAND_STOP_LINE, stop_line_fallback_type
 
 from lanelet2.io import Origin, load
 from lanelet2.projection import UtmProjector
@@ -15,10 +16,16 @@ from lanelet2.geometry import ArcCoordinates, fromArcCoordinates, toArcCoordinat
 utm_origin_lat = 58.385345
 utm_origin_lon = 26.726272
 projector = UtmProjector(Origin(utm_origin_lat, utm_origin_lon), True, False)
-lanelet2_map = load("tartu_large_processed.osm", projector)
+lanelet2_map = None
 
-ACCELERATION_VALUES = [-4.0, -2.667, -1.333, 0.0, 1.333, 2.667] # 4.0 is not allowed here
-STEERING_VALUES = [-0.667, -0.5, -0.333, -0.167, -0.08, -0.035, 0.0, 0.035, 0.08, 0.167, 0.333, 0.500, 0.667]
+def get_lanelet_map():
+    global lanelet2_map
+    if lanelet2_map is None:
+        lanelet2_map = load("tartu_large_processed.osm", projector)
+    return lanelet2_map
+
+ACCELERATION_VALUES = [-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0]
+STEERING_VALUES = [-0.667, -0.5, -0.333, -0.167, -0.08, -0.01, 0.0, 0.01, 0.08, 0.167, 0.333, 0.500, 0.667]
 
 def to_egocentric_vector(x, y, ego_heading):
     rel_x = x * math.cos(ego_heading) + y * math.sin(ego_heading)
@@ -62,42 +69,73 @@ def normalize_heading(heading):
 def calculate_heading_change(a, b):
     return min(b - a, b - a - 2 * math.pi, b - a + 2 * math.pi, key=abs)
 
-def process_scenario(filepath):
-    print(f"processing {filepath}", file=sys.stderr)
-    scenario = json.load(open(filepath, "r"))
-    hidden_road_border_ids = {
-        int(value) for value in scenario.get("hidden_road_border_ids", [])
-    }
-    hidden_centerline_lanelet_ids = {
-        int(value)
-        for value in scenario.get("hidden_centerline_lanelet_ids", [])
-    }
 
-    inputs = np.zeros((90, 1861), dtype=np.float32)
-    actions = np.zeros((90, 2), dtype=np.int32)
-    actions[:, 0] = ACCELERATION_VALUES.index(0.0)
-    actions[:, 1] = STEERING_VALUES.index(0.0)
+def write_history(data, t, x, y, heading, speed, policy_actions):
+    """Write past states and normalized commands, newest first.
+
+    Before the scenario begins, repeat the initial state and use neutral commands.
+    policy_actions[s] is the command selected at s, before actuator delay.
+    """
+    past_steps = np.maximum(t - np.arange(1, 11), 0)
+    cosine, sine = np.cos(heading[t]), np.sin(heading[t])
+    dx, dy = x[past_steps] - x[t], y[past_steps] - y[t]
+    positions = data[20:40].reshape(-1, 2)
+    positions[:, 0] = (dx * cosine + dy * sine) * 0.02
+    positions[:, 1] = (-dx * sine + dy * cosine) * 0.02
+    delta = heading[past_steps] - heading[t]
+    headings = data[40:60].reshape(-1, 2)
+    headings[:, 0], headings[:, 1] = np.cos(delta), np.sin(delta)
+    data[60:70] = speed[past_steps] / 27.7
+    # Older speed samples repeat the initial speed if they predate the scenario.
+    data[70:75] = speed[np.maximum(t - np.array([20, 30, 40, 50, 60]), 0)] / 27.7
+    commands = data[75:95].reshape(10, 2)
+    commands[:] = 0  # Normalized physical zero: no acceleration or steering.
+    count = min(t, 10)
+    commands[:count] = policy_actions[t-count:t][::-1]
+
+
+def process_scenario(filepath):
+    with open(filepath) as file:
+        scenario = json.load(file)
+    action_delay_steps = scenario["ego"]["action_delay_steps"]
+    if type(action_delay_steps) is not int or not 0 <= action_delay_steps <= 5:
+        raise ValueError(f"{filepath}: action_delay_steps must be an integer from 0 to 5")
+    print(f"processing {filepath} (action delay: {action_delay_steps} steps)", file=sys.stderr)
+    lanelet2_map = get_lanelet_map()
+    hide_road_border = scenario.get("hide_road_border", False)
+    hide_centerline = scenario.get("hide_centerline", False)
+
+    trajectory = {key: np.asarray(scenario["ego"][key], dtype=np.float64)
+                  for key in ("x", "y", "heading", "speed")}
+    steps = len(trajectory["x"]) - 1
+    # Reserve future transitions for every possible delay so scenario lengths
+    # stay independent of the sampled delay and can still be stacked for training.
+    sample_count = steps - 5
+    if sample_count <= 0 or any(len(v) != steps + 1 for v in trajectory.values()):
+        raise ValueError(f"{filepath}: need matching trajectories extending beyond 5 steps")
+    inputs = np.zeros((sample_count, 1936), dtype=np.float32)
+    expert_actions = np.zeros((steps, 2), dtype=np.int32)
+    expert_actions[:, 0] = ACCELERATION_VALUES.index(0.0)
+    expert_actions[:, 1] = STEERING_VALUES.index(0.0)
+    waypoints = np.zeros((sample_count, 5, 2), dtype=np.float32)
+    waypoint_mask = np.zeros((sample_count, 5), dtype=np.int8)
 
     prev_heading = scenario["ego"]["heading"][0]
     prev_speed = scenario["ego"]["speed"][0]
 
-    for t in range(90):
-        ego_x = scenario["ego"]["x"][t]
-        ego_y = scenario["ego"]["y"][t]
-        ego_heading = scenario["ego"]["heading"][t]
-
+    for t in range(steps):
         speed = scenario["ego"]["speed"][t]
         next_speed = scenario["ego"]["speed"][t + 1]
         next_heading = normalize_heading(scenario["ego"]["heading"][t + 1])
 
         desired_acceleration = (next_speed - prev_speed) / 0.1
-        if next_speed < 0.01 and prev_speed < 1.333*0.1:
-            accel_action_idx = ACCELERATION_VALUES.index(-1.333)
+        if next_speed < 0.01 and prev_speed <= 0.1:
+            accel_action_idx = ACCELERATION_VALUES.index(-1.0)
         elif desired_acceleration > 0:
             accel_action_idx = max([i for i in range(len(ACCELERATION_VALUES)) if ACCELERATION_VALUES[i] >= 0 and desired_acceleration >= ACCELERATION_VALUES[i]], key=lambda x: ACCELERATION_VALUES[x])
         else:
             accel_action_idx = min([i for i in range(len(ACCELERATION_VALUES)) if ACCELERATION_VALUES[i] <= 0 and desired_acceleration <= ACCELERATION_VALUES[i]], key=lambda x: ACCELERATION_VALUES[x])
-        actions[t][0] = accel_action_idx
+        expert_actions[t][0] = accel_action_idx
         prev_speed = max(0.1, prev_speed + ACCELERATION_VALUES[accel_action_idx] * 0.1)
 
         if speed > 0.1:
@@ -107,21 +145,43 @@ def process_scenario(filepath):
                 steering_action_idx = max([i for i in range(len(STEERING_VALUES)) if STEERING_VALUES[i] >= 0 and desired_steering >= STEERING_VALUES[i]], key=lambda x: STEERING_VALUES[x])
             else:
                 steering_action_idx = min([i for i in range(len(STEERING_VALUES)) if STEERING_VALUES[i] <= 0 and desired_steering <= STEERING_VALUES[i]], key=lambda x: STEERING_VALUES[x])
-            actions[t][1] = steering_action_idx
+            expert_actions[t][1] = steering_action_idx
             prev_heading = normalize_heading(prev_heading + speed * 0.1 * math.tan(STEERING_VALUES[steering_action_idx]) / wheelbase)
+
+    # The teacher issues the command early enough for the scenario's delay.
+    # Use this same issued-command timeline for both labels and past actions.
+    issued_actions = expert_actions[action_delay_steps:]
+    policy_actions = np.column_stack((
+        np.asarray(ACCELERATION_VALUES)[issued_actions[:, 0]] / 4.0,
+        np.asarray(STEERING_VALUES)[issued_actions[:, 1]] / 0.667,
+    ))
+
+    for row in range(sample_count):
+        t = row
+        ego_x = scenario["ego"]["x"][t]
+        ego_y = scenario["ego"]["y"][t]
+        ego_heading = scenario["ego"]["heading"][t]
+        speed = scenario["ego"]["speed"][t]
 
         rel_goal_x, rel_goal_y = to_egocentric_point(scenario["ego"]["goal"]["x"], scenario["ego"]["goal"]["y"],
                                                      ego_x, ego_y, ego_heading)
         rel_next_goal_x, rel_next_goal_y = to_egocentric_point(scenario["ego"]["next_goal"]["x"], scenario["ego"]["next_goal"]["y"],
                                                                ego_x, ego_y, ego_heading)
 
+        for f in range(5):
+            if t + f * 10 + 10 > steps:
+                break
+            waypoint_mask[row][f] = 1
+            future_x = scenario["ego"]["x"][t + f * 10 + 10]
+            future_y = scenario["ego"]["y"][t + f * 10 + 10]
+            waypoints[row][f] = to_egocentric_point(future_x, future_y, ego_x, ego_y, ego_heading)
 
         centerline_search_box = BoundingBox2d(BasicPoint2d(ego_x - 10, ego_y - 10), BasicPoint2d(ego_x + 10, ego_y + 10))
         lateral_offset = None
         lane_heading_angle_diff = None
         for lanelet in lanelet2_map.laneletLayer.search(centerline_search_box):
             if (
-                lanelet.id not in hidden_centerline_lanelet_ids
+                not hide_centerline
                 and "subtype" in lanelet.attributes
                 and lanelet.attributes["subtype"] == "road"
             ):
@@ -141,50 +201,54 @@ def process_scenario(filepath):
             lateral_offset = 0.0
             lane_heading_angle_diff = 0.0
 
-        data = inputs[t]
-
-        data[0] = rel_goal_x * 0.005
-        data[1] = rel_goal_y * 0.005
-        data[2] = speed / 27.7
-        data[3] = scenario["ego"]["width"] / 15.0
-        data[4] = scenario["ego"]["length"] / 30.0
-        data[5] = 1.0 # stop line reward coefficient
-        data[6] = 50 / 3.6 / 27.7 # max speed
-        data[7] = 2.5e-3 / 7.5e-4 # lane center reward coefficient
-        data[8] = 0.01 / 0.1 # comfort coefficient
-        data[9] = 2.5e-2 / 2.5e-2 # lane align reward coefficient
-        data[10] = 1.0 # collision reward coefficient
-        data[11] = 1.0 # off-road reward coefficient
-        data[12] = 0 # lane center bias
-        data[13] = lane_heading_angle_diff
-        data[14] = lateral_offset / 4.0
-        data[15] = scenario["ego"]["height"] / 10.0 # height
-        data[16] = rel_next_goal_x * 0.005
-        data[17] = rel_next_goal_y * 0.005
-        data[18] = 3.0 / 3.0 # goal radius
-        data[19] = (3 - 1) / 2.0 # remaining goals = 3
+        data = inputs[row]
+        # Safety penalties, comfort, then lane-following preferences.
+        data[0] = 1.0  # Collision reward coefficient
+        data[1] = 1.0  # Offroad reward coefficient
+        data[2] = 1.0  # Stop-line reward coefficient
+        data[3] = 0.01  # Comfort reward coefficient
+        data[4] = 2.5e-3  # Lane-center reward coefficient
+        data[5] = 2.5e-2  # Lane-alignment reward coefficient
+        data[6] = 0.0  # Lane-center bias
+        data[7] = speed / 27.7
+        data[8] = 50 / 3.6 / 27.7
+        data[9] = scenario["ego"]["width"] / 15.0
+        data[10] = scenario["ego"]["length"] / 30.0
+        data[11] = 1.0  # Goal radius / 3 m
+        data[12:14] = rel_goal_x * 0.005, rel_goal_y * 0.005
+        data[14:16] = rel_next_goal_x * 0.005, rel_next_goal_y * 0.005
+        remaining = scenario["ego"].get("remaining_goals", 3)
+        if isinstance(remaining, list):
+            remaining = remaining[t]
+        data[16] = remaining >= 2
+        data[17] = remaining >= 1
+        data[18] = lane_heading_angle_diff
+        data[19] = lateral_offset / 4.0
+        write_history(data, t, **trajectory, policy_actions=policy_actions)
 
         assert len(scenario["others"]) <= 63
 
-        for i, obj in enumerate(scenario["others"]):
+        nearby = (obj for obj in scenario["others"]
+                  if (obj["x"][t] - ego_x)**2 + (obj["y"][t] - ego_y)**2 <= 2500)
+        for i, obj in enumerate(nearby):
             obj_x, obj_y = to_egocentric_point(obj["x"][t], obj["y"][t], ego_x, ego_y, ego_heading)
             obj_heading_x, obj_heading_y = to_egocentric_vector(math.cos(obj["heading"][t]), math.sin(obj["heading"][t]), ego_heading)
-            data[20 + 7 * i] = obj_x * 0.02
-            data[20 + 7 * i + 1] = obj_y * 0.02
-            data[20 + 7 * i + 2] = obj["width"] / 15.0
-            data[20 + 7 * i + 3] = obj["length"] / 30.0
-            data[20 + 7 * i + 4] = obj_heading_x
-            data[20 + 7 * i + 5] = obj_heading_y
-            data[20 + 7 * i + 6] = obj["speed"][t] / 27.7
+            data[95 + 7 * i] = obj_x * 0.02
+            data[95 + 7 * i + 1] = obj_y * 0.02
+            data[95 + 7 * i + 2] = obj["width"] / 15.0
+            data[95 + 7 * i + 3] = obj["length"] / 30.0
+            data[95 + 7 * i + 4] = obj_heading_x
+            data[95 + 7 * i + 5] = obj_heading_y
+            data[95 + 7 * i + 6] = obj["speed"][t] / 27.7
 
         search_box = BoundingBox2d(BasicPoint2d(ego_x - 150, ego_y - 150), BasicPoint2d(ego_x + 150, ego_y + 150))
 
-        default_line_attribute = 0.1 / 100
+        default_line_attribute = 0.0
 
         centerline_linestrings = [
             (lanelet.centerline, 0, default_line_attribute)
             for lanelet in lanelet2_map.laneletLayer.search(search_box)
-            if lanelet.id not in hidden_centerline_lanelet_ids
+            if not hide_centerline
             and "subtype" in lanelet.attributes
             and lanelet.attributes["subtype"] == "road"
         ]
@@ -194,7 +258,7 @@ def process_scenario(filepath):
         border_linestrings = [
             (linestring, 2, default_line_attribute)
             for linestring in nearby_linestrings
-            if linestring.id not in hidden_road_border_ids
+            if not hide_road_border
             and "type" in linestring.attributes
             and linestring.attributes["type"] in {"road_border", "curbstone", "guard_rail"}
         ]
@@ -202,9 +266,12 @@ def process_scenario(filepath):
         stop_line_linestrings = []
         for linestring in nearby_linestrings:
             if "type" in linestring.attributes and linestring.attributes["type"] == "stop_line":
+                if "subtype" in linestring.attributes and linestring.attributes["subtype"] == "yield_right":
+                    stop_line_linestrings.append((linestring, RIGHT_HAND_STOP_LINE - 4, default_line_attribute))
+                    continue
                 traffic_light_states = scenario.get("traffic_light_states", {})
                 state_sequence = traffic_light_states.get(str(linestring.id))
-                if state_sequence is not None:
+                if state_sequence is not None and state_sequence[t] != "off":
                     status = state_sequence[t]
                     if status == "red":
                         line_attribute = -0.5
@@ -212,21 +279,21 @@ def process_scenario(filepath):
                         line_attribute = 0.0
                     elif status == "green":
                         line_attribute = 0.5
-                    elif status == "off":
-                        line_attribute = -1.0
                     else:
                         raise ValueError(
                             f"Unknown traffic-light state {status!r} for stop line "
                             f"{linestring.id} in {filepath}"
                         )
                     stop_line_linestrings.append((linestring, 5, line_attribute))
-                elif linestring.attributes["subtype"] in {"yield_manual", "yield", "yield_stop"}:
+                elif stop_line_fallback_type(linestring.attributes) == STOP_SIGN:
                     stop_line_linestrings.append((linestring, 3, default_line_attribute))
 
         crosswalk_linestrings = [
             (linestring, 4, default_line_attribute)
             for lanelet in lanelet2_map.laneletLayer.search(search_box)
-            if "subtype" in lanelet.attributes and lanelet.attributes["subtype"] == "crosswalk"
+            if not (hide_road_border and hide_centerline)
+            and "subtype" in lanelet.attributes
+            and lanelet.attributes["subtype"] == "crosswalk"
             for linestring in [lanelet.leftBound, lanelet.rightBound]
         ]
 
@@ -266,7 +333,9 @@ def process_scenario(filepath):
                 prev_p = p
 
         road_data = sorted(road_data, key=lambda row: math.hypot(row[0], row[1]))[:200]
-        data[20 + 7 * 63:20 + 7 * 63 + len(road_data) * 7] = np.array(road_data).ravel()
+        data[95 + 7 * 63:95 + 7 * 63 + len(road_data) * 7] = np.array(road_data).ravel()
+
+    actions = issued_actions[:sample_count]
 
     if os.environ.get("DEBUG") == "1":
         with open(f"/tmp/supervised_debug_{os.path.basename(filepath)}.bin", "wb") as f:
@@ -274,11 +343,11 @@ def process_scenario(filepath):
             compressed = lz4.block.compress(inputs.tobytes(), store_size=False)
 
             import struct
-            f.write(struct.pack("iii", 1861, 90, len(compressed)))
+            f.write(struct.pack("iii", 1936, sample_count, len(compressed)))
             f.write(compressed)
 
             # Reward data, not relevant here so set to all zeros
-            reward_compressed = lz4.block.compress(bytes([0]) * 4 * 7 * 90, store_size=False)
+            reward_compressed = lz4.block.compress(bytes([0]) * 4 * 7 * sample_count, store_size=False)
             f.write(struct.pack("ii", 7, len(reward_compressed)))
             f.write(reward_compressed)
 
@@ -286,20 +355,26 @@ def process_scenario(filepath):
             f.write(struct.pack("i", 2))
             f.write(actions.tobytes())
 
-    return inputs, actions
+    return inputs, actions, waypoints, waypoint_mask
 
 
 def main():
     scenario_dir = sys.argv[1]
-    scenario_files = sorted([os.path.join(root, file) for root, _dirs, files in os.walk(scenario_dir) for file in files])
+    scenario_files = sorted([os.path.join(root, file) for root, _dirs, files in os.walk(scenario_dir) for file in files if file.endswith(".json")])
     with Pool() as pool:
         results = pool.map(process_scenario, scenario_files)
 
-    inputs, actions = zip(*results)
+    inputs, actions, waypoints, waypoint_masks = zip(*results)
     inputs = np.stack(inputs, axis=0)
     actions = np.stack(actions, axis=0)
+    waypoints = np.stack(waypoints, axis=0)
+    waypoint_masks = np.stack(waypoint_masks, axis=0)
 
-    np.savez("supervised_data.npz", inputs=inputs, actions=actions)
+    np.savez("supervised_data.npz",
+             inputs=inputs,
+             actions=actions,
+             waypoints=waypoints,
+             waypoint_masks=waypoint_masks)
 
 if __name__ == "__main__":
     main()

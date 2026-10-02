@@ -34,7 +34,9 @@ static PyObject* make_static_road_map(PyObject* self, PyObject* args) {
     for (int i = 0; i < count; i++) {
         if (!grid_map_entity_type(roads[i].type) || roads[i].array_size < 0 ||
             (roads[i].array_size > 0 && (!roads[i].traj_x || !roads[i].traj_y || !roads[i].traj_z)) ||
-            (roads[i].type == TRAFFIC_LIGHT_STOP_LINE && roads[i].traffic_light_idx < 0)) {
+            (roads[i].type == TRAFFIC_LIGHT_STOP_LINE &&
+             (roads[i].traffic_light_idx < 0 ||
+              (roads[i].traffic_light_off_type != NONE && roads[i].traffic_light_off_type != STOP_SIGN)))) {
             PyErr_SetString(PyExc_ValueError, "Invalid static road geometry or traffic-light index");
             return NULL;
         }

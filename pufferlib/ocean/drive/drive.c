@@ -6,7 +6,7 @@
 // Use this test if the network changes to ensure that the forward pass
 // matches the torch implementation to the 3rd or ideally 4th decimal place
 void test_drivenet() {
-    int num_obs = 1848;
+    int num_obs = 95 + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     int num_actions = 2;
     int num_agents = 4;
 
@@ -19,7 +19,7 @@ void test_drivenet() {
 
     //Weights* weights = load_weights("resources/drive/puffer_drive_weights.bin");
     Weights* weights = load_weights("puffer_drive_weights.bin");
-    DriveNet* net = init_drivenet(weights, num_agents);
+    DriveNet* net = init_drivenet(weights, num_agents, CLASSIC);
 
     forward(net, observations, actions);
     for (int i = 0; i < num_agents*num_actions; i++) {
