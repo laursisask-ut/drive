@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 import pufferlib
 import pufferlib.models
+from pufferlib.ocean.drive import observation as drive_obs
 
 from pufferlib.models import Default as Policy  # noqa: F401
 from pufferlib.models import Convolutional as Conv  # noqa: F401
@@ -18,7 +19,7 @@ class Drive(nn.Module):
         self.hidden_size = hidden_size
 
         # Determine ego dimension from environment's dynamics model
-        self.ego_dim = 23 if env.dynamics_model == "jerk" else 20
+        self.ego_dim = drive_obs.ego_features(env.dynamics_model)
 
         self.ego_encoder = nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
@@ -26,9 +27,8 @@ class Drive(nn.Module):
             # nn.ReLU(),
             pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
         )
-        max_road_objects = 13
         self.road_encoder = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(max_road_objects, input_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(14, input_size)),
             nn.LayerNorm(input_size),
             # nn.ReLU(),
             pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
@@ -78,7 +78,7 @@ class Drive(nn.Module):
         road_objects = road_obs.view(-1, 200, 7)
         road_continuous = road_objects[:, :, :6]  # First 6 features
         road_categorical = road_objects[:, :, 6]
-        road_onehot = F.one_hot(road_categorical.long(), num_classes=7)  # Shape: [batch, 200, 7]
+        road_onehot = F.one_hot(road_categorical.long(), num_classes=8)  # Type 11 (yield_right) is category 7.
         road_objects = torch.cat([road_continuous, road_onehot], dim=2)
         ego_features = self.ego_encoder(ego_obs)
         partner_features, _ = self.partner_encoder(partner_objects).max(dim=1)
@@ -126,17 +126,18 @@ class SceneEncoderBlock(torch.nn.Module):
         return x + mlp_out
 
 class SceneEncoder(torch.nn.Module):
-    def __init__(self, ego_dim=20, hidden_dim=256, num_blocks=4):
+    def __init__(self, ego_dim=95, hidden_dim=256, num_blocks=4):
         super().__init__()
         self.ego_dim = ego_dim
-        self.ego_state_indices = [2, 3, 4, 5, 6, 13, 14, 15]
-        if ego_dim == 23:
-            self.ego_state_indices += [20, 21, 22]
-        self.goal_indices = [0, 1, 18, 19]
-        self.next_goal_indices = [16, 17]
-        self.reward_pref_indices = [7, 8, 9, 10, 11, 12]
+        if ego_dim not in (95, 98):
+            raise ValueError("Unsupported Drive ego layout; regenerate observations and retrain old checkpoints")
+        # All pose, speed and selected-command history belongs to this one token.
+        self.ego_state_indices = list(range(7, 12)) + list(range(18, ego_dim))
+        self.goal_indices = [12, 13, 16, 17]
+        self.next_goal_indices = [14, 15]
+        self.reward_pref_indices = list(range(7))
         self.map_proj = torch.nn.Sequential(
-            torch.nn.Linear(13, hidden_dim),
+            torch.nn.Linear(14, hidden_dim),
             torch.nn.ReLU()
         )
         self.vehicle_proj = torch.nn.Sequential(
@@ -181,7 +182,7 @@ class SceneEncoder(torch.nn.Module):
 
         road_continuous = road_obs[:, :, :6]
         road_categorical = road_obs[:, :, 6]
-        road_onehot = F.one_hot(road_categorical.long(), num_classes=7)
+        road_onehot = F.one_hot(road_categorical.long(), num_classes=8)
         map_data = torch.cat([road_continuous, road_onehot], dim=2)
 
         map_tokens = self.map_proj(map_data.view(B * M, -1)).view(B, M, -1)
@@ -251,7 +252,7 @@ class Wayformer(torch.nn.Module):
         super().__init__()
         hidden_dim = 128
         if ego_dim is None:
-            ego_dim = 23 if env.dynamics_model == "jerk" else 20
+            ego_dim = drive_obs.ego_features(env.dynamics_model if env is not None else "classic")
         if action_dim is None:
             action_dim = env.single_action_space.nvec.tolist()
         self.encoder = SceneEncoder(ego_dim=ego_dim, hidden_dim=hidden_dim, num_blocks=2)

@@ -956,8 +956,6 @@ road_border_index = RoadBorderIndex(lanelet2_map.lineStringLayer)
 map_spawn_positions, pedestrian_crossing_routes_cache, map_parked_spawn_positions = load_or_build_mapgen_cache(
     MAP_PATH, MAPGEN_CACHE_PATH, map_lanelets, road_border_index,
 )
-print("map_spawn_positions", len(map_spawn_positions))
-print("map_parked_spawn_positions", len(map_parked_spawn_positions))
 map_pedestrian_crossing_routes = tuple(pedestrian_crossing_routes_cache.values())
 map_obstacle_positions = load_obstacle_positions(
     MAP_PATH, (utm_origin_lat, utm_origin_lon), OBSTACLE_CACHE_PATH, map_lanelets,
