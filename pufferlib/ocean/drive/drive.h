@@ -343,11 +343,11 @@ static inline int grid_map_entity_type(int type) {
 static inline int sample_traffic_light_transition(int color) {
     switch (color) {
         case TRAFFIC_LIGHT_RED:
-            return rand_int_inclusive(5, 50);
+            return rand_int_inclusive(20, 50);
         case TRAFFIC_LIGHT_YELLOW:
-            return rand_int_inclusive(10, 30);
+            return rand_int_inclusive(20, 30);
         case TRAFFIC_LIGHT_GREEN:
-            return rand_int_inclusive(10, 100);
+            return rand_int_inclusive(20, 100);
         default:
             return 0;
     }
