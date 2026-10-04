@@ -84,6 +84,8 @@ DRIVE_STEPS_PER_SECOND = 10
 YIELD_VALIDATION_SECONDS = 10
 YIELD_VALIDATION_SCENARIO_LENGTH = YIELD_VALIDATION_SECONDS * DRIVE_STEPS_PER_SECOND
 YIELD_VALIDATION_AGENTS_PER_MAP = 1
+DEFAULT_EVAL_SET = "yield_multi_car_validation"
+MAX_AGENTS_PER_DRIVE_MAP = 128
 
 VALIDATION_SPECS = (
     {
@@ -119,6 +121,21 @@ VALIDATION_SPECS = (
             num_maps=YIELD_VALIDATION_MAP_COUNT,
             num_agents=YIELD_VALIDATION_MAP_COUNT * YIELD_VALIDATION_AGENTS_PER_MAP,
             map_dir="yield-validation",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            scenario_length=YIELD_VALIDATION_SCENARIO_LENGTH,
+        ),
+        "max_scenario_length": YIELD_VALIDATION_SCENARIO_LENGTH + 1,
+    },
+    {
+        "name": "yield_two_agent_validation",
+        "sample_count": YIELD_VALIDATION_MAP_COUNT,
+        "sample_seed": 0,
+        "env_kwargs": dict(
+            resample_frequency=-1,
+            num_maps=YIELD_VALIDATION_MAP_COUNT,
+            num_agents=YIELD_VALIDATION_MAP_COUNT * 2,
+            map_dir="yield-two-agent-validation",
             dynamic_map_generation=False,
             all_maps_exactly_once=True,
             scenario_length=YIELD_VALIDATION_SCENARIO_LENGTH,
@@ -864,7 +881,7 @@ class PuffeRL:
         for k in list(stats.keys()):
             v = stats[k]
             try:
-                v = np.mean(v)
+                v = np.sum(v) if k == "priority_violations" else np.mean(v)
             except:
                 del stats[k]
                 continue
@@ -1513,66 +1530,101 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     return all_logs
 
 
-def eval(env_name, args=None, vecenv=None, policy=None):
-    args = args or load_config(env_name)
-    backend = args["vec"]["backend"]
-    if backend != "PufferEnv":
-        backend = "Serial"
+def _validation_map_count(map_dir):
+    if not os.path.isdir(map_dir):
+        raise pufferlib.APIUsageError(f"Evaluation map directory does not exist: {map_dir}")
 
-    args["vec"] = dict(backend=backend, num_envs=1)
-    vecenv = vecenv or load_env(env_name, args)
+    map_names = sorted(name for name in os.listdir(map_dir) if name.endswith(".bin"))
+    if not map_names:
+        raise pufferlib.APIUsageError(f"No .bin scenarios found in evaluation map directory: {map_dir}")
 
-    policy = policy or load_policy(args, vecenv, env_name)
-    ob, info = vecenv.reset()
-    driver = vecenv.driver_env
-    num_agents = vecenv.observation_space.shape[0]
-    device = args["train"]["device"]
-
-    # Rebuild visualize binary if saving frames (for C-based rendering)
-    if args["save_frames"] > 0:
-        ensure_drive_binary()
-
-    state = {}
-    if args["train"]["use_rnn"]:
-        state = dict(
-            lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
-            lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
+    expected_names = [f"map_{i:03d}.bin" for i in range(len(map_names))]
+    if map_names != expected_names:
+        raise pufferlib.APIUsageError(
+            f"Evaluation scenarios in {map_dir} must be named contiguously "
+            f"from map_000.bin through map_{len(map_names) - 1:03d}.bin"
         )
 
-    frames = []
-    while True:
-        render = driver.render()
-        if len(frames) < args["save_frames"]:
-            frames.append(render)
+    missing_targets = [name for name in map_names if not os.path.isfile(os.path.join(map_dir, name))]
+    if missing_targets:
+        raise pufferlib.APIUsageError(
+            f"Evaluation map is missing or is a broken symlink: {os.path.join(map_dir, missing_targets[0])}"
+        )
 
-        # Screenshot Ocean envs with F12, gifs with control + F12
-        if driver.render_mode == "ansi":
-            print("\033[0;0H" + render + "\n")
-            time.sleep(1 / args["fps"])
-        elif driver.render_mode == "rgb_array":
-            pass
-            # import cv2
-            # render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
-            # cv2.imshow('frame', render)
-            # cv2.waitKey(1)
-            # time.sleep(1/args['fps'])
+    return len(map_names)
 
-        with torch.no_grad():
-            ob = torch.as_tensor(ob).to(device)
-            logits, value = policy.forward_eval(ob, state)
-            action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
-            action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
-        if isinstance(logits, torch.distributions.Normal):
-            action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
+def eval(env_name, args=None, vecenv=None, policy=None):
+    args = args or load_config(env_name)
+    if policy is None and not args["load_model_path"]:
+        raise pufferlib.APIUsageError("eval requires --load-model-path pointing to a policy checkpoint")
 
-        ob = vecenv.step(action)[0]
+    validation_spec = next(spec for spec in VALIDATION_SPECS if spec["name"] == args["eval_set"])
+    map_dir = args["eval_map_dir"] or validation_spec["env_kwargs"]["map_dir"]
+    map_dir = os.path.normpath(os.path.expandvars(os.path.expanduser(map_dir)))
+    scenario_count = _validation_map_count(map_dir)
 
-        if len(frames) > 0 and len(frames) == args["save_frames"]:
-            import imageio
+    validation_kwargs = dict(args["env"])
+    validation_kwargs.update(validation_spec["env_kwargs"])
+    validation_kwargs.update(
+        map_dir=map_dir,
+        num_maps=scenario_count,
+        # binding.shared stops once num_agents is reached. This upper bound
+        # ensures every map is opened even if a custom directory has maps
+        # with more than one policy-controlled agent.
+        num_agents=scenario_count * MAX_AGENTS_PER_DRIVE_MAP,
+        report_interval=1,
+        artifact_dir="/tmp/puffer_drive_eval",
+        replay_everything=True
+    )
 
-            imageio.mimsave(args["gif_path"], frames, fps=args["fps"], loop=0)
-            frames.append("Done")
+    owns_env = vecenv is None
+    validation_env = vecenv or Drive(**validation_kwargs)
+    device = args["train"]["device"]
+    metric_keys = ("completion_rate", "collision_rate", "offroad_rate", "priority_violations")
+    metric_log = None
+
+    try:
+        policy = policy or load_policy(args, validation_env, env_name)
+        policy.eval()
+        observations, _ = validation_env.reset()
+        num_agents = observations.shape[0]
+
+        state = None
+        if args["train"]["use_rnn"]:
+            state = dict(
+                lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
+                lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
+            )
+
+        with torch.inference_mode():
+            for _ in range(validation_spec["max_scenario_length"]):
+                logits, _value = policy.forward_eval(torch.as_tensor(observations).to(device), state)
+                actions = torch.stack([l.argmax(dim=-1) for l in logits], dim=-1)
+                actions = actions.cpu().numpy()
+                if isinstance(logits, torch.distributions.Normal):
+                    actions = np.clip(actions, validation_env.action_space.low, validation_env.action_space.high)
+
+                observations, _rewards, _terminals, _truncations, info = validation_env.step(actions)
+                for item in info:
+                    if all(key in item for key in metric_keys):
+                        if metric_log is not None:
+                            raise RuntimeError("Evaluation produced more than one aggregate scenario log")
+                        metric_log = item
+
+        if metric_log is None:
+            raise RuntimeError("Evaluation finished without producing scenario metrics")
+
+        metrics = {key: float(metric_log[key]) for key in metric_keys}
+        print(f"Evaluated {scenario_count} scenarios from {map_dir}")
+        print(f"Completion rate: {metrics['completion_rate']:.2%}")
+        print(f"Collision rate: {metrics['collision_rate']:.2%}")
+        print(f"Offroad rate: {metrics['offroad_rate']:.2%}")
+        print(f"Priority violations: {metrics['priority_violations']:.0f}")
+        return metrics
+    finally:
+        if owns_env:
+            validation_env.close()
 
 
 def sweep(args=None, env_name=None):
@@ -1761,6 +1813,21 @@ def load_config(env_name):
         add_help=False,
     )
     parser.add_argument("--load-model-path", type=str, default=None, help="Path to a pretrained checkpoint")
+    parser.add_argument(
+        "--eval-set",
+        type=str,
+        choices=[spec["name"] for spec in VALIDATION_SPECS],
+        default=DEFAULT_EVAL_SET,
+        help="Validation configuration to run",
+    )
+    parser.add_argument(
+        "--eval-map-dir",
+        "--map-path",
+        dest="eval_map_dir",
+        type=str,
+        default=None,
+        help="Override the validation configuration's scenario directory",
+    )
     parser.add_argument("--config-file", type=str, default="config/ocean/drive.ini")
     parser.add_argument(
         "--load-id", type=str, default=None, help="Kickstart/eval from from a finished Wandb/Neptune run"
