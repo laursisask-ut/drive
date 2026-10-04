@@ -27,6 +27,8 @@
 #define CROSSWALK 8
 #define TRAFFIC_LIGHT_STOP_LINE 9
 #define RIGHT_HAND_STOP_LINE 11
+#define EXIT_ORDER 99
+#define MAX_EXIT_ORDER_AGENTS 32
 #define MAP_ENTITY_TYPE_MASK 0xFF
 #define MAP_TRAFFIC_LIGHT_YIELD_FLAG 0x200
 
@@ -177,6 +179,8 @@ struct Log {
     float lane_lateral_offset;
     float lane_heading_angle_diff;
     float close_to_lane;
+    float avg_distance_driven_per_agent;
+    float priority_violations;
 };
 
 typedef struct Entity Entity;
@@ -283,6 +287,16 @@ struct TrafficLightState {
     int traffic_light_color;
     int traffic_light_transition_in;
 };
+
+typedef struct ExitOrder {
+    int array_size;
+    float* traj_x;
+    float* traj_y;
+    int exit_order[MAX_EXIT_ORDER_AGENTS];
+    int expected_exit_order[MAX_EXIT_ORDER_AGENTS];
+    int exit_count;
+    int expected_exit_count;
+} ExitOrder;
 
 void free_entity(Entity* entity){
     // free trajectory arrays
@@ -471,6 +485,8 @@ struct Drive {
     int action_type;
     int human_agent_idx;
     Entity* entities;
+    ExitOrder* exit_orders;
+    int num_exit_orders;
     StaticRoadEntity* static_road_entities;
     StaticRoadMap* static_road_map;
     TrafficLightState* traffic_light_states;
@@ -511,6 +527,72 @@ struct Drive {
     char* replay_dir;
     ReplayExportLog export_log;
 };
+
+static int inside_exit_order(const ExitOrder* order, float x, float y) {
+    int inside = 0;
+    for (int i = 0, j = order->array_size - 1; i < order->array_size; j = i++) {
+        float xi = order->traj_x[i], yi = order->traj_y[i];
+        float xj = order->traj_x[j], yj = order->traj_y[j];
+        // Points on the boundary are still inside.
+        if ((x - xi) * (yj - yi) == (y - yi) * (xj - xi) &&
+            x >= fminf(xi, xj) && x <= fmaxf(xi, xj) &&
+            y >= fminf(yi, yj) && y <= fmaxf(yi, yj)) return 1;
+        if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+            inside = !inside;
+    }
+    return inside;
+}
+
+static int exited_polygon(const ExitOrder* order, float prev_x, float prev_y, float x, float y) {
+    // An invalid/expired expert trajectory is not a polygon exit.
+    if (!isfinite(prev_x) || !isfinite(prev_y) || !isfinite(x) || !isfinite(y) ||
+        prev_x == INVALID_POSITION || prev_y == INVALID_POSITION ||
+        x == INVALID_POSITION || y == INVALID_POSITION) return 0;
+    return inside_exit_order(order, prev_x, prev_y) && !inside_exit_order(order, x, y);
+}
+
+static void append_exit(int* order, int* count, int agent_idx) {
+    if (*count == MAX_EXIT_ORDER_AGENTS) return;
+    for (int i = 0; i < *count; i++) {
+        if (order[i] == agent_idx) return;
+    }
+    order[(*count)++] = agent_idx;
+}
+
+static void reset_exit_orders(Drive* env) {
+    for (int i = 0; i < env->num_exit_orders; i++) {
+        ExitOrder* order = &env->exit_orders[i];
+        order->exit_count = order->expected_exit_count = 0;
+        // add_log runs before movement at scenario_length. Match that window;
+        // exits on the same step are ordered by entity index in both sequences.
+        for (int t = env->init_steps + 1; t < env->scenario_length; t++) {
+            for (int idx = 0; idx < env->num_objects; idx++) {
+                const Entity* e = &env->entities[idx];
+                if (e->type != VEHICLE || t <= 0 || t >= e->array_size ||
+                    (e->traj_valid && (!e->traj_valid[t - 1] || !e->traj_valid[t]))) continue;
+                if (exited_polygon(order, e->traj_x[t - 1], e->traj_y[t - 1], e->traj_x[t], e->traj_y[t]))
+                    append_exit(order->expected_exit_order, &order->expected_exit_count, idx);
+            }
+        }
+    }
+}
+
+static void update_exit_orders(Drive* env) {
+    for (int i = 0; i < env->num_exit_orders; i++) {
+        ExitOrder* order = &env->exit_orders[i];
+        for (int idx = 0; idx < env->num_objects; idx++) {
+            const Entity* e = &env->entities[idx];
+            if (e->type != VEHICLE) continue;
+            if (!e->active_agent && e->mark_as_expert) {
+                int t = env->timestep;
+                if (t <= 0 || t >= e->array_size ||
+                    (e->traj_valid && (!e->traj_valid[t - 1] || !e->traj_valid[t]))) continue;
+            }
+            if (exited_polygon(order, e->prev_x, e->prev_y, e->x, e->y))
+                append_exit(order->exit_order, &order->exit_count, idx);
+        }
+    }
+}
 
 static int road_traffic_light_color(const Drive* env, const StaticRoadEntity* road) {
     int idx = road->traffic_light_idx;
@@ -594,6 +676,14 @@ static void scan_vehicles_initial(const Drive* env, SelectionBuckets* out, int c
     }
 }
 void add_log(Drive* env) {
+    for (int i = 0; i < env->num_exit_orders; i++) {
+        const ExitOrder* order = &env->exit_orders[i];
+        if (order->exit_count != order->expected_exit_count ||
+            memcmp(order->exit_order, order->expected_exit_order, order->exit_count * sizeof(int)) != 0) {
+            env->log.priority_violations += 1.0f;
+            break; // One binary violation per episode, regardless of agent/polygon count.
+        }
+    }
     for(int i = 0; i < env->active_agent_count; i++){
         Entity* e = &env->entities[env->active_agent_indices[i]];
 
@@ -629,6 +719,7 @@ void add_log(Drive* env) {
         env->log.lane_heading_angle_diff += env->logs[i].lane_heading_angle_diff;
         env->log.lane_lateral_offset += env->logs[i].lane_lateral_offset;
         env->log.close_to_lane += env->logs[i].close_to_lane;
+        env->log.avg_distance_driven_per_agent += env->logs[i].avg_distance_driven_per_agent;
         env->log.episode_length += env->logs[i].episode_length;
         env->log.episode_return += env->logs[i].episode_return;
         env->log.goal_reward += env->logs[i].goal_reward;
@@ -928,9 +1019,11 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     fread(&env->num_roads, sizeof(int), 1, file);
     Entity* entities = (Entity*)calloc(env->num_objects, sizeof(Entity));
     env->static_road_entities = (StaticRoadEntity*)calloc(env->num_roads, sizeof(StaticRoadEntity));
+    int num_records = env->num_objects + env->num_roads;
+    env->num_roads = 0;
     int traffic_light_idx = 0;
     int initial_scenario_length = env->scenario_length;
-    for (int i = 0; i < env->num_objects + env->num_roads; i++) {
+    for (int i = 0; i < num_records; i++) {
         Entity road_record = {0};
         Entity* e = i < env->num_objects ? &entities[i] : &road_record;
 	    // Read base entity data
@@ -1002,7 +1095,17 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             }
         }
         if (i >= env->num_objects) {
-            StaticRoadEntity* road = &env->static_road_entities[i - env->num_objects];
+            // Type 99 uses the existing road record format, but owns only XY.
+            if (e->type == EXIT_ORDER) {
+                env->exit_orders = realloc(env->exit_orders, (env->num_exit_orders + 1) * sizeof(ExitOrder));
+                env->exit_orders[env->num_exit_orders++] = (ExitOrder){
+                    .array_size = e->array_size, .traj_x = e->traj_x, .traj_y = e->traj_y,
+                };
+                e->traj_x = e->traj_y = NULL;
+                free_entity(e);
+                continue;
+            }
+            StaticRoadEntity* road = &env->static_road_entities[env->num_roads++];
             road->type = e->type;
             road->array_size = e->array_size;
             road->traj_x = e->traj_x;
@@ -1145,6 +1248,7 @@ void set_start_position(Drive* env){
             reset_ego_history(e);
         }
     }
+    reset_exit_orders(env);
     record_replay_trajectories(env);
     //EndDrawing();
 }
@@ -1419,6 +1523,8 @@ static StaticRoadMap* create_static_road_map(StaticRoadEntity* roads, int num_ro
 
 void move_expert(Drive* env, float* actions, int agent_idx){
     Entity* agent = &env->entities[agent_idx];
+    agent->prev_x = agent->x;
+    agent->prev_y = agent->y;
     int t = env->timestep;
     if (t < 0 || t >= agent->array_size || (agent->traj_valid && agent->traj_valid[t] == 0)) {
         if (env->dynamic_map_generation) return;
@@ -2391,6 +2497,11 @@ static void saveReplayToFile(Drive* env) {
 }
 
 void c_close(Drive* env){
+    for (int i = 0; i < env->num_exit_orders; i++) {
+        free(env->exit_orders[i].traj_x);
+        free(env->exit_orders[i].traj_y);
+    }
+    free(env->exit_orders);
     for(int i = 0; i < env->num_objects; i++){
         free_entity(&env->entities[i]);
     }
@@ -2541,6 +2652,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         float speed = sqrtf(vx*vx + vy*vy);
         float new_speed = speed + acceleration * env->dt;
         new_speed = clipSpeed(new_speed, agent);
+        env->logs[action_idx].avg_distance_driven_per_agent += new_speed * env->dt;
 
         // Compute yaw rate
         float beta = tanh(.5*tanf(steering));
@@ -3455,6 +3567,7 @@ void c_step(Drive* env){
         env->logs[i].avg_displacement_error = current_ade;
     }
 
+    if (env->num_exit_orders > 0 && env->timestep < env->scenario_length) update_exit_orders(env);
     record_replay_trajectories(env);
 
     compute_observations(env);

@@ -122,7 +122,7 @@ def main():
 
             train_updates += 1
             bar.set_description(f"Train loss: {train_loss_sum / train_updates:.5f}, accel accuracy: {train_accel_accuracy_sum / train_updates:.5f}, steering accuracy: {train_steering_accuracy_sum / train_updates:.5f}")
-        
+
         with torch.no_grad():
             model.eval()
             loss_sum = 0

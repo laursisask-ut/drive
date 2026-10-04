@@ -1351,7 +1351,7 @@ def generate_map():
         ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
-        ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.1)
+        ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.03)
         ent.friction_coefficient = random.uniform(0.7, 1.3)
         ent.acceleration_gain = random.uniform(0.9, 1.1)
         ent.steering_gain = random.uniform(0.9, 1.1)

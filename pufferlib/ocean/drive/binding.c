@@ -445,6 +445,7 @@ static int my_log(
     assign_to_dict(dict, "stop_line_rate", log->stop_line_rate);
     assign_to_dict(dict, "episode_length", log->episode_length);
     assign_to_dict(dict, "collision_rate", log->collision_rate);
+    assign_to_dict(dict, "priority_violations", log->priority_violations);
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "goal_reward", log->goal_reward);
     assign_to_dict(dict, "lane_center_reward", log->lane_center_reward);
@@ -470,6 +471,7 @@ static int my_log(
     assign_to_dict(dict, "close_to_lane", log->close_to_lane);
     assign_to_dict(dict, "lane_heading_angle_diff", log->lane_heading_angle_diff);
     assign_to_dict(dict, "lane_lateral_offset", log->lane_lateral_offset);
+    assign_to_dict(dict, "avg_distance_driven_per_agent", log->avg_distance_driven_per_agent);
 
     if (assign_int_array_to_dict(dict, "collision_counts", collision_counts, COLLISION_COUNT_BUCKETS)) {
         return 1;
