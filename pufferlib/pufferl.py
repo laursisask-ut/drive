@@ -62,7 +62,6 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 TABLE_METRIC_KEYS = {
     "collision_counts",
     "expert_collision_counts",
-    "blind_vehicle_collision_counts",
     "offroad_counts",
     "stop_line_counts",
     "comfort_violation_counts",
@@ -88,6 +87,23 @@ DEFAULT_EVAL_SET = "yield_multi_car_validation"
 MAX_AGENTS_PER_DRIVE_MAP = 128
 
 VALIDATION_SPECS = (
+    {
+        "name": "traffic_light_validation",
+        "env_kwargs": dict(
+            resample_frequency=-1,
+            num_maps=64,
+            num_agents=64,
+            map_dir="traffic-light-validation",
+            dynamic_map_generation=False,
+            all_maps_exactly_once=True,
+            deterministic_agent_selection=True,
+            use_goal_generation=False,
+            init_steps=0,
+            dt=0.1,
+            scenario_length=201,
+        ),
+        "max_scenario_length": 202,
+    },
     {
         "name": "validation",
         "env_kwargs": dict(
@@ -330,7 +346,6 @@ class PuffeRL:
         self.last_stats = defaultdict(list)
         self.collision_counts = np.zeros((5151,), np.int64)
         self.expert_collision_counts = np.zeros((100,), np.int64)
-        self.blind_vehicle_collision_counts = np.zeros((100,), np.int64)
         self.offroad_counts = np.zeros((100,), np.int64)
         self.stop_line_counts = np.zeros((100,), np.int64)
         self.comfort_violation_counts = np.zeros((100,), np.int64)
@@ -380,9 +395,6 @@ class PuffeRL:
             return True
         if key == "expert_collision_counts":
             self.expert_collision_counts += value
-            return True
-        if key == "blind_vehicle_collision_counts":
-            self.blind_vehicle_collision_counts += value
             return True
         if key == "offroad_counts":
             self.offroad_counts += value
@@ -881,7 +893,7 @@ class PuffeRL:
         for k in list(stats.keys()):
             v = stats[k]
             try:
-                v = np.sum(v) if k == "priority_violations" else np.mean(v)
+                v = np.sum(v) if k in ("priority_violations", "traffic_light_violations") else np.mean(v)
             except:
                 del stats[k]
                 continue
@@ -917,7 +929,6 @@ class PuffeRL:
         if self.epoch - self.last_table_metrics_sent_epoch >= config["table_metrics_interval"]:
             logs["collision_counts"] = self.create_collision_counts_table()
             logs["expert_collision_counts"] = self.create_expert_collision_counts_table()
-            logs["blind_vehicle_collision_counts"] = self.create_blind_vehicle_collision_counts_table()
             logs["offroad_counts"] = self.create_offroad_counts_table()
             logs["stop_line_counts"] = self.create_stop_line_counts_table()
             logs["comfort_violation_counts"] = self.create_comfort_violation_counts_table()
@@ -953,14 +964,6 @@ class PuffeRL:
         for coef_bin in range(100):
             data.append([coef_bin / 100, self.expert_collision_counts[coef_bin]])
         self.expert_collision_counts[:] = 0
-
-        return wandb.Table(data=data, columns=["collision_coefficient", "n"], log_mode="MUTABLE")
-
-    def create_blind_vehicle_collision_counts_table(self):
-        data = []
-        for coef_bin in range(100):
-            data.append([coef_bin / 100, self.blind_vehicle_collision_counts[coef_bin]])
-        self.blind_vehicle_collision_counts[:] = 0
 
         return wandb.Table(data=data, columns=["collision_coefficient", "n"], log_mode="MUTABLE")
 
@@ -1581,7 +1584,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     owns_env = vecenv is None
     validation_env = vecenv or Drive(**validation_kwargs)
     device = args["train"]["device"]
-    metric_keys = ("completion_rate", "collision_rate", "offroad_rate", "priority_violations")
+    metric_keys = ("completion_rate", "collision_rate", "offroad_rate", "priority_violations", "traffic_light_violations")
     metric_log = None
 
     try:
@@ -1621,6 +1624,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         print(f"Collision rate: {metrics['collision_rate']:.2%}")
         print(f"Offroad rate: {metrics['offroad_rate']:.2%}")
         print(f"Priority violations: {metrics['priority_violations']:.0f}")
+        print(f"Traffic light violations: {metrics['traffic_light_violations']:.0f}")
         return metrics
     finally:
         if owns_env:
