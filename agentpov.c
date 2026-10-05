@@ -29,15 +29,14 @@ static const char *DISPLAY_REWARD_LABELS[DISPLAY_REWARD_COMPONENT_COUNT] = {
 };
 
 static const float DISPLAY_ACCELERATION_VALUES[7] = {
-    -4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f,
+    -4.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 4.0f,
 };
 
 static const float DISPLAY_STEERING_VALUES[13] = {
-    -0.667f, -0.500f, -0.333f, -0.167f, -0.035f, -0.08f, 0.000f,
-    0.08f, 0.035f, 0.167f, 0.333f, 0.500f, 0.667f,
+    -0.667f, -0.500f, -0.333f, -0.167f, -0.08f, -0.01f, 0.000f,
+    0.01f, 0.08f, 0.167f, 0.333f, 0.500f, 0.667f,
 };
 
-static const int EGO_OBS_COLLISION_REWARD_COEFFICIENT_IDX = 10;
 
 static Color traffic_light_color_from_obs(float value) {
     if (value <= -0.75f) {
@@ -368,7 +367,7 @@ int main(int argc, char *argv[]) {
     const int other_agent_count = 63;
     const int road_segment_count = 200;
     int ego_dim = max_obs - other_agent_count * 7 - road_segment_count * 7;
-    if (ego_dim != 20 && ego_dim != 23) {
+    if (ego_dim != 95 && ego_dim != 98) {
         fprintf(stderr, "invalid replay layout: max_obs=%d inferred ego_dim=%d\n", max_obs, ego_dim);
         free(obs_buf);
         free(reward_values);
@@ -443,18 +442,70 @@ int main(int argc, char *argv[]) {
         rlDisableBackfaceCulling();
         rlPushMatrix();
         rlScalef(-1, 1, 1);
-        float goal_x = obs[t][0] / 0.005f;
-        float goal_y = obs[t][1] / 0.005f;
-        float speed = obs[t][2] * 27.7f;
-        float width = obs[t][3] * 15.0f;
-        float length = obs[t][4] * 30.0f;
-        float lane_heading_angle_diff = obs[t][13];
-        float lane_lateral_offset = obs[t][14] * 4.0f;
-        float next_goal_x = obs[t][16] / 0.005f;
-        float next_goal_y = obs[t][17] / 0.005f;
-        float goal_radius = obs[t][18] * 3.0f;
-        float collision_reward_coefficient = obs[t][EGO_OBS_COLLISION_REWARD_COEFFICIENT_IDX];
-        int remaining_goals = (int)roundf(obs[t][19] * 2.0f + 1.0f);
+        float goal_x = obs[t][12] / 0.005f;
+        float goal_y = obs[t][13] / 0.005f;
+        float speed = obs[t][7] * 27.7f;
+        float width = obs[t][9] * 15.0f;
+        float length = obs[t][10] * 30.0f;
+        float lane_heading_angle_diff = obs[t][18];
+        float lane_lateral_offset = obs[t][19] * 4.0f;
+        float next_goal_x = obs[t][14] / 0.005f;
+        float next_goal_y = obs[t][15] / 0.005f;
+        float goal_radius = obs[t][11] * 3.0f;
+        float collision_reward_coefficient = obs[t][0];
+        int remaining_goals = (int)(obs[t][16] + obs[t][17]);
+
+        // Draw roads beneath the history trail and vehicle outlines.
+        int valid_road_points = 0;
+        for (int road_idx = 0; road_idx < road_segment_count; road_idx++) {
+            float *road_obs = &obs[t][ego_dim + other_agent_count * 7 + road_idx * 7];
+
+            float rel_x = road_obs[0] / 0.02f;
+            float rel_y = road_obs[1] / 0.02f;
+
+            float road_length = road_obs[2] * 100.0f;
+            if (road_length < 1e-5) continue;
+
+            int road_type = roundf(road_obs[6] + 4);
+            Color color = WHITE;
+            if (road_type == 4) {
+                color = GRAY;
+            } else if (road_type == 6) {
+                color = (Color){220, 220, 220, 255};
+            } else if (road_type == 7) {
+                color = RED;
+            } else if (road_type == 11) {
+                color = (Color){255, 182, 193, 255};
+            } else if (road_type == 9) {
+                color = traffic_light_color_from_obs(road_obs[3]);
+            } else if (road_type == 8) {
+                color = YELLOW;
+            }
+
+            float rel_heading_x = road_obs[4];
+            float rel_heading_y = road_obs[5];
+
+            DrawTriangle(
+                (Vector2){rel_x + 0.75f * rel_heading_x, rel_y + 0.75f * rel_heading_y},
+                (Vector2){rel_x - 0.75f * rel_heading_x + rel_heading_y * 0.6f, rel_y - 0.75f * rel_heading_y - rel_heading_x * 0.6f},
+                (Vector2){rel_x - 0.75f * rel_heading_x - rel_heading_y * 0.6f, rel_y - 0.75f * rel_heading_y + rel_heading_x * 0.6f},
+                color);
+            DrawLineEx((Vector2){rel_x, rel_y}, (Vector2){rel_x + road_length * rel_heading_x, rel_y + road_length * rel_heading_y}, line_thickness, color);
+            DrawLineEx((Vector2){rel_x, rel_y}, (Vector2){rel_x - road_length * rel_heading_x, rel_y - road_length * rel_heading_y}, line_thickness, color);
+            valid_road_points++;
+        }
+
+        // History XY pairs are newest first, in the current ego frame.
+        // A thicker stroke stays distinct when it follows the centerline exactly.
+        Vector2 previous = {0.0f, 0.0f};
+        for (int k = 0; k < 10; k++) {
+            Vector2 position = {
+                obs[t][20 + 2*k] / 0.02f,
+                obs[t][20 + 2*k + 1] / 0.02f,
+            };
+            DrawLineEx(previous, position, 2.0f * line_thickness, GOLD);
+            previous = position;
+        }
 
         DrawCircleLines(goal_x, goal_y, goal_radius, DARKGREEN);
         DrawCircleLines(next_goal_x, next_goal_y, goal_radius, ORANGE);
@@ -466,7 +517,7 @@ int main(int argc, char *argv[]) {
 
         for (int car_idx = 0; car_idx < other_agent_count; car_idx++) {
             float* other_car_obs = &obs[t][ego_dim + car_idx * 7];
-            
+
             float rel_x = other_car_obs[0] / 0.02f;
             float rel_y = other_car_obs[1] / 0.02f;
             if (rel_x == 0 && rel_y == 0) continue;
@@ -490,43 +541,6 @@ int main(int argc, char *argv[]) {
             DrawLineEx(corners[3], corners[0], line_thickness, YELLOW);
 
             DrawLineEx((Vector2){rel_x, rel_y}, (Vector2){rel_x + rel_heading_x * other_length * 0.625f, rel_y + 0.625f * rel_heading_y * other_length}, line_thickness, YELLOW);
-        }
-
-        int valid_road_points = 0;
-        for (int road_idx = 0; road_idx < road_segment_count; road_idx++) {
-            float *road_obs = &obs[t][ego_dim + other_agent_count * 7 + road_idx * 7];
-
-            float rel_x = road_obs[0] / 0.02f;
-            float rel_y = road_obs[1] / 0.02f;
-
-            float road_length = road_obs[2] * 100.0f;
-            if (road_length < 1e-5) continue;
-
-            int road_type = roundf(road_obs[6] + 4);
-            Color color = WHITE;
-            if (road_type == 4) {
-                color = GRAY;
-            } else if (road_type == 6) {
-                color = (Color){220, 220, 220, 255};
-            } else if (road_type == 7) {
-                color = RED;
-            } else if (road_type == 9) {
-                color = traffic_light_color_from_obs(road_obs[3]);
-            } else if (road_type == 8) {
-                color = YELLOW;
-            }
-
-            float rel_heading_x = road_obs[4];
-            float rel_heading_y = road_obs[5];
-
-            DrawTriangle(
-                (Vector2){rel_x + 0.75f * rel_heading_x, rel_y + 0.75f * rel_heading_y},
-                (Vector2){rel_x - 0.75f * rel_heading_x + rel_heading_y * 0.6f, rel_y - 0.75f * rel_heading_y - rel_heading_x * 0.6f},
-                (Vector2){rel_x - 0.75f * rel_heading_x - rel_heading_y * 0.6f, rel_y - 0.75f * rel_heading_y + rel_heading_x * 0.6f},
-                color);
-            DrawLineEx((Vector2){rel_x, rel_y}, (Vector2){rel_x + road_length * rel_heading_x, rel_y + road_length * rel_heading_y}, line_thickness, color);
-            DrawLineEx((Vector2){rel_x, rel_y}, (Vector2){rel_x - road_length * rel_heading_x, rel_y - road_length * rel_heading_y}, line_thickness, color);
-            valid_road_points++;
         }
 
         rlPopMatrix();
@@ -556,8 +570,8 @@ int main(int argc, char *argv[]) {
             DrawText("Acceleration action: N/A", 10, 102, 18, WHITE);
         }
 
-        if (remaining_goals >= 3) {
-            DrawText("Goals remaining: 3+", 10, 125, 18, WHITE);
+        if (remaining_goals >= 2) {
+            DrawText("Goals remaining: 2+", 10, 125, 18, WHITE);
         } else {
             DrawText(TextFormat("Goals remaining: %d", remaining_goals), 10, 125, 18, WHITE);
         }
