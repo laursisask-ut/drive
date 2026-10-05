@@ -27,10 +27,12 @@
 #define CROSSWALK 8
 #define TRAFFIC_LIGHT_STOP_LINE 9
 #define RIGHT_HAND_STOP_LINE 11
+#define EVAL_TRAFFIC_LIGHT_LINE 98
 #define EXIT_ORDER 99
 #define MAX_EXIT_ORDER_AGENTS 32
 #define MAP_ENTITY_TYPE_MASK 0xFF
 #define MAP_TRAFFIC_LIGHT_YIELD_FLAG 0x200
+#define MAP_TRAFFIC_LIGHT_SEQUENCE_FLAG 0x400
 
 #define TRAFFIC_LIGHT_OFF 0
 #define TRAFFIC_LIGHT_RED 1
@@ -181,6 +183,7 @@ struct Log {
     float close_to_lane;
     float avg_distance_driven_per_agent;
     float priority_violations;
+    float traffic_light_violations;
 };
 
 typedef struct Entity Entity;
@@ -246,7 +249,7 @@ struct Entity {
     float offroad_reward_coefficient;
     float stop_line_reward_coefficient;
     float lane_center_bias;
-    int hide_other_vehicles;
+    float object_detection_distance; // Actor visibility radius in meters; zero defaults to 50 m.
     float friction_coefficient;
     float steering_gain;
     float acceleration_gain;
@@ -286,7 +289,14 @@ typedef struct TrafficLightState TrafficLightState;
 struct TrafficLightState {
     int traffic_light_color;
     int traffic_light_transition_in;
+    int* sequence; // Optional map states, indexed by absolute scenario timestep.
+    int sequence_length;
 };
+
+typedef struct EvalTrafficLightLine {
+    float x[2], y[2];
+    int traffic_light_idx; // Zero-based ordinal among the map's type-9 records.
+} EvalTrafficLightLine;
 
 typedef struct ExitOrder {
     int array_size;
@@ -343,11 +353,11 @@ static inline int grid_map_entity_type(int type) {
 static inline int sample_traffic_light_transition(int color) {
     switch (color) {
         case TRAFFIC_LIGHT_RED:
-            return rand_int_inclusive(20, 50);
+            return rand_int_inclusive(30, 60);
         case TRAFFIC_LIGHT_YELLOW:
-            return rand_int_inclusive(20, 30);
+            return rand_int_inclusive(30, 40);
         case TRAFFIC_LIGHT_GREEN:
-            return rand_int_inclusive(20, 100);
+            return rand_int_inclusive(30, 100);
         default:
             return 0;
     }
@@ -471,7 +481,6 @@ struct Drive {
     Log* logs;
     int* collision_counts;
     int* expert_collision_counts;
-    int* blind_vehicle_collision_counts;
     int* offroad_counts;
     int* stop_line_counts;
     int* comfort_violation_counts;
@@ -487,6 +496,9 @@ struct Drive {
     Entity* entities;
     ExitOrder* exit_orders;
     int num_exit_orders;
+    EvalTrafficLightLine* eval_traffic_light_lines;
+    int num_eval_traffic_light_lines;
+    int eval_traffic_light_violation;
     StaticRoadEntity* static_road_entities;
     StaticRoadMap* static_road_map;
     TrafficLightState* traffic_light_states;
@@ -523,6 +535,7 @@ struct Drive {
     int control_non_vehicles;
     int dynamic_map_generation;
     int traffic_lights_enabled;
+    int has_traffic_light_sequences;
     int export_replay_enabled;
     char* replay_dir;
     ReplayExportLog export_log;
@@ -676,6 +689,7 @@ static void scan_vehicles_initial(const Drive* env, SelectionBuckets* out, int c
     }
 }
 void add_log(Drive* env) {
+    env->log.traffic_light_violations += env->eval_traffic_light_violation;
     for (int i = 0; i < env->num_exit_orders; i++) {
         const ExitOrder* order = &env->exit_orders[i];
         if (order->exit_count != order->expected_exit_count ||
@@ -1029,6 +1043,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
 	    // Read base entity data
         fread(&e->type, sizeof(int), 1, file);
         int is_v2 = (e->type & 256) != 0;
+        int has_light_sequence = (e->type & MAP_TRAFFIC_LIGHT_SEQUENCE_FLAG) != 0;
         int light_off_type = (e->type & MAP_TRAFFIC_LIGHT_YIELD_FLAG) ? STOP_SIGN : NONE;
         e->type &= MAP_ENTITY_TYPE_MASK;
         fread(&e->array_size, sizeof(int), 1, file);
@@ -1095,6 +1110,17 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             }
         }
         if (i >= env->num_objects) {
+            if (e->type == EVAL_TRAFFIC_LIGHT_LINE) {
+                assert(e->array_size == 2);
+                env->eval_traffic_light_lines = realloc(env->eval_traffic_light_lines,
+                    (env->num_eval_traffic_light_lines + 1) * sizeof(EvalTrafficLightLine));
+                EvalTrafficLightLine* line = &env->eval_traffic_light_lines[env->num_eval_traffic_light_lines++];
+                memcpy(line->x, e->traj_x, sizeof(line->x));
+                memcpy(line->y, e->traj_y, sizeof(line->y));
+                line->traffic_light_idx = e->mark_as_expert;
+                free_entity(e);
+                continue;
+            }
             // Type 99 uses the existing road record format, but owns only XY.
             if (e->type == EXIT_ORDER) {
                 env->exit_orders = realloc(env->exit_orders, (env->num_exit_orders + 1) * sizeof(ExitOrder));
@@ -1113,9 +1139,29 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             road->traj_z = e->traj_z;
             road->traffic_light_idx = road->type == TRAFFIC_LIGHT_STOP_LINE ? traffic_light_idx++ : -1;
             road->traffic_light_off_type = light_off_type;
+            if (road->type == TRAFFIC_LIGHT_STOP_LINE) {
+                env->traffic_light_states = realloc(env->traffic_light_states,
+                    traffic_light_idx * sizeof(TrafficLightState));
+                TrafficLightState* state = &env->traffic_light_states[road->traffic_light_idx];
+                *state = (TrafficLightState){0};
+                if (has_light_sequence) {
+                    fread(&state->sequence_length, sizeof(int), 1, file);
+                    assert(state->sequence_length > 0);
+                    state->sequence = malloc(state->sequence_length * sizeof(int));
+                    fread(state->sequence, sizeof(int), state->sequence_length, file);
+                    for (int t = 0; t < state->sequence_length; t++)
+                        assert(state->sequence[t] >= TRAFFIC_LIGHT_OFF && state->sequence[t] <= TRAFFIC_LIGHT_GREEN);
+                    env->has_traffic_light_sequences = 1;
+                }
+            }
             e->traj_x = e->traj_y = e->traj_z = NULL;
             free_entity(e);
         }
+    }
+    env->num_traffic_lights = traffic_light_idx;
+    for (int i = 0; i < env->num_eval_traffic_light_lines; i++) {
+        int idx = env->eval_traffic_light_lines[i].traffic_light_idx;
+        assert(idx >= 0 && idx < env->num_traffic_lights);
     }
     fclose(file);
     return entities;
@@ -1249,6 +1295,7 @@ void set_start_position(Drive* env){
         }
     }
     reset_exit_orders(env);
+    env->eval_traffic_light_violation = 0;
     record_replay_trajectories(env);
     //EndDrawing();
 }
@@ -1834,6 +1881,35 @@ static int stop_line_overlaps_vehicle(const StaticRoadEntity* line, const Entity
     return 0;
 }
 
+// Evaluation-only geometry: never enters observations, collisions or rewards.
+static void update_eval_traffic_light_lines(Drive* env) {
+    if (env->eval_traffic_light_violation || !env->traffic_lights_enabled) return;
+    for (int i = 0; i < env->num_eval_traffic_light_lines; i++) {
+        EvalTrafficLightLine* hidden = &env->eval_traffic_light_lines[i];
+        StaticRoadEntity line = {.array_size = 2, .traj_x = hidden->x, .traj_y = hidden->y,
+                                .traffic_light_idx = hidden->traffic_light_idx};
+        if (road_traffic_light_color(env, &line) != TRAFFIC_LIGHT_RED) continue;
+        for (int idx = 0; idx < env->num_objects; idx++) {
+            const Entity* e = &env->entities[idx];
+            if (e->type != VEHICLE || (!e->active_agent && !e->mark_as_expert) ||
+                e->x == INVALID_POSITION || e->prev_x == INVALID_POSITION) continue;
+            int previous = (e->ego_history_head + EGO_HISTORY_CAPACITY - 1) % EGO_HISTORY_CAPACITY;
+            float cosine = e->ego_history[previous][2], sine = e->ego_history[previous][3];
+            if (!e->active_agent) {
+                int t = env->timestep;
+                if (t <= 0 || t >= e->array_size || !e->traj_valid[t - 1] || !e->traj_valid[t]) continue;
+                cosine = cosf(e->traj_heading[t - 1]);
+                sine = sinf(e->traj_heading[t - 1]);
+            }
+            if (stop_line_overlaps_vehicle(&line, e, e->x, e->y, cosf(e->heading), sinf(e->heading)) &&
+                !stop_line_overlaps_vehicle(&line, e, e->prev_x, e->prev_y, cosine, sine)) {
+                env->eval_traffic_light_violation = 1;
+                return;
+            }
+        }
+    }
+}
+
 float normalize_heading(float heading){
     if(heading > M_PI) heading -= 2*M_PI;
     if(heading < -M_PI) heading += 2*M_PI;
@@ -2242,8 +2318,14 @@ void init_traffic_lights(Drive* env) {
         env->traffic_light_states = (TrafficLightState*)calloc(env->num_traffic_lights, sizeof(TrafficLightState));
     }
     env->traffic_lights_enabled = rand_int_inclusive(0, 4) > 0;
+    if (env->has_traffic_light_sequences) env->traffic_lights_enabled = 1;
     for (int i = 0; i < env->num_traffic_lights; i++) {
         TrafficLightState* state = &env->traffic_light_states[i];
+        if (state->sequence) {
+            state->traffic_light_color = state->sequence[(int)fmin(env->timestep, state->sequence_length - 1)];
+            state->traffic_light_transition_in = 0;
+            continue;
+        }
         state->traffic_light_color = env->traffic_lights_enabled
             ? rand_int_inclusive(TRAFFIC_LIGHT_OFF, TRAFFIC_LIGHT_GREEN) : TRAFFIC_LIGHT_OFF;
         state->traffic_light_transition_in = sample_traffic_light_transition(state->traffic_light_color);
@@ -2251,12 +2333,16 @@ void init_traffic_lights(Drive* env) {
 }
 
 void update_traffic_lights(Drive* env) {
-    if (!env->traffic_lights_enabled || env->timestep == env->init_steps + 1 || env->timestep % TRAFFIC_LIGHT_UPDATE_INTERVAL != 0) {
-        return;
-    }
+    int random_update = env->timestep != env->init_steps + 1 && env->timestep % TRAFFIC_LIGHT_UPDATE_INTERVAL == 0;
+    if (!env->traffic_lights_enabled || (!env->has_traffic_light_sequences && !random_update)) return;
 
     for (int i = 0; i < env->num_traffic_lights; i++) {
         TrafficLightState* state = &env->traffic_light_states[i];
+        if (state->sequence) {
+            state->traffic_light_color = state->sequence[(int)fmin(env->timestep, state->sequence_length - 1)];
+            continue;
+        }
+        if (!random_update) continue;
         if (state->traffic_light_color == TRAFFIC_LIGHT_OFF) continue;
 
         state->traffic_light_transition_in -= TRAFFIC_LIGHT_UPDATE_INTERVAL;
@@ -2299,7 +2385,6 @@ void init(Drive* env){
     env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
     env->collision_counts = (int*)calloc(COLLISION_COUNT_BUCKETS, sizeof(int));
     env->expert_collision_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
-    env->blind_vehicle_collision_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->offroad_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->stop_line_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
     env->comfort_violation_counts = (int*)calloc(COEFFICIENT_COUNT_BINS, sizeof(int));
@@ -2429,7 +2514,8 @@ static void saveReplayToFile(Drive* env) {
     }
 
     fwrite(&env->export_log.num_agents, sizeof(int), 1, file);
-    fwrite(&env->num_roads, sizeof(int), 1, file);
+    int road_records = env->num_roads + env->num_eval_traffic_light_lines;
+    fwrite(&road_records, sizeof(int), 1, file);
 
     int exported_steps = fmin(env->timestep+1, env->export_log.capacity);
 
@@ -2478,6 +2564,9 @@ static void saveReplayToFile(Drive* env) {
     for (int i = 0; i < env->num_roads; i++) {
         const StaticRoadEntity* road = &env->static_road_entities[i];
         int raw_type = road->type;
+        const TrafficLightState* light = road->traffic_light_idx >= 0
+            ? &env->traffic_light_states[road->traffic_light_idx] : NULL;
+        if (light && light->sequence) raw_type |= MAP_TRAFFIC_LIGHT_SEQUENCE_FLAG;
         if (road->type == TRAFFIC_LIGHT_STOP_LINE && road->traffic_light_off_type == STOP_SIGN)
             raw_type |= MAP_TRAFFIC_LIGHT_YIELD_FLAG;
         fwrite(&raw_type, sizeof(int), 1, file);
@@ -2490,6 +2579,20 @@ static void saveReplayToFile(Drive* env) {
         int mark_as_expert = 0;
         fwrite(unused, sizeof(float), 6, file);
         fwrite(&mark_as_expert, sizeof(int), 1, file);
+        if (light && light->sequence) {
+            fwrite(&light->sequence_length, sizeof(int), 1, file);
+            fwrite(light->sequence, sizeof(int), light->sequence_length, file);
+        }
+    }
+    for (int i = 0; i < env->num_eval_traffic_light_lines; i++) {
+        const EvalTrafficLightLine* line = &env->eval_traffic_light_lines[i];
+        int header[] = {EVAL_TRAFFIC_LIGHT_LINE, 2};
+        float zeros[8] = {0}; // Z coordinates, dimensions and goal.
+        fwrite(header, sizeof(int), 2, file);
+        fwrite(line->x, sizeof(float), 2, file);
+        fwrite(line->y, sizeof(float), 2, file);
+        fwrite(zeros, sizeof(float), 8, file);
+        fwrite(&line->traffic_light_idx, sizeof(int), 1, file);
     }
     fclose(file);
 
@@ -2502,6 +2605,7 @@ void c_close(Drive* env){
         free(env->exit_orders[i].traj_y);
     }
     free(env->exit_orders);
+    free(env->eval_traffic_light_lines);
     for(int i = 0; i < env->num_objects; i++){
         free_entity(&env->entities[i]);
     }
@@ -2510,7 +2614,6 @@ void c_close(Drive* env){
     free(env->logs);
     free(env->collision_counts);
     free(env->expert_collision_counts);
-    free(env->blind_vehicle_collision_counts);
     free(env->offroad_counts);
     free(env->stop_line_counts);
     free(env->comfort_violation_counts);
@@ -2527,7 +2630,10 @@ void c_close(Drive* env){
         free(env->neighbor_offsets);
         freeTopologyGraph(env->topology_graph);
     }
-    free(env->traffic_light_states);
+    if (env->traffic_light_states) {
+        for (int i = 0; i < env->num_traffic_lights; i++) free(env->traffic_light_states[i].sequence);
+        free(env->traffic_light_states);
+    }
     free(env->static_car_indices);
     free(env->expert_static_car_indices);
     // free(env->map_name);
@@ -2804,6 +2910,10 @@ typedef struct {
     int usable;
 } ActorObservationGrid;
 
+static inline float actor_detection_distance(const Entity* entity) {
+    return entity->object_detection_distance > 0.0f ? entity->object_detection_distance : 50.0f;
+}
+
 static inline int observation_actor_index(const Drive* env, int rank) {
     return rank < env->active_agent_count
         ? env->active_agent_indices[rank]
@@ -2843,13 +2953,16 @@ static void build_actor_observation_grid(const Drive* env, ActorObservationGrid*
 static int nearby_observation_actors(const Drive* env, const ActorObservationGrid* grid,
                                     const Entity* ego, int* indices) {
     int count = 0;
-    if (ego->hide_other_vehicles || ego->respawn_timestep != -1) return 0;
+    if (ego->respawn_timestep != -1) return 0;
+    float radius = actor_detection_distance(ego);
     int min_x, max_x, min_y, max_y;
     if (!grid->usable ||
-        !actor_observation_cell(ego->x - ACTOR_OBSERVATION_CELL_SIZE, &min_x) ||
-        !actor_observation_cell(ego->x + ACTOR_OBSERVATION_CELL_SIZE, &max_x) ||
-        !actor_observation_cell(ego->y - ACTOR_OBSERVATION_CELL_SIZE, &min_y) ||
-        !actor_observation_cell(ego->y + ACTOR_OBSERVATION_CELL_SIZE, &max_y)) {
+        !actor_observation_cell(ego->x - radius, &min_x) ||
+        !actor_observation_cell(ego->x + radius, &max_x) ||
+        !actor_observation_cell(ego->y - radius, &min_y) ||
+        !actor_observation_cell(ego->y + radius, &max_y) ||
+        // A full scan is cheaper for unusually large detection radii.
+        ((double)max_x - min_x + 1) * ((double)max_y - min_y + 1) > env->num_controllable_agents) {
         for (int rank = 0; rank < env->num_controllable_agents; rank++)
             indices[count++] = observation_actor_index(env, rank);
         return count;
@@ -2958,6 +3071,9 @@ void compute_observations(Drive* env) {
         float sin_heading = ego_entity->heading_y;
         write_ego_observation(ego_entity, env->dynamics_model, obs);
 
+        float radius = actor_detection_distance(ego_entity);
+        float max_distance = radius * radius;
+
         // Relative Pos of other cars
         int obs_idx = ego_dim;
         int cars_seen = 0;
@@ -2973,7 +3089,7 @@ void compute_observations(Drive* env) {
             float dx = other_entity->x - ego_entity->x;
             float dy = other_entity->y - ego_entity->y;
             float dist = (dx*dx + dy*dy);
-            if(dist > 2500.0f) continue;
+            if(dist > max_distance) continue;
             // Rotate to ego vehicle's frame
             float rel_x = dx*cos_heading + dy*sin_heading;
             float rel_y = -dx*sin_heading + dy*cos_heading;
@@ -3397,6 +3513,8 @@ void c_step(Drive* env){
         move_dynamics(env, i, agent_idx);
         record_speed_count(env, &env->entities[agent_idx]);
     }
+    if (env->num_eval_traffic_light_lines > 0 && env->timestep < env->scenario_length)
+        update_eval_traffic_light_lines(env);
     for(int i = 0; i < env->active_agent_count; i++){
         int agent_idx = env->active_agent_indices[i];
         Entity* e = &env->entities[agent_idx];
@@ -3406,7 +3524,7 @@ void c_step(Drive* env){
         int collision_state = env->entities[agent_idx].collision_state;
 
         if(collision_state > 0){
-            if (!e->hide_other_vehicles && collision_state == VEHICLE_COLLISION && prev_collision_state != VEHICLE_COLLISION) {
+            if (collision_state == VEHICLE_COLLISION && prev_collision_state != VEHICLE_COLLISION) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float collision_reward = -e->collision_reward_coefficient * (1 + 0.1 * speed);
                 env->rewards[i] = collision_reward;
@@ -3425,9 +3543,6 @@ void c_step(Drive* env){
                 if (collided_with->mark_as_expert) {
                     int coef_bin = clipped_scaled_bin(e->collision_reward_coefficient, 100.0f, COEFFICIENT_COUNT_BINS);
                     env->expert_collision_counts[coef_bin]++;
-                } else if (collided_with->hide_other_vehicles) {
-                    int coef_bin = clipped_scaled_bin(e->collision_reward_coefficient, 100.0f, COEFFICIENT_COUNT_BINS);
-                    env->blind_vehicle_collision_counts[coef_bin]++;
                 } else {
                     float coef1 = fminf(e->collision_reward_coefficient, collided_with->collision_reward_coefficient);
                     float coef2 = fmaxf(e->collision_reward_coefficient, collided_with->collision_reward_coefficient);
@@ -3436,7 +3551,7 @@ void c_step(Drive* env){
                     int joint_bin_idx = coef1_bin * COLLISION_COUNT_BINS + coef2_bin - coef1_bin * (coef1_bin + 1) / 2;
                     env->collision_counts[joint_bin_idx]++;
                 }
-            } else if (!e->hide_other_vehicles && collision_state == VEHICLE_COLLISION) {
+            } else if (collision_state == VEHICLE_COLLISION) {
                 // Continuing contact costs 1% per step, without another collision event.
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float collision_reward = -0.01f * e->collision_reward_coefficient * (1 + 0.1f * speed);
@@ -4204,7 +4319,6 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                 if (is_expert) car_color = GOLD;      // expert replay
                 if (is_active_agent) car_color = BLUE; // policy-controlled
                 if (is_active_agent && env->entities[i].collision_state > 0) car_color = RED;
-                if (is_active_agent && env->entities[i].hide_other_vehicles) car_color = PINK;
                 rlSetLineWidth(3.0f);
                 for (int j = 0; j < 4; j++) {
                     DrawLine3D(corners[j], corners[(j+1)%4], car_color);
@@ -4286,7 +4400,6 @@ void draw_scene(Drive* env, Client* client, int mode, int obs_only, int lasers, 
                     if (!is_active_agent && env->entities[i].mark_as_expert == 1) wire_color = GOLD;  // expert replay
                     if (is_active_agent) wire_color = BLUE;   // policy
                     if (is_active_agent && env->entities[i].collision_state > 0) wire_color = RED;
-                    if (is_active_agent && env->entities[i].hide_other_vehicles) wire_color = PINK;
                     rlSetLineWidth(2.0f);
                     for (int j = 0; j < 4; j++) {
                         DrawLine3D(corners[j], corners[(j+1)%4], wire_color);

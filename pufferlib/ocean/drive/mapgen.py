@@ -110,7 +110,7 @@ class Entity(Structure):
         ("offroad_reward_coefficient", c_float),
         ("stop_line_reward_coefficient", c_float),
         ("lane_center_bias", c_float),
-        ("hide_other_vehicles", c_int),
+        ("object_detection_distance", c_float),
         ("friction_coefficient", c_float),
         ("steering_gain", c_float),
         ("acceleration_gain", c_float),
@@ -1343,15 +1343,15 @@ def generate_map():
         ent.multi_goal_position_y = alloc_float_array([-pos.y for pos in goal_positions[i]])
         ent.multi_goal_position_z = alloc_float_array([0 for _pos in goal_positions[i]]) # TODO: Height dimension
         ent.max_speed = max_speed * (1 + random.uniform(-0.1, 0.1)) / 3.6
-        ent.lane_center_reward_coefficient = random.uniform(2.5e-5, 2.5e-4) if random.uniform(0, 1) < 0.5 else random.uniform(2.5e-4, 2.5e-3)
+        ent.lane_center_reward_coefficient = random.uniform(5e-5, 5e-4) if random.uniform(0, 1) < 0.5 else random.uniform(5e-4, 5e-3)
         ent.comfort_reward_coefficient = random.uniform(0, 0.01)
-        ent.lane_align_reward_coefficient = random.uniform(2.5e-5, 2.5e-3) if random.uniform(0, 1) < 0.5 else random.uniform(2.5e-3, 2.5e-2)
+        ent.lane_align_reward_coefficient = random.uniform(5e-5, 5e-3) if random.uniform(0, 1) < 0.5 else random.uniform(5e-3, 5e-2)
         ent.collision_reward_coefficient = random.uniform(0, 1.0)
         ent.offroad_reward_coefficient = random.uniform(0, 1.0)
         ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(1, 3)
-        ent.hide_other_vehicles = int(random.uniform(0, 1) < 0.05)
+        ent.object_detection_distance = random.uniform(4, 6) if random.uniform(0, 1) < 0.1 else random.uniform(30, 50)
         ent.friction_coefficient = random.uniform(0.7, 1.3)
         ent.acceleration_gain = random.uniform(0.9, 1.1)
         ent.steering_gain = random.uniform(0.9, 1.1)

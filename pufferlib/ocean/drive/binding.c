@@ -432,7 +432,6 @@ static int my_log(
     Log* log,
     int* collision_counts,
     int* expert_collision_counts,
-    int* blind_vehicle_collision_counts,
     int* offroad_counts,
     int* stop_line_counts,
     int* comfort_violation_counts,
@@ -446,6 +445,7 @@ static int my_log(
     assign_to_dict(dict, "episode_length", log->episode_length);
     assign_to_dict(dict, "collision_rate", log->collision_rate);
     assign_to_dict(dict, "priority_violations", log->priority_violations);
+    assign_to_dict(dict, "traffic_light_violations", log->traffic_light_violations);
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "goal_reward", log->goal_reward);
     assign_to_dict(dict, "lane_center_reward", log->lane_center_reward);
@@ -477,9 +477,6 @@ static int my_log(
         return 1;
     }
     if (assign_int_array_to_dict(dict, "expert_collision_counts", expert_collision_counts, COEFFICIENT_COUNT_BINS)) {
-        return 1;
-    }
-    if (assign_int_array_to_dict(dict, "blind_vehicle_collision_counts", blind_vehicle_collision_counts, COEFFICIENT_COUNT_BINS)) {
         return 1;
     }
     if (assign_int_array_to_dict(dict, "offroad_counts", offroad_counts, COEFFICIENT_COUNT_BINS)) {
