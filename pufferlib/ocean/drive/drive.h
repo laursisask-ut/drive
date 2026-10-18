@@ -47,7 +47,7 @@
 
 // Actions
 #define NOOP 0
-#define MAX_ACTION_DELAY_STEPS 5
+#define MAX_ACTION_DELAY_STEPS 3
 #define ACTION_QUEUE_CAPACITY (MAX_ACTION_DELAY_STEPS + 1)
 
 // Dynamics Models
@@ -92,7 +92,7 @@
 #define MAX_ROAD_SEGMENT_LENGTH 100.0f
 
 #define MAX_EXPORT_STEPS 1000
-#define MAX_REPLAY_AGENTS 64  // First controlled-agent slots in each recorded map.
+#define MAX_REPLAY_OBSERVATION_AGENTS 64  // Trajectories include every policy slot.
 #define REPLAY_ACTION_COMPONENT_COUNT 2
 #define REPLAY_ACTION_ACCELERATION_IDX 0
 #define REPLAY_ACTION_STEERING_IDX 1
@@ -123,7 +123,7 @@ static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 
 // Classic action space (for CLASSIC dynamics model)
-static const float ACCELERATION_VALUES[7] = {-4.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 4.0f};
+static const float ACCELERATION_VALUES[7] = {-5.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 4.0f};
 static const float STEERING_VALUES[13] = {-0.667f, -0.500f, -0.333f, -0.167f, -0.08f, -0.01f, 0.000f, 0.01f, 0.08f, 0.167f, 0.333f, 0.500f, 0.667f};
 
 static const float offsets[4][2] = {
@@ -261,6 +261,7 @@ struct Entity {
     float jerk_lat;
     float steering_angle;
     float wheelbase;
+    float max_steering_rate;
 
     // Private actuator state; delay is fixed for an episode. Discrete indices
     // and continuous commands both fit exactly in these two-component rows.
@@ -1181,7 +1182,7 @@ static void clear_action_queue(const Drive* env, Entity* agent) {
 }
 
 static void reset_action_delay(const Drive* env, Entity* agent) {
-    // Rejection avoids modulo bias, so each delay from 0 through 5 is equally likely.
+    // Rejection avoids modulo bias, so each delay from 0 through 3 is equally likely.
     const unsigned int choices = MAX_ACTION_DELAY_STEPS + 1;
     const unsigned int limit = (unsigned int)RAND_MAX - ((unsigned int)RAND_MAX + 1u) % choices;
     unsigned int sample;
@@ -2741,6 +2742,10 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         if (agent->acceleration_gain != 0.0f) acceleration *= agent->acceleration_gain;
         if (agent->steering_gain != 0.0f) steering *= agent->steering_gain;
 
+        float max_steering_rate = agent->max_steering_rate;
+        if (max_steering_rate == 0.0f) max_steering_rate = 0.03f;
+        steering = agent->steering_angle + fmaxf(fminf(steering - agent->steering_angle, max_steering_rate), -max_steering_rate);
+
         // Current state
         float x = agent->x;
         float y = agent->y;
@@ -2791,6 +2796,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         agent->heading_y = sinf(heading);
         agent->vx = new_vx;
         agent->vy = new_vy;
+        agent->steering_angle = steering;
 
         int comfort_violations = (fabsf(acceleration) > 3.0f) + (fabsf(a_lat) > 3.0f);
         if (comfort_violations > 0) {

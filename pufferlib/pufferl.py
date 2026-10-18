@@ -77,14 +77,12 @@ DRIVE_CLASSIC_STEERING_VALUES = [
     0.01, 0.08, 0.167, 0.333, 0.5, 0.667,
 ]
 
-SYNTHETIC_VALIDATION_SCENARIO_LENGTH = 200
 YIELD_VALIDATION_MAP_COUNT = 64
 DRIVE_STEPS_PER_SECOND = 10
 YIELD_VALIDATION_SECONDS = 10
 YIELD_VALIDATION_SCENARIO_LENGTH = YIELD_VALIDATION_SECONDS * DRIVE_STEPS_PER_SECOND
 YIELD_VALIDATION_AGENTS_PER_MAP = 1
 DEFAULT_EVAL_SET = "yield_multi_car_validation"
-MAX_AGENTS_PER_DRIVE_MAP = 128
 
 VALIDATION_SPECS = (
     {
@@ -119,14 +117,14 @@ VALIDATION_SPECS = (
         "name": "synthetic_validation",
         "env_kwargs": dict(
             resample_frequency=-1,
-            num_maps=128,
-            num_agents=128 * agents_per_generated_map,
+            num_maps=1,
+            num_agents=agents_per_generated_map,
             map_dir="synthetic-validation-maps",
             dynamic_map_generation=False,
             all_maps_exactly_once=True,
-            scenario_length=SYNTHETIC_VALIDATION_SCENARIO_LENGTH,
+            scenario_length=500,
         ),
-        "max_scenario_length": SYNTHETIC_VALIDATION_SCENARIO_LENGTH + 1,
+        "max_scenario_length": 501,
     },
     {
         "name": "yield_validation",
@@ -300,6 +298,8 @@ class PuffeRL:
             warnings.filterwarnings(action="ignore", category=UserWarning, module=r"heavyball.*")
             import heavyball.utils
 
+            # Heavyball 1.7.2 defaults to QR for square matrices, which can reverse updates.
+            heavyball.utils.zeroth_power_mode = "newtonschulz"
             heavyball.utils.compile_mode = config["compile_mode"] if config["compile"] else None
             optimizer = ForeachMuon(
                 self.policy.parameters(),
@@ -668,11 +668,14 @@ class PuffeRL:
                     continue
 
             profile("train_anchor", epoch)
-            behavior_anchor_kl_div = 0
+            behavior_anchor_kl_div = newlogprob.new_zeros((), dtype=torch.float32)
             if self.anchor_policy is not None:
                 with torch.no_grad(), self.amp_context():
                     regularizer_logits, _ = self.anchor_policy(mb_obs, state)
-                    behavior_anchor_kl_div = sum(pufferlib.pytorch.kl_div(p, q).mean() for p, q in zip(regularizer_logits, logits))
+                behavior_anchor_kl_div = sum(
+                    pufferlib.pytorch.kl_div(p.float(), q.float()).mean()
+                    for p, q in zip(regularizer_logits, logits)
+                )
 
             profile("train_misc", epoch)
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.025 * behavior_anchor_kl_div
@@ -1575,7 +1578,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         # binding.shared stops once num_agents is reached. This upper bound
         # ensures every map is opened even if a custom directory has maps
         # with more than one policy-controlled agent.
-        num_agents=scenario_count * MAX_AGENTS_PER_DRIVE_MAP,
+        num_agents=scenario_count * agents_per_generated_map,
         report_interval=1,
         artifact_dir="/tmp/puffer_drive_eval",
         replay_everything=True
@@ -1584,7 +1587,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     owns_env = vecenv is None
     validation_env = vecenv or Drive(**validation_kwargs)
     device = args["train"]["device"]
-    metric_keys = ("completion_rate", "collision_rate", "offroad_rate", "priority_violations", "traffic_light_violations")
+    metric_keys = ("completion_rate", "collision_rate", "offroad_rate", "priority_violations", "traffic_light_violations", "avg_distance_driven_per_agent")
     metric_log = None
 
     try:
@@ -1625,6 +1628,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         print(f"Offroad rate: {metrics['offroad_rate']:.2%}")
         print(f"Priority violations: {metrics['priority_violations']:.0f}")
         print(f"Traffic light violations: {metrics['traffic_light_violations']:.0f}")
+        print(f"Average distance driven per agent: {metrics['avg_distance_driven_per_agent']:.1f} m")
         return metrics
     finally:
         if owns_env:
@@ -1759,8 +1763,11 @@ def load_anchor_policy(args, vecenv):
 
     device = args["train"]["device"]
     policy_cls = getattr(env_module.torch, args["behavioral_anchor"]["policy_name"])
+    state = torch.load(args["behavioral_anchor"]["policy_weights"], map_location="cpu", weights_only=True)
     policy = policy_cls(vecenv.driver_env).to(device)
-    policy.load_state_dict(torch.load(args["behavioral_anchor"]["policy_weights"]))
+    policy.load_state_dict(state)
+    policy.eval()
+    policy.requires_grad_(False)
 
     return policy
 

@@ -121,10 +121,11 @@ class Entity(Structure):
         ("jerk_lat", c_float),
         ("steering_angle", c_float),
         ("wheelbase", c_float),
+        ("max_steering_rate", c_float),
         # Private actuator state; must match ACTION_QUEUE_CAPACITY in drive.h.
         ("action_delay_steps", c_int),
         ("action_queue_head", c_int),
-        ("action_queue", (c_float * 2) * 6),
+        ("action_queue", (c_float * 2) * 4),
         ("ego_history_head", c_int),
         ("ego_history", (c_float * 7) * HISTORY_CAPACITY),
     ]
@@ -1346,7 +1347,7 @@ def generate_map():
         ent.lane_center_reward_coefficient = random.uniform(5e-5, 5e-4) if random.uniform(0, 1) < 0.5 else random.uniform(5e-4, 5e-3)
         ent.comfort_reward_coefficient = random.uniform(0, 0.01)
         ent.lane_align_reward_coefficient = random.uniform(5e-5, 5e-3) if random.uniform(0, 1) < 0.5 else random.uniform(5e-3, 5e-2)
-        ent.collision_reward_coefficient = random.uniform(0, 1.0)
+        ent.collision_reward_coefficient = random.uniform(0.25, 1.0)
         ent.offroad_reward_coefficient = random.uniform(0, 1.0)
         ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
@@ -1356,6 +1357,7 @@ def generate_map():
         ent.acceleration_gain = random.uniform(0.9, 1.1)
         ent.steering_gain = random.uniform(0.9, 1.1)
         ent.wheelbase = random.uniform(0.55, 0.65) * ent.length
+        ent.max_steering_rate = 0.03 * random.uniform(0.8, 1.2)
         ent.mark_as_expert = 0
 
     for i in range(num_stationary_objects):

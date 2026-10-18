@@ -166,6 +166,7 @@ class SceneEncoder(torch.nn.Module):
             torch.nn.Linear(hidden_dim, 2 * hidden_dim)
         )
         self.blocks = torch.nn.ModuleList([SceneEncoderBlock(hidden_dim=hidden_dim) for _ in range(num_blocks)])
+        self.final_norm = torch.nn.LayerNorm(hidden_dim, elementwise_affine=False)
 
     def forward(self, observations):
         B = observations.size(0)
@@ -201,7 +202,7 @@ class SceneEncoder(torch.nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        return x
+        return self.final_norm(x)
 
 class TrajectoryDecoderBlock(torch.nn.Module):
     def __init__(self, hidden_dim=256):
