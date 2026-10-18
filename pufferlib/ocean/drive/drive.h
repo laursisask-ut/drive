@@ -3357,8 +3357,8 @@ void c_reset(Drive* env){
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
 
     if (env->export_replay_enabled && env->export_log.traj_x == NULL) {
-        env->export_log.num_agents = env->active_agent_count < MAX_REPLAY_AGENTS
-            ? env->active_agent_count : MAX_REPLAY_AGENTS;
+        env->export_log.num_agents = env->active_agent_count < 64
+            ? env->active_agent_count : 64;
         env->export_log.capacity = env->scenario_length < MAX_EXPORT_STEPS - 2
             ? env->scenario_length + 2 : MAX_EXPORT_STEPS;
         if (env->export_log.capacity < 1) env->export_log.capacity = 1;
