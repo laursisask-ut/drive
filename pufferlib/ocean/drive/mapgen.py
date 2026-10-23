@@ -128,6 +128,8 @@ class Entity(Structure):
         ("action_queue", (c_float * 2) * 4),
         ("ego_history_head", c_int),
         ("ego_history", (c_float * 7) * HISTORY_CAPACITY),
+        ("last_ttc_penalty_timestep", c_int),
+        ("last_lateral_penalty_timestep", c_int),
     ]
 
 class StaticRoadEntity(Structure):

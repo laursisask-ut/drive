@@ -78,7 +78,7 @@ def main():
     model = model.to(device)
     original_model = model
     model = torch.compile(model)
-    optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
     dataset = PregeneratedDataset("supervised_data.npz")

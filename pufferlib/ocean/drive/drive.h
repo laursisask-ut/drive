@@ -60,6 +60,11 @@
 #define OFFROAD 2
 #define RED_TRAFFIC_LIGHT_CROSSED 3
 
+#define SAFETY_MIN_SPEED 3.0f
+#define SAFETY_TIME_SECONDS 1.0f
+#define SAFETY_CLEARANCE 0.1f
+#define SAFETY_COLLISION_FRACTION 0.1f
+
 // Metrics array indices
 #define COLLISION_IDX 0
 #define OFFROAD_IDX 1
@@ -272,6 +277,9 @@ struct Entity {
     // Ring of pre-action states and normalized commands selected by the policy.
     int ego_history_head;
     float ego_history[EGO_HISTORY_CAPACITY][7];
+
+    int last_ttc_penalty_timestep;
+    int last_lateral_penalty_timestep;
 };
 
 typedef struct StaticRoadEntity StaticRoadEntity;
@@ -1282,6 +1290,8 @@ void set_start_position(Drive* env){
         e->displacement_sample_count = 0;
         e->respawn_timestep = -1;
         e->respawn_count = 0;
+        e->last_ttc_penalty_timestep = -1;
+        e->last_lateral_penalty_timestep = -1;
 
         // Dynamics
         e->a_long = 0.0f;
@@ -1755,6 +1765,123 @@ int collision_check(Drive* env, int agent_idx) {
     return car_collided_with_index;
 }
 
+// Continuous separating-axis test for translating oriented rectangles. Heading
+// and world-space velocity stay fixed; return first body contact, in seconds.
+static float vehicle_time_to_collision(const Entity* ego, const Entity* other) {
+    float dx = other->x - ego->x, dy = other->y - ego->y;
+    float vx = other->vx - ego->vx, vy = other->vy - ego->vy;
+    const float axes[4][2] = {
+        {ego->heading_x, ego->heading_y}, {-ego->heading_y, ego->heading_x},
+        {other->heading_x, other->heading_y}, {-other->heading_y, other->heading_x}
+    };
+    float enter = 0.0f, leave = SAFETY_TIME_SECONDS;
+    for (int i = 0; i < 4; i++) {
+        float ax = axes[i][0], ay = axes[i][1];
+        float extent = 0.5f * (
+            ego->length * fabsf(ax * ego->heading_x + ay * ego->heading_y) +
+            ego->width * fabsf(-ax * ego->heading_y + ay * ego->heading_x) +
+            other->length * fabsf(ax * other->heading_x + ay * other->heading_y) +
+            other->width * fabsf(-ax * other->heading_y + ay * other->heading_x));
+        float position = dx * ax + dy * ay;
+        float velocity = vx * ax + vy * ay;
+        if (fabsf(velocity) < 1e-6f) {
+            if (fabsf(position) > extent) return INFINITY;
+            continue;
+        }
+        float first = (-extent - position) / velocity;
+        float last = (extent - position) / velocity;
+        enter = fmaxf(enter, fminf(first, last));
+        leave = fminf(leave, fmaxf(first, last));
+        if (enter > leave) return INFINITY;
+    }
+    return enter;
+}
+
+static int vehicle_approaches_from_behind(const Entity* ego, const Entity* other) {
+    // Similar headings: within 45 degrees. Also require the other center to
+    // lie in the rear 90-degree cone, so crossing/side approaches still count.
+    float heading_dot = ego->heading_x * other->heading_x + ego->heading_y * other->heading_y;
+    float dx = other->x - ego->x, dy = other->y - ego->y;
+    float longitudinal = dx * ego->heading_x + dy * ego->heading_y;
+    float lateral = -dx * ego->heading_y + dy * ego->heading_x;
+    return heading_dot >= 0.70710678f && longitudinal < 0.0f && fabsf(lateral) <= -longitudinal;
+}
+
+static float point_vehicle_distance_squared(float x, float y, const Entity* vehicle) {
+    float dx = x - vehicle->x, dy = y - vehicle->y;
+    float longitudinal = fmaxf(fabsf(dx * vehicle->heading_x + dy * vehicle->heading_y)
+                               - 0.5f * vehicle->length, 0.0f);
+    float lateral = fmaxf(fabsf(-dx * vehicle->heading_y + dy * vehicle->heading_x)
+                          - 0.5f * vehicle->width, 0.0f);
+    return longitudinal * longitudinal + lateral * lateral;
+}
+
+static float vehicle_clearance_squared(Entity* ego, Entity* other) {
+    if (check_aabb_collision(ego, other)) return 0.0f;
+    // For disjoint rectangles the closest pair includes a corner of at least
+    // one rectangle. Check both directions for exact edge/corner clearance.
+    float distance = INFINITY;
+    for (int side = 0; side < 2; side++) {
+        const Entity* from = side ? other : ego;
+        const Entity* to = side ? ego : other;
+        for (int corner = 0; corner < 4; corner++) {
+            float x = offsets[corner][0] * 0.5f * from->length;
+            float y = offsets[corner][1] * 0.5f * from->width;
+            float world_x = from->x + x * from->heading_x - y * from->heading_y;
+            float world_y = from->y + x * from->heading_y + y * from->heading_x;
+            distance = fminf(distance, point_vehicle_distance_squared(world_x, world_y, to));
+        }
+    }
+    return distance;
+}
+
+static int safety_penalty_ready(const Drive* env, int last_timestep) {
+    return last_timestep < 0 || (env->timestep - last_timestep) * env->dt >= SAFETY_TIME_SECONDS;
+}
+
+static void apply_safety_penalties(Drive* env, int agent_slot, int agent_idx) {
+    Entity* ego = &env->entities[agent_idx];
+    float speed_squared = ego->vx * ego->vx + ego->vy * ego->vy;
+    if (ego->type != VEHICLE || ego->x == INVALID_POSITION || ego->respawn_timestep != -1 ||
+        ego->collision_state == VEHICLE_COLLISION || speed_squared <= SAFETY_MIN_SPEED * SAFETY_MIN_SPEED ||
+        ego->collision_reward_coefficient == 0.0f) return;
+
+    int check_ttc = safety_penalty_ready(env, ego->last_ttc_penalty_timestep);
+    int check_lateral = safety_penalty_ready(env, ego->last_lateral_penalty_timestep);
+    int ttc_violation = 0, lateral_violation = 0;
+    // Include pedestrians/cyclists even when they are excluded from policy
+    // selection, and do not restrict safety checks to visible observations.
+    for (int index = 0; index < env->num_objects && (check_ttc || check_lateral); index++) {
+        if (index == agent_idx) continue;
+        Entity* other = &env->entities[index];
+        if (other->type < VEHICLE || other->type > CYCLIST || other->x == INVALID_POSITION ||
+            other->respawn_timestep != -1) continue;
+        float dx = fabsf(other->x - ego->x), dy = fabsf(other->y - ego->y);
+        // Conservative world-axis bounds avoid detailed geometry for distant
+        // actors without imposing an observation-distance or partner-count cap.
+        float extent = 0.5f * (ego->length + ego->width + other->length + other->width);
+        if (check_lateral && dx < extent + SAFETY_CLEARANCE && dy < extent + SAFETY_CLEARANCE &&
+            vehicle_clearance_squared(ego, other) < SAFETY_CLEARANCE * SAFETY_CLEARANCE) {
+            lateral_violation = 1;
+            check_lateral = 0;
+        }
+        if (check_ttc && other->type == VEHICLE &&
+            dx <= extent + SAFETY_TIME_SECONDS * fabsf(other->vx - ego->vx) &&
+            dy <= extent + SAFETY_TIME_SECONDS * fabsf(other->vy - ego->vy) &&
+            !vehicle_approaches_from_behind(ego, other) &&
+            vehicle_time_to_collision(ego, other) < SAFETY_TIME_SECONDS) {
+            ttc_violation = 1;
+            check_ttc = 0;
+        }
+    }
+    if (ttc_violation) ego->last_ttc_penalty_timestep = env->timestep;
+    if (lateral_violation) ego->last_lateral_penalty_timestep = env->timestep;
+    float reward = -(ttc_violation + lateral_violation) * SAFETY_COLLISION_FRACTION *
+        ego->collision_reward_coefficient * (1.0f + 0.1f * sqrtf(speed_squared));
+    env->rewards[agent_slot] += reward;
+    record_reward_component(env, agent_slot, REWARD_COMPONENT_COLLISION, reward);
+}
+
 int check_lane_aligned(Entity* car, const StaticRoadEntity* lane, int geometry_idx) {
     // Validate lane geometry length
     if (!lane || lane->array_size < 2) {
@@ -2069,6 +2196,7 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
 }
 
 int valid_active_agent(Drive* env, int agent_idx){
+    if (env->entities[agent_idx].type != VEHICLE && !env->control_non_vehicles) return 0;
     if (env->entities[agent_idx].traj_valid[env->init_steps] != 1) return 0;
     float cos_heading = cosf(env->entities[agent_idx].traj_heading[0]);
     float sin_heading = sinf(env->entities[agent_idx].traj_heading[0]);
@@ -2130,13 +2258,6 @@ void set_active_agents(Drive* env){
             env->entities[b.candidates[k]].active_agent = 0;
         }
 
-        env->active_agent_indices = (int*)malloc(env->active_agent_count * sizeof(int));
-        env->static_car_indices = (int*)malloc(env->static_car_count * sizeof(int));
-        env->expert_static_car_indices = (int*)malloc(env->expert_static_car_count * sizeof(int));
-        for (int i = 0; i < env->active_agent_count; i++) env->active_agent_indices[i] = active_agent_indices[i];
-        for (int i = 0; i < env->static_car_count; i++) env->static_car_indices[i] = static_car_indices[i];
-        for (int i = 0; i < env->expert_static_car_count; i++) env->expert_static_car_indices[i] = expert_static_car_indices[i];
-
         goto finalize;
     } else if (env->policy_agents_per_env > 0) {
         SelectionBuckets b;
@@ -2179,13 +2300,6 @@ void set_active_agents(Drive* env){
                 static_car_indices[env->static_car_count++] = b.statics[i];
             }
 
-            env->active_agent_indices = (int*)malloc(env->active_agent_count * sizeof(int));
-            env->static_car_indices = (int*)malloc(env->static_car_count * sizeof(int));
-            env->expert_static_car_indices = (int*)malloc(env->expert_static_car_count * sizeof(int));
-            for (int i = 0; i < env->active_agent_count; i++) env->active_agent_indices[i] = active_agent_indices[i];
-            for (int i = 0; i < env->static_car_count; i++) env->static_car_indices[i] = static_car_indices[i];
-            for (int i = 0; i < env->expert_static_car_count; i++) env->expert_static_car_indices[i] = expert_static_car_indices[i];
-
             goto finalize;
         } else {
             int picked = -1;
@@ -2214,12 +2328,6 @@ void set_active_agents(Drive* env){
                     }
                 }
 
-                env->active_agent_indices = (int*)malloc(env->active_agent_count * sizeof(int));
-                env->static_car_indices = (int*)malloc(env->static_car_count * sizeof(int));
-                env->expert_static_car_indices = (int*)malloc(env->expert_static_car_count * sizeof(int));
-                for (int i = 0; i < env->active_agent_count; i++) env->active_agent_indices[i] = active_agent_indices[i];
-                for (int i = 0; i < env->static_car_count; i++) env->static_car_indices[i] = static_car_indices[i];
-                for (int i = 0; i < env->expert_static_car_count; i++) env->expert_static_car_indices[i] = expert_static_car_indices[i];
                 goto finalize;
             }
         }
@@ -2277,7 +2385,24 @@ legacy_select:
             }
         }
     }
-    // set up initial active agents
+finalize: {
+    // Excluding pedestrians/cyclists from policy control must not remove them
+    // from the simulation. Keep their trajectories in every selection mode.
+    unsigned char* registered = (unsigned char*)calloc(env->num_objects, sizeof(unsigned char));
+    for (int i = 0; i < env->active_agent_count; i++) registered[active_agent_indices[i]] = 1;
+    for (int i = 0; i < env->static_car_count; i++) registered[static_car_indices[i]] = 1;
+    for (int i = 0; i < env->num_objects &&
+                    env->active_agent_count + env->static_car_count < MAX_AGENTS; i++) {
+        Entity* e = &env->entities[i];
+        if (registered[i] || (e->type != PEDESTRIAN && e->type != CYCLIST)) continue;
+        static_car_indices[env->static_car_count++] = i;
+        expert_static_car_indices[env->expert_static_car_count++] = i;
+        e->active_agent = 0;
+        e->mark_as_expert = 1;
+    }
+    free(registered);
+}
+    // Publish the completed actor lists for rendering, observations and physics.
     env->active_agent_indices = (int*)malloc(env->active_agent_count * sizeof(int));
     env->static_car_indices = (int*)malloc(env->static_car_count * sizeof(int));
     env->expert_static_car_indices = (int*)malloc(env->expert_static_car_count * sizeof(int));
@@ -2291,7 +2416,6 @@ legacy_select:
     for(int i=0;i<env->expert_static_car_count;i++){
         env->expert_static_car_indices[i] = expert_static_car_indices[i];
     }
-finalize:
     // Collision and partner-observation loops visit active actors, then static
     // actors. Explicit selection modes must publish the same total as legacy mode.
     env->num_controllable_agents = env->active_agent_count + env->static_car_count;
@@ -3589,6 +3713,8 @@ void c_step(Drive* env){
                 env->entities[agent_idx].collided_before_goal = 1;
             }
         }
+
+        apply_safety_penalties(env, i, agent_idx);
 
         int lane_aligned = e->metrics_array[LANE_ALIGNED_IDX];
         float lateral_offset = e->metrics_array[LANE_LATERAL_OFFSET_IDX];
