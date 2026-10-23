@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replay</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #10171e; color: #dce5ed; font: 13px system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100dvh; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  #controls { position: fixed; bottom: 12px; left: 12px; right: 12px; display: flex; align-items: center;
+    gap: 8px; padding: 10px; background: #1b2631ee; border: 1px solid #354553; border-radius: 8px; }
+  button, select { background: #263543; color: inherit; border: 1px solid #485a69; border-radius: 4px;
+    padding: 6px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: #354b5d; }
+  button:disabled, select:disabled { opacity: .45; cursor: default; }
+  #play { min-width: 62px; }
+  #timeline { flex: 1; min-width: 50px; accent-color: #68d7df; }
+  #frame { min-width: 95px; text-align: center; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #message { position: fixed; top: 16px; left: 16px; right: 16px; text-align: center; pointer-events: none; }
+  @media (max-width: 550px) {
+    #controls { flex-wrap: wrap; gap: 6px; }
+    #timeline { order: 1; flex-basis: 100%; }
+    #frame { flex: 1; min-width: 70px; }
+  }
+</style>
+<canvas id="canvas" aria-label="Replay map. Drag to pan, scroll to zoom."></canvas>
+<div id="message" role="status">Loading replay.bin…</div>
+<div id="controls">
+  <button id="play" disabled title="Play / pause (Space)">Play</button>
+  <input id="timeline" disabled type="range" min="0" max="0" value="0" step="1" aria-label="Replay frame">
+  <output id="frame">0 / 0</output>
+  <select id="rate" disabled aria-label="Playback frame rate" title="Playback frame rate">
+    <option value="5">5 fps</option><option value="10" selected>10 fps</option>
+    <option value="20">20 fps</option><option value="40">40 fps</option>
+  </select>
+  <button id="out" disabled aria-label="Zoom out" title="Zoom out (−)">−</button>
+  <button id="in" disabled aria-label="Zoom in" title="Zoom in (+)">+</button>
+  <button id="fit" disabled title="Fit map (F)">Fit</button>
+</div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const canvas = $('canvas'), timeline = $('timeline');
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const validXY = (x, y) => Number.isFinite(x) && Number.isFinite(y) && x !== -10000 && y !== -10000;
+let replay, gl, program, staticMesh, movingMesh, viewUniform, scaleUniform;
+let tick = 0, playing = false, lastTime = 0, dirty = true;
+const camera = {x: 0, y: 0, zoom: 1, fit: 1};
+
+// drive.h/saveReplayToFile: little-endian counts, then actor and road records.
+function decode(buffer) {
+  const view = new DataView(buffer);
+  let offset = 0;
+  function reserve(bytes) {
+    if (bytes < 0 || offset + bytes > buffer.byteLength) throw Error('Invalid or truncated replay.bin.');
+    const start = offset;
+    offset += bytes;
+    return start;
+  }
+  const int = () => view.getInt32(reserve(4), true);
+  const array = (n, Type = Float32Array) => new Type(buffer, reserve(n * 4), n);
+  const objects = int(), roads = int();
+  if (objects < 0 || roads < 0 || objects + roads > (buffer.byteLength - 8) / 36)
+    throw Error('Invalid replay header.');
+  const actors = [], map = [], lights = [], bounds = [Infinity, Infinity, -Infinity, -Infinity];
+  let frames = 0;
+  for (let i = 0; i < objects + roads; i++) {
+    const raw = int(), type = raw & 255, n = int(), moving = type >= 1 && type <= 3;
+    const x = array(n), y = array(n);
+    reserve(n * 4); // Z.
+    let heading, valid;
+    if (moving) {
+      reserve(n * 12); // Velocity XYZ.
+      heading = array(n);
+      valid = array(n, Int32Array);
+    }
+    const dimensions = array(6), mark = int(); // Width, length, height, goal XYZ, expert / signal index.
+    if (raw & 0x100) reserve(int() * 12); // Optional multi-goal XYZ arrays.
+    const sequence = raw & 0x400 ? array(int(), Int32Array) : null;
+    const record = {type, n, x, y, heading, valid, width: dimensions[0], length: dimensions[1],
+      mark, sequence, yieldWhenOff: !!(raw & 0x200)};
+    if (moving) { actors.push(record); frames = Math.max(frames, n); }
+    else if (type !== 99) map.push(record); // Exit-order metadata has no visible geometry.
+    if (type === 9) lights.push(record);
+    for (let j = 0; j < n; j++) {
+      if ((moving && !valid[j]) || type === 99 || !validXY(x[j], y[j])) continue;
+      bounds[0] = Math.min(bounds[0], x[j]); bounds[1] = Math.min(bounds[1], y[j]);
+      bounds[2] = Math.max(bounds[2], x[j]); bounds[3] = Math.max(bounds[3], y[j]);
+    }
+  }
+  if (offset !== buffer.byteLength) throw Error('Unexpected data at the end of replay.bin.');
+  if (!Number.isFinite(bounds[0])) throw Error('Replay contains no visible geometry.');
+  return {actors, map, lights, bounds, frames: Math.max(1, frames)};
+}
+
+function initGL() {
+  gl = canvas.getContext('webgl2', {alpha: false, antialias: true});
+  if (!gl) throw Error('WebGL 2 is unavailable in this browser.');
+  function shader(type, source) {
+    const result = gl.createShader(type);
+    gl.shaderSource(result, source); gl.compileShader(result);
+    if (!gl.getShaderParameter(result, gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(result));
+    return result;
+  }
+  program = gl.createProgram();
+  gl.attachShader(program, shader(gl.VERTEX_SHADER, `#version 300 es
+    layout(location=0) in vec2 corner;
+    layout(location=1) in vec2 center;
+    layout(location=2) in vec2 direction;
+    layout(location=3) in vec2 size;
+    layout(location=4) in vec3 color;
+    layout(location=5) in float kind;
+    uniform vec2 viewCenter, viewScale;
+    uniform float zoom;
+    out vec2 uv;
+    out vec3 tint;
+    flat out float category;
+    out float along;
+    void main() {
+      bool actor = kind < 4.0;
+      vec2 minimum = actor ? vec2(5.0, 3.0) : vec2(0.0, kind == 4.0 ? 0.45 : 0.85);
+      vec2 local = corner * max(size, minimum / zoom);
+      vec2 world = center + direction * local.x + vec2(-direction.y, direction.x) * local.y;
+      gl_Position = vec4((world - viewCenter) * viewScale, 0.0, 1.0);
+      uv = corner; tint = color; category = kind; along = (corner.x + 0.5) * size.x;
+    }`));
+  gl.attachShader(program, shader(gl.FRAGMENT_SHADER, `#version 300 es
+    precision highp float;
+    in vec2 uv;
+    in vec3 tint;
+    flat in float category;
+    in float along;
+    uniform float zoom;
+    out vec4 pixel;
+    void main() {
+      if (category == 2.0 && length(uv) > 0.5) discard;
+      if (category == 5.0 && zoom > 1.0 && mod(along, 3.0) > 1.8) discard;
+      vec3 c = tint;
+      if (category == 1.0 && zoom > 1.0 && uv.x > 0.1 && uv.x < 0.3 && abs(uv.y) < 0.38)
+        c *= 0.35; // Windshield marks the front of each car.
+      pixel = vec4(c, 1.0);
+    }`));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+  viewUniform = gl.getUniformLocation(program, 'viewCenter');
+  scaleUniform = gl.getUniformLocation(program, 'viewScale');
+  gl.clearColor(16/255, 23/255, 30/255, 1);
+}
+
+// One rectangle per road segment / actor, rendered in two instanced draw calls.
+function mesh(data, usage) {
+  const vao = gl.createVertexArray(), buffer = gl.createBuffer();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-.5,-.5, .5,-.5, -.5,.5, .5,.5]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, data, usage);
+  let offset = 0;
+  [2, 2, 2, 3, 1].forEach((size, i) => {
+    gl.enableVertexAttribArray(i + 1);
+    gl.vertexAttribPointer(i + 1, size, gl.FLOAT, false, 40, offset * 4);
+    gl.vertexAttribDivisor(i + 1, 1); offset += size;
+  });
+  return {vao, buffer, count: data.length / 10};
+}
+
+const colors = {4: [.19,.29,.31], 5: [.65,.68,.65], 6: [.43,.52,.57],
+  7: [.95,.64,.22], 8: [.30,.62,.69], 9: [.49,.52,.57], 11: [.66,.49,.72], 98: [.49,.52,.57]};
+const widths = {4: .12, 5: .16, 6: .25, 7: .5, 8: .25, 9: .6, 11: .3, 98: .35};
+const signalColors = [colors[9], [.97,.27,.28], [1,.76,.24], [.30,.87,.51]];
+function segments(target, road, color) {
+  for (let i = 1; i < road.n; i++) {
+    const ax = road.x[i-1], ay = road.y[i-1], bx = road.x[i], by = road.y[i];
+    if (!validXY(ax, ay) || !validXY(bx, by)) continue;
+    const dx = bx-ax, dy = by-ay, length = Math.hypot(dx, dy);
+    if (length) target.push((ax+bx)/2, (ay+by)/2, dx/length, dy/length,
+      length, widths[road.type] || .25, ...color, road.type);
+  }
+}
+function dynamicData() {
+  const data = [], frame = Math.floor(tick), fraction = tick - frame;
+  for (const road of replay.map) {
+    if (road.type !== 9 && road.type !== 98) continue;
+    const light = road.type === 98 ? replay.lights[road.mark] : road;
+    const sequence = light?.sequence;
+    const state = sequence?.[Math.min(frame, sequence.length - 1)];
+    const color = state === 0 && light.yieldWhenOff ? colors[7] : signalColors[state] || colors[9];
+    segments(data, road, color);
+  }
+  for (const actor of replay.actors) {
+    if (frame >= actor.n || !actor.valid[frame] || !validXY(actor.x[frame], actor.y[frame])) continue;
+    let next = Math.min(frame + 1, actor.n - 1);
+    if (!actor.valid[next] || !validXY(actor.x[next], actor.y[next])) next = frame;
+    const x = actor.x[frame] + (actor.x[next] - actor.x[frame]) * fraction;
+    const y = actor.y[frame] + (actor.y[next] - actor.y[frame]) * fraction;
+    const delta = actor.heading[next] - actor.heading[frame];
+    const angle = actor.heading[frame] + Math.atan2(Math.sin(delta), Math.cos(delta)) * fraction;
+    if (!Number.isFinite(angle)) continue;
+    const color = actor.type === 2 ? [1,.68,.38] : actor.type === 3 ? [.73,.62,1] : [.37,.87,.89];
+    data.push(x, y, Math.cos(angle), Math.sin(angle), actor.length || 4.5, actor.width || 1.8, ...color, actor.type);
+  }
+  return new Float32Array(data);
+}
+
+function draw() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const width = Math.round(canvas.clientWidth * dpr), height = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  gl.viewport(0, 0, width, height); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(viewUniform, camera.x, camera.y);
+  gl.uniform2f(scaleUniform, 2 * camera.zoom / canvas.clientWidth, 2 * camera.zoom / canvas.clientHeight);
+  gl.uniform1f(gl.getUniformLocation(program, 'zoom'), camera.zoom);
+  const data = dynamicData();
+  gl.bindBuffer(gl.ARRAY_BUFFER, movingMesh.buffer); gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+  movingMesh.count = data.length / 10;
+  for (const m of [staticMesh, movingMesh]) {
+    gl.bindVertexArray(m.vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, m.count);
+  }
+  timeline.value = Math.floor(tick);
+  $('frame').textContent = `${Math.floor(tick)} / ${replay.frames - 1}`;
+  dirty = false;
+}
+function fit() {
+  if (!replay) return;
+  const [x0, y0, x1, y1] = replay.bounds;
+  camera.x = (x0+x1)/2; camera.y = (y0+y1)/2;
+  camera.fit = Math.min(canvas.clientWidth / Math.max(20, x1-x0),
+    Math.max(50, canvas.clientHeight - 160) / Math.max(20, y1-y0)) * .9;
+  camera.zoom = camera.fit; dirty = true;
+}
+function zoom(factor, x = canvas.clientWidth/2, y = canvas.clientHeight/2) {
+  const previous = camera.zoom;
+  camera.zoom = clamp(previous * factor, camera.fit / 4, Math.max(100, camera.fit));
+  camera.x += (x - canvas.clientWidth/2) * (1/previous - 1/camera.zoom);
+  camera.y -= (y - canvas.clientHeight/2) * (1/previous - 1/camera.zoom);
+  dirty = true;
+}
+function play(value) {
+  playing = value;
+  if (playing && tick >= replay.frames - 1) tick = 0;
+  lastTime = performance.now(); $('play').textContent = playing ? 'Pause' : 'Play'; dirty = true;
+}
+function seek(value) { play(false); tick = clamp(value, 0, replay.frames - 1); dirty = true; }
+$('play').onclick = () => play(!playing);
+timeline.oninput = () => seek(+timeline.value);
+$('in').onclick = () => zoom(1.5);
+$('out').onclick = () => zoom(1/1.5);
+$('fit').onclick = fit;
+canvas.addEventListener('wheel', event => {
+  event.preventDefault();
+  if (replay) zoom(Math.exp(-clamp(event.deltaY * (event.deltaMode === 1 ? 16 : 1), -300, 300) * .002), event.clientX, event.clientY);
+}, {passive: false});
+let drag;
+canvas.onpointerdown = event => {
+  if (event.button !== 0 || !replay || drag) return;
+  drag = {id: event.pointerId, x: event.clientX, y: event.clientY};
+  canvas.setPointerCapture(event.pointerId);
+};
+canvas.onpointermove = event => {
+  if (!drag || drag.id !== event.pointerId) return;
+  camera.x -= (event.clientX-drag.x)/camera.zoom; camera.y += (event.clientY-drag.y)/camera.zoom;
+  drag.x = event.clientX; drag.y = event.clientY; dirty = true;
+};
+canvas.onlostpointercapture = () => { drag = null; };
+canvas.onpointerup = canvas.onpointercancel = event => {
+  if (drag?.id === event.pointerId) { canvas.releasePointerCapture(event.pointerId); drag = null; }
+};
+window.onkeydown = event => {
+  if (!replay || event.target.matches('input, select, button') || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.code === 'Space') play(!playing);
+  else if (event.key === 'ArrowLeft') seek(Math.floor(tick)-1);
+  else if (event.key === 'ArrowRight') seek(Math.floor(tick)+1);
+  else if (event.key === 'Home') seek(0);
+  else if (event.key === 'End') seek(replay.frames-1);
+  else if (event.key === '+' || event.key === '=') zoom(1.5);
+  else if (event.key === '-') zoom(1/1.5);
+  else if (event.key.toLowerCase() === 'f') fit();
+  else return;
+  event.preventDefault();
+};
+window.onresize = () => { dirty = true; };
+function fail(error) {
+  playing = false; replay = null;
+  $('message').textContent = error.message;
+  document.querySelectorAll('#controls button, #controls input, #controls select').forEach(el => el.disabled = true);
+}
+canvas.addEventListener('webglcontextlost', event => {
+  event.preventDefault(); fail(Error('WebGL context lost. Reload to resume.'));
+});
+function animate(now) {
+  if (replay && playing) {
+    tick = Math.min(replay.frames-1, tick + Math.min((now-lastTime)/1000, .25) * +$('rate').value);
+    if (tick >= replay.frames-1) play(false);
+    dirty = true;
+  }
+  lastTime = now;
+  if (replay && dirty) draw();
+  requestAnimationFrame(animate);
+}
+(async () => {
+  try {
+    initGL();
+    const response = await fetch('replay.bin');
+    if (!response.ok) throw Error(`Could not load replay.bin (HTTP ${response.status}). Place it beside index.html.`);
+    replay = decode(await response.arrayBuffer());
+    const data = [];
+    for (const road of replay.map) if (road.type !== 9 && road.type !== 98)
+      segments(data, road, colors[road.type] || colors[6]);
+    staticMesh = mesh(new Float32Array(data), gl.STATIC_DRAW);
+    movingMesh = mesh(new Float32Array(0), gl.DYNAMIC_DRAW);
+    timeline.max = replay.frames-1;
+    document.querySelectorAll('#controls button, #controls input, #controls select').forEach(el => el.disabled = false);
+    $('message').textContent = '';
+    fit(); requestAnimationFrame(animate);
+  } catch (error) { fail(error); }
+})();
+</script>
+</html>
