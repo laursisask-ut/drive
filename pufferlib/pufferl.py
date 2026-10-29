@@ -678,7 +678,7 @@ class PuffeRL:
                 )
 
             profile("train_misc", epoch)
-            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.025 * behavior_anchor_kl_div
+            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + 0.01 * behavior_anchor_kl_div
 
             # This breaks vloss clipping?
             if config["use_rnn"]:
