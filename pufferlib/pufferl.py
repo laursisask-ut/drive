@@ -210,11 +210,24 @@ class PuffeRL:
             raise pufferlib.APIUsageError(f"Total agents {total_agents} <= segments {segments}")
 
         device = config["device"]
+        # Match floating observation storage to the policy's compute precision.
+        precision = config["precision"]
+        if precision not in ("float32", "bfloat16"):
+            raise pufferlib.APIUsageError(f"Invalid precision: {precision}: use float32 or bfloat16")
+        policy_dtype = next(policy.parameters()).dtype
+        self.amp_context = contextlib.nullcontext
+        if config.get("amp", True) and device == "cuda" and precision == "bfloat16":
+            policy_dtype = getattr(torch, precision)
+            self.amp_context = lambda: torch.amp.autocast(device_type="cuda", dtype=policy_dtype)
+
+        obs_dtype = pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype]
+        if obs_dtype.is_floating_point:
+            obs_dtype = policy_dtype
         self.observations = torch.zeros(
             segments,
             horizon,
             *obs_space.shape,
-            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype],
+            dtype=obs_dtype,
             pin_memory=device == "cuda" and config["cpu_offload"],
             device="cpu" if config["cpu_offload"] else device,
         )
@@ -321,15 +334,6 @@ class PuffeRL:
         epochs = config["total_timesteps"] // config["batch_size"]
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         self.total_epochs = epochs
-
-        # Automatic mixed precision
-        precision = config["precision"]
-        if precision not in ("float32", "bfloat16"):
-            raise pufferlib.APIUsageError(f"Invalid precision: {precision}: use float32 or bfloat16")
-        self.amp_context = contextlib.nullcontext
-        if config.get("amp", True) and config["device"] == "cuda":
-            amp_dtype = getattr(torch, precision)
-            self.amp_context = lambda: torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
 
         # Initializations
         self.config = config
@@ -440,7 +444,7 @@ class PuffeRL:
 
             profile("eval_copy", epoch)
             o = torch.as_tensor(o)
-            o_device = o.to(device)  # , non_blocking=True)
+            o_device = o.to(device=device, dtype=self.observations.dtype)
             r = torch.as_tensor(r).to(device)  # , non_blocking=True)
             d = torch.as_tensor(d).to(device)  # , non_blocking=True)
             t = torch.as_tensor(t).to(device)  # , non_blocking=True)
