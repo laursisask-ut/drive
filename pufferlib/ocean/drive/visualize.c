@@ -285,6 +285,7 @@ int eval_gif(const char* map_name, const char* policy_name, const char* model_pa
         e->comfort_reward_coefficient = 0.01f;
         e->lane_align_reward_coefficient = 5e-2f;
         e->collision_reward_coefficient = 1.0f;
+        e->safety_reward_coefficient = 1.0f;
         e->offroad_reward_coefficient = 1.0f;
         e->stop_line_reward_coefficient = 1.0f;
         e->lane_center_bias = 0.0f;

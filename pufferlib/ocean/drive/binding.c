@@ -452,6 +452,7 @@ static int my_log(
     assign_to_dict(dict, "comfort_reward", log->comfort_reward);
     assign_to_dict(dict, "lane_alignment_reward", log->lane_alignment_reward);
     assign_to_dict(dict, "collision_reward", log->collision_reward);
+    assign_to_dict(dict, "safety_reward", log->safety_reward);
     assign_to_dict(dict, "offroad_reward", log->offroad_reward);
     assign_to_dict(dict, "stop_line_reward", log->stop_line_reward);
     assign_to_dict(dict, "velocity_reward", log->velocity_reward);

@@ -6,7 +6,7 @@
 // Use this test if the network changes to ensure that the forward pass
 // matches the torch implementation to the 3rd or ideally 4th decimal place
 void test_drivenet() {
-    int num_obs = 95 + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int num_obs = drive_ego_features(CLASSIC) + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     int num_actions = 2;
     int num_agents = 4;
 

@@ -126,16 +126,16 @@ class SceneEncoderBlock(torch.nn.Module):
         return x + mlp_out
 
 class SceneEncoder(torch.nn.Module):
-    def __init__(self, ego_dim=95, hidden_dim=256, num_blocks=4):
+    def __init__(self, ego_dim=97, hidden_dim=256, num_blocks=4):
         super().__init__()
         self.ego_dim = ego_dim
-        if ego_dim not in (95, 98):
+        if ego_dim not in (97, 100):
             raise ValueError("Unsupported Drive ego layout; regenerate observations and retrain old checkpoints")
         # All pose, speed and selected-command history belongs to this one token.
-        self.ego_state_indices = list(range(7, 12)) + list(range(18, ego_dim))
-        self.goal_indices = [12, 13, 16, 17]
-        self.next_goal_indices = [14, 15]
-        self.reward_pref_indices = list(range(7))
+        self.ego_state_indices = list(range(8, 14)) + list(range(20, ego_dim))
+        self.goal_indices = [14, 15, 18, 19]
+        self.next_goal_indices = [16, 17, 18, 19]
+        self.reward_pref_indices = list(range(8))
         self.map_proj = torch.nn.Sequential(
             torch.nn.Linear(14, hidden_dim),
             torch.nn.ReLU()

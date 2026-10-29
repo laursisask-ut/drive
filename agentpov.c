@@ -15,7 +15,7 @@
 #include <rlgl.h>
 #include <lz4.h>
 
-#define DISPLAY_REWARD_COMPONENT_COUNT 7
+#define DISPLAY_REWARD_COMPONENT_COUNT 8
 #define DISPLAY_ACTION_COMPONENT_COUNT 2
 
 static const char *DISPLAY_REWARD_LABELS[DISPLAY_REWARD_COMPONENT_COUNT] = {
@@ -24,12 +24,13 @@ static const char *DISPLAY_REWARD_LABELS[DISPLAY_REWARD_COMPONENT_COUNT] = {
     "Comfort",
     "Lane alignment",
     "Collision",
+    "Safety",
     "Offroad",
     "Stop line",
 };
 
 static const float DISPLAY_ACCELERATION_VALUES[7] = {
-    -4.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 4.0f,
+    -5.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 4.0f,
 };
 
 static const float DISPLAY_STEERING_VALUES[13] = {
@@ -367,7 +368,7 @@ int main(int argc, char *argv[]) {
     const int other_agent_count = 63;
     const int road_segment_count = 200;
     int ego_dim = max_obs - other_agent_count * 7 - road_segment_count * 7;
-    if (ego_dim != 95 && ego_dim != 98) {
+    if (ego_dim != 97 && ego_dim != 100) {
         fprintf(stderr, "invalid replay layout: max_obs=%d inferred ego_dim=%d\n", max_obs, ego_dim);
         free(obs_buf);
         free(reward_values);
@@ -442,18 +443,19 @@ int main(int argc, char *argv[]) {
         rlDisableBackfaceCulling();
         rlPushMatrix();
         rlScalef(-1, 1, 1);
-        float goal_x = obs[t][12] / 0.005f;
-        float goal_y = obs[t][13] / 0.005f;
-        float speed = obs[t][7] * 27.7f;
-        float width = obs[t][9] * 15.0f;
-        float length = obs[t][10] * 30.0f;
-        float lane_heading_angle_diff = obs[t][18];
-        float lane_lateral_offset = obs[t][19] * 4.0f;
-        float next_goal_x = obs[t][14] / 0.005f;
-        float next_goal_y = obs[t][15] / 0.005f;
-        float goal_radius = obs[t][11] * 3.0f;
+        float goal_x = obs[t][14] / 0.005f;
+        float goal_y = obs[t][15] / 0.005f;
+        float speed = obs[t][8] * 27.7f;
+        float steering_angle_degrees = obs[t][9] * 0.667f * 180.0f / PI;
+        float width = obs[t][11] * 15.0f;
+        float length = obs[t][12] * 30.0f;
+        float lane_heading_angle_diff = obs[t][20];
+        float lane_lateral_offset = obs[t][21] * 4.0f;
+        float next_goal_x = obs[t][16] / 0.005f;
+        float next_goal_y = obs[t][17] / 0.005f;
+        float goal_radius = obs[t][13] * 3.0f;
         float collision_reward_coefficient = obs[t][0];
-        int remaining_goals = (int)(obs[t][16] + obs[t][17]);
+        int remaining_goals = (int)(obs[t][18] + obs[t][19]);
 
         // Draw roads beneath the history trail and vehicle outlines.
         int valid_road_points = 0;
@@ -500,8 +502,8 @@ int main(int argc, char *argv[]) {
         Vector2 previous = {0.0f, 0.0f};
         for (int k = 0; k < 10; k++) {
             Vector2 position = {
-                obs[t][20 + 2*k] / 0.02f,
-                obs[t][20 + 2*k + 1] / 0.02f,
+                obs[t][22 + 2*k] / 0.02f,
+                obs[t][22 + 2*k + 1] / 0.02f,
             };
             DrawLineEx(previous, position, 2.0f * line_thickness, GOLD);
             previous = position;
@@ -549,6 +551,7 @@ int main(int argc, char *argv[]) {
         DrawText(TextFormat("Lane angle diff: %04.1f degrees", lane_heading_angle_diff / PI * 180.0f), 10, 10, 18, WHITE);
         DrawText(TextFormat("Lane lateral offset: %04.2f m", lane_lateral_offset), 10, 33, 18, WHITE);
         DrawText(TextFormat("Speed: %04.2f km/h", speed * 3.6), 10, 56, 18, WHITE);
+        DrawText(TextFormat("Steering angle: %+05.1f deg", steering_angle_degrees), 10, 79, 18, WHITE);
         int acceleration_index = -1;
         int steering_index = -1;
         if (action_values != NULL) {
@@ -558,25 +561,25 @@ int main(int argc, char *argv[]) {
 
         if (steering_index >= 0 && steering_index < (int)(sizeof(DISPLAY_STEERING_VALUES) / sizeof(DISPLAY_STEERING_VALUES[0]))) {
             float steering_degrees = DISPLAY_STEERING_VALUES[steering_index] * 180.0f / PI;
-            DrawText(TextFormat("Steering action: %+05.1f deg", steering_degrees), 10, 79, 18, WHITE);
+            DrawText(TextFormat("Steering action: %+05.1f deg", steering_degrees), 10, 102, 18, WHITE);
         } else {
-            DrawText("Steering action: N/A", 10, 79, 18, WHITE);
+            DrawText("Steering action: N/A", 10, 102, 18, WHITE);
         }
 
         if (acceleration_index >= 0 && acceleration_index < (int)(sizeof(DISPLAY_ACCELERATION_VALUES) / sizeof(DISPLAY_ACCELERATION_VALUES[0]))) {
             float acceleration_ms = DISPLAY_ACCELERATION_VALUES[acceleration_index];
-            DrawText(TextFormat("Acceleration action: %+0.2f m/s^2", acceleration_ms), 10, 102, 18, WHITE);
+            DrawText(TextFormat("Acceleration action: %+0.2f m/s^2", acceleration_ms), 10, 125, 18, WHITE);
         } else {
-            DrawText("Acceleration action: N/A", 10, 102, 18, WHITE);
+            DrawText("Acceleration action: N/A", 10, 125, 18, WHITE);
         }
 
         if (remaining_goals >= 2) {
-            DrawText("Goals remaining: 2+", 10, 125, 18, WHITE);
+            DrawText("Goals remaining: 2+", 10, 148, 18, WHITE);
         } else {
-            DrawText(TextFormat("Goals remaining: %d", remaining_goals), 10, 125, 18, WHITE);
+            DrawText(TextFormat("Goals remaining: %d", remaining_goals), 10, 148, 18, WHITE);
         }
 
-        DrawText(TextFormat("Road points: %d", valid_road_points), 10, 148, 18, WHITE);
+        DrawText(TextFormat("Road points: %d", valid_road_points), 10, 171, 18, WHITE);
 
         const int table_x = 420;
         const int table_y = 8;

@@ -13,18 +13,19 @@ import wandb
 
 
 from pufferlib.ocean.torch import Wayformer
+from pufferlib.ocean.drive.observation import ego_features
 
 class PregeneratedDataset(Dataset):
     def __init__(self, archive_path):
         super().__init__()
         with np.load(archive_path) as data:
             inputs = data["inputs"]
-            if inputs.ndim != 3 or inputs.shape[-1] != 1936:
+            if inputs.ndim != 3 or inputs.shape[-1] != ego_features() + 63 * 7 + 200 * 7:
                 raise ValueError("Wrong input shape: regenerate supervised_data.npz with create_supervised_data.py")
             self.inputs = torch.from_numpy(inputs).to(torch.float32)
             # Hide reward preferences and all history in both splits, keeping the full shape.
             self.inputs[..., :7] = 0
-            self.inputs[..., 20:95] = 0
+            self.inputs[..., 21:ego_features()] = 0
             self.actions = torch.from_numpy(data["actions"]).to(torch.int64)
             self.waypoints = torch.from_numpy(data["waypoints"]).to(torch.float32)
             self.waypoint_masks = torch.from_numpy(data["waypoint_masks"]).to(torch.bool)
@@ -54,14 +55,14 @@ def main():
     torch.set_float32_matmul_precision("high")
     random.seed(2026)
 
-    model = Wayformer(ego_dim=95, action_dim=[7, 13])
+    model = Wayformer(ego_dim=ego_features(), action_dim=[7, 13])
     #model.load_state_dict(torch.load("/home/laur/Dev/PufferDrive/experiments/puffer_drive_n1uaeele/model_puffer_drive_003577.pt"))
 
     # Zero-input weights stay zero during training, so deployment ignores these
     # features too. Preferences enter through both a token and FiLM conditioning.
     history_columns = [
         i for i, obs_index in enumerate(model.encoder.ego_state_indices)
-        if 20 <= obs_index < 95
+        if 22 <= obs_index < model.encoder.ego_dim
     ]
     with torch.no_grad():
         model.encoder.ego_state_proj[0].weight[:, history_columns] = 0

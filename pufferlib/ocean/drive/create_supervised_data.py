@@ -6,6 +6,7 @@ import itertools
 from multiprocessing import Pool
 
 import numpy as np
+from pufferlib.ocean.drive.observation import ego_features
 from pufferlib.ocean.drive.road_types import STOP_SIGN, RIGHT_HAND_STOP_LINE, stop_line_fallback_type
 
 from lanelet2.io import Origin, load
@@ -24,7 +25,7 @@ def get_lanelet_map():
         lanelet2_map = load("tartu_large_processed.osm", projector)
     return lanelet2_map
 
-ACCELERATION_VALUES = [-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0]
+ACCELERATION_VALUES = [-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0]
 STEERING_VALUES = [-0.667, -0.5, -0.333, -0.167, -0.08, -0.01, 0.0, 0.01, 0.08, 0.167, 0.333, 0.500, 0.667]
 
 def to_egocentric_vector(x, y, ego_heading):
@@ -79,28 +80,40 @@ def write_history(data, t, x, y, heading, speed, policy_actions):
     past_steps = np.maximum(t - np.arange(1, 11), 0)
     cosine, sine = np.cos(heading[t]), np.sin(heading[t])
     dx, dy = x[past_steps] - x[t], y[past_steps] - y[t]
-    positions = data[20:40].reshape(-1, 2)
+    positions = data[22:42].reshape(-1, 2)
     positions[:, 0] = (dx * cosine + dy * sine) * 0.02
     positions[:, 1] = (-dx * sine + dy * cosine) * 0.02
     delta = heading[past_steps] - heading[t]
-    headings = data[40:60].reshape(-1, 2)
+    headings = data[42:62].reshape(-1, 2)
     headings[:, 0], headings[:, 1] = np.cos(delta), np.sin(delta)
-    data[60:70] = speed[past_steps] / 27.7
+    data[62:72] = speed[past_steps] / 27.7
     # Older speed samples repeat the initial speed if they predate the scenario.
-    data[70:75] = speed[np.maximum(t - np.array([20, 30, 40, 50, 60]), 0)] / 27.7
-    commands = data[75:95].reshape(10, 2)
+    data[72:77] = speed[np.maximum(t - np.array([20, 30, 40, 50, 60]), 0)] / 27.7
+    commands = data[77:97].reshape(10, 2)
     commands[:] = 0  # Normalized physical zero: no acceleration or steering.
     count = min(t, 10)
     commands[:count] = policy_actions[t-count:t][::-1]
 
 
+def calculate_steering_rate(desired_steering, steering_angle):
+    low_steering_rate = 3.0 / 16.135
+    high_steering_rate = 5.5 / 16.135
+
+    low_steering_rate_error = 0.2 / 16.135
+    high_steering_rate_error = 1.5 / 16.135
+
+    steering_error = abs(desired_steering - steering_angle)
+
+    slope = (high_steering_rate - low_steering_rate) / (high_steering_rate_error - low_steering_rate_error)
+    intercept = low_steering_rate - slope * low_steering_rate_error
+
+    return min(high_steering_rate, max(low_steering_rate, steering_error * slope + intercept))
+
+
 def process_scenario(filepath):
     with open(filepath) as file:
         scenario = json.load(file)
-    action_delay_steps = scenario["ego"]["action_delay_steps"]
-    if type(action_delay_steps) is not int or not 0 <= action_delay_steps <= 5:
-        raise ValueError(f"{filepath}: action_delay_steps must be an integer from 0 to 5")
-    print(f"processing {filepath} (action delay: {action_delay_steps} steps)", file=sys.stderr)
+    print(f"processing {filepath}", file=sys.stderr)
     lanelet2_map = get_lanelet_map()
     hide_road_border = scenario.get("hide_road_border", False)
     hide_centerline = scenario.get("hide_centerline", False)
@@ -108,12 +121,11 @@ def process_scenario(filepath):
     trajectory = {key: np.asarray(scenario["ego"][key], dtype=np.float64)
                   for key in ("x", "y", "heading", "speed")}
     steps = len(trajectory["x"]) - 1
-    # Reserve future transitions for every possible delay so scenario lengths
-    # stay independent of the sampled delay and can still be stacked for training.
-    sample_count = steps - 5
+    sample_count = steps - 3
     if sample_count <= 0 or any(len(v) != steps + 1 for v in trajectory.values()):
-        raise ValueError(f"{filepath}: need matching trajectories extending beyond 5 steps")
-    inputs = np.zeros((sample_count, 1936), dtype=np.float32)
+        raise ValueError(f"{filepath}: need matching trajectories extending beyond 3 steps")
+    ego_dim = ego_features()
+    inputs = np.zeros((sample_count, ego_dim + 63 * 7 + 200 * 7), dtype=np.float32)
     expert_actions = np.zeros((steps, 2), dtype=np.int32)
     expert_actions[:, 0] = ACCELERATION_VALUES.index(0.0)
     expert_actions[:, 1] = STEERING_VALUES.index(0.0)
@@ -122,6 +134,8 @@ def process_scenario(filepath):
 
     prev_heading = scenario["ego"]["heading"][0]
     prev_speed = scenario["ego"]["speed"][0]
+    steering_angles = []
+    steering_angle = 0
 
     for t in range(steps):
         speed = scenario["ego"]["speed"][t]
@@ -146,10 +160,12 @@ def process_scenario(filepath):
             else:
                 steering_action_idx = min([i for i in range(len(STEERING_VALUES)) if STEERING_VALUES[i] <= 0 and desired_steering <= STEERING_VALUES[i]], key=lambda x: STEERING_VALUES[x])
             expert_actions[t][1] = steering_action_idx
-            prev_heading = normalize_heading(prev_heading + speed * 0.1 * math.tan(STEERING_VALUES[steering_action_idx]) / wheelbase)
+            max_steer_rate = calculate_steering_rate(STEERING_VALUES[steering_action_idx], steering_angle) * 0.1
+            steering_angle += max(min(STEERING_VALUES[steering_action_idx] - steering_angle, max_steer_rate), -max_steer_rate)
+            prev_heading = normalize_heading(prev_heading + speed * 0.1 * math.tan(steering_angle) / wheelbase)
+        steering_angles.append(steering_angle)
 
-    # The teacher issues the command early enough for the scenario's delay.
-    # Use this same issued-command timeline for both labels and past actions.
+    action_delay_steps = 2
     issued_actions = expert_actions[action_delay_steps:]
     policy_actions = np.column_stack((
         np.asarray(ACCELERATION_VALUES)[issued_actions[:, 0]] / 4.0,
@@ -204,26 +220,28 @@ def process_scenario(filepath):
         data = inputs[row]
         # Safety penalties, comfort, then lane-following preferences.
         data[0] = 1.0  # Collision reward coefficient
-        data[1] = 1.0  # Offroad reward coefficient
-        data[2] = 1.0  # Stop-line reward coefficient
-        data[3] = 0.01  # Comfort reward coefficient
-        data[4] = 2.5e-3  # Lane-center reward coefficient
-        data[5] = 2.5e-2  # Lane-alignment reward coefficient
-        data[6] = 0.0  # Lane-center bias
-        data[7] = speed / 27.7
-        data[8] = 50 / 3.6 / 27.7
-        data[9] = scenario["ego"]["width"] / 15.0
-        data[10] = scenario["ego"]["length"] / 30.0
-        data[11] = 1.0  # Goal radius / 3 m
-        data[12:14] = rel_goal_x * 0.005, rel_goal_y * 0.005
-        data[14:16] = rel_next_goal_x * 0.005, rel_next_goal_y * 0.005
+        data[1] = 1.0  # Safety reward coefficient
+        data[2] = 1.0  # Offroad reward coefficient
+        data[3] = 1.0  # Stop-line reward coefficient
+        data[4] = 0.01  # Comfort reward coefficient
+        data[5] = 2.5e-3  # Lane-center reward coefficient
+        data[6] = 2.5e-2  # Lane-alignment reward coefficient
+        data[7] = 0.0  # Lane-center bias
+        data[8] = speed / 27.7
+        data[9] = steering_angles[t] / 0.667
+        data[10] = 50 / 3.6 / 27.7
+        data[11] = scenario["ego"]["width"] / 15.0
+        data[12] = scenario["ego"]["length"] / 30.0
+        data[13] = 1.0  # Goal radius / 3 m
+        data[14:16] = rel_goal_x * 0.005, rel_goal_y * 0.005
+        data[16:18] = rel_next_goal_x * 0.005, rel_next_goal_y * 0.005
         remaining = scenario["ego"].get("remaining_goals", 3)
         if isinstance(remaining, list):
             remaining = remaining[t]
-        data[16] = remaining >= 2
-        data[17] = remaining >= 1
-        data[18] = lane_heading_angle_diff
-        data[19] = lateral_offset / 4.0
+        data[18] = remaining >= 2
+        data[19] = remaining >= 1
+        data[20] = lane_heading_angle_diff
+        data[21] = lateral_offset / 4.0
         write_history(data, t, **trajectory, policy_actions=policy_actions)
 
         assert len(scenario["others"]) <= 63
@@ -233,13 +251,13 @@ def process_scenario(filepath):
         for i, obj in enumerate(nearby):
             obj_x, obj_y = to_egocentric_point(obj["x"][t], obj["y"][t], ego_x, ego_y, ego_heading)
             obj_heading_x, obj_heading_y = to_egocentric_vector(math.cos(obj["heading"][t]), math.sin(obj["heading"][t]), ego_heading)
-            data[95 + 7 * i] = obj_x * 0.02
-            data[95 + 7 * i + 1] = obj_y * 0.02
-            data[95 + 7 * i + 2] = obj["width"] / 15.0
-            data[95 + 7 * i + 3] = obj["length"] / 30.0
-            data[95 + 7 * i + 4] = obj_heading_x
-            data[95 + 7 * i + 5] = obj_heading_y
-            data[95 + 7 * i + 6] = obj["speed"][t] / 27.7
+            data[ego_dim + 7 * i] = obj_x * 0.02
+            data[ego_dim + 7 * i + 1] = obj_y * 0.02
+            data[ego_dim + 7 * i + 2] = obj["width"] / 15.0
+            data[ego_dim + 7 * i + 3] = obj["length"] / 30.0
+            data[ego_dim + 7 * i + 4] = obj_heading_x
+            data[ego_dim + 7 * i + 5] = obj_heading_y
+            data[ego_dim + 7 * i + 6] = obj["speed"][t] / 27.7
 
         search_box = BoundingBox2d(BasicPoint2d(ego_x - 150, ego_y - 150), BasicPoint2d(ego_x + 150, ego_y + 150))
 
@@ -333,7 +351,7 @@ def process_scenario(filepath):
                 prev_p = p
 
         road_data = sorted(road_data, key=lambda row: math.hypot(row[0], row[1]))[:200]
-        data[95 + 7 * 63:95 + 7 * 63 + len(road_data) * 7] = np.array(road_data).ravel()
+        data[ego_dim + 7 * 63:ego_dim + 7 * 63 + len(road_data) * 7] = np.array(road_data).ravel()
 
     actions = issued_actions[:sample_count]
 
@@ -343,12 +361,12 @@ def process_scenario(filepath):
             compressed = lz4.block.compress(inputs.tobytes(), store_size=False)
 
             import struct
-            f.write(struct.pack("iii", 1936, sample_count, len(compressed)))
+            f.write(struct.pack("iii", inputs.shape[1], sample_count, len(compressed)))
             f.write(compressed)
 
             # Reward data, not relevant here so set to all zeros
-            reward_compressed = lz4.block.compress(bytes([0]) * 4 * 7 * sample_count, store_size=False)
-            f.write(struct.pack("ii", 7, len(reward_compressed)))
+            reward_compressed = lz4.block.compress(bytes([0]) * 4 * 8 * sample_count, store_size=False)
+            f.write(struct.pack("ii", 8, len(reward_compressed)))
             f.write(reward_compressed)
 
             # Actions

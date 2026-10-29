@@ -60,10 +60,10 @@
 #define OFFROAD 2
 #define RED_TRAFFIC_LIGHT_CROSSED 3
 
-#define SAFETY_MIN_SPEED 3.0f
+#define SAFETY_MIN_SPEED 2.0f
 #define SAFETY_TIME_SECONDS 1.0f
 #define SAFETY_CLEARANCE 0.1f
-#define SAFETY_COLLISION_FRACTION 0.1f
+#define SAFETY_COLLISION_FRACTION 0.01f
 
 // Metrics array indices
 #define COLLISION_IDX 0
@@ -101,17 +101,18 @@
 #define REPLAY_ACTION_COMPONENT_COUNT 2
 #define REPLAY_ACTION_ACCELERATION_IDX 0
 #define REPLAY_ACTION_STEERING_IDX 1
+#define REPLAY_REWARD_COMPONENT_COUNT 8
 
 #define REWARD_COMPONENT_GOAL 0
 #define REWARD_COMPONENT_LANE_CENTER 1
 #define REWARD_COMPONENT_COMFORT 2
 #define REWARD_COMPONENT_LANE_ALIGNMENT 3
 #define REWARD_COMPONENT_COLLISION 4
-#define REWARD_COMPONENT_OFFROAD 5
-#define REWARD_COMPONENT_STOP_LINE 6
-#define REPLAY_REWARD_COMPONENT_COUNT 7
-#define REWARD_COMPONENT_VELOCITY 7
-#define REWARD_COMPONENT_ADE 8
+#define REWARD_COMPONENT_SAFETY 5
+#define REWARD_COMPONENT_OFFROAD 6
+#define REWARD_COMPONENT_STOP_LINE 7
+#define REWARD_COMPONENT_VELOCITY 8
+#define REWARD_COMPONENT_ADE 9
 
 #define COLLISION_COUNT_BINS 101
 #define COLLISION_COUNT_BUCKETS 5151
@@ -162,6 +163,7 @@ struct Log {
     float comfort_reward;
     float lane_alignment_reward;
     float collision_reward;
+    float safety_reward;
     float offroad_reward;
     float stop_line_reward;
     float velocity_reward;
@@ -251,6 +253,7 @@ struct Entity {
     float comfort_reward_coefficient;
     float lane_align_reward_coefficient;
     float collision_reward_coefficient;
+    float safety_reward_coefficient;
     float offroad_reward_coefficient;
     float stop_line_reward_coefficient;
     float lane_center_bias;
@@ -266,7 +269,10 @@ struct Entity {
     float jerk_lat;
     float steering_angle;
     float wheelbase;
-    float max_steering_rate;
+    float low_steering_rate;
+    float high_steering_rate;
+    float low_steering_rate_error;
+    float high_steering_rate_error;
 
     // Private actuator state; delay is fixed for an episode. Discrete indices
     // and continuous commands both fit exactly in these two-component rows.
@@ -277,9 +283,6 @@ struct Entity {
     // Ring of pre-action states and normalized commands selected by the policy.
     int ego_history_head;
     float ego_history[EGO_HISTORY_CAPACITY][7];
-
-    int last_ttc_penalty_timestep;
-    int last_lateral_penalty_timestep;
 };
 
 typedef struct StaticRoadEntity StaticRoadEntity;
@@ -466,7 +469,9 @@ typedef struct StaticRoadMap {
 
 struct ReplayExportLog {
     int capacity;
-    int num_agents;
+    int num_agents; // Policy slots with observations/actions.
+    int num_actors; // Policy slots first, then background actors (including experts).
+    int* actor_indices;
     float* traj_x;
     float* traj_y;
     float* traj_z;
@@ -474,6 +479,8 @@ struct ReplayExportLog {
     float* traj_vy;
     float* traj_vz;
     float* heading;
+    int* valid;
+    int* traffic_light_states; // Light-major, indexed by absolute scenario timestep.
     float* observations;
     float* reward_components;
     int* action_indices;
@@ -750,6 +757,7 @@ void add_log(Drive* env) {
         env->log.comfort_reward += env->logs[i].comfort_reward;
         env->log.lane_alignment_reward += env->logs[i].lane_alignment_reward;
         env->log.collision_reward += env->logs[i].collision_reward;
+        env->log.safety_reward += env->logs[i].safety_reward;
         env->log.offroad_reward += env->logs[i].offroad_reward;
         env->log.stop_line_reward += env->logs[i].stop_line_reward;
         env->log.velocity_reward += env->logs[i].velocity_reward;
@@ -778,6 +786,9 @@ static inline void accumulate_reward_component(Log* log, int component, float re
         break;
     case REWARD_COMPONENT_COLLISION:
         log->collision_reward += reward;
+        break;
+    case REWARD_COMPONENT_SAFETY:
+        log->safety_reward += reward;
         break;
     case REWARD_COMPONENT_OFFROAD:
         log->offroad_reward += reward;
@@ -895,9 +906,9 @@ static void record_replay_trajectories(Drive* env) {
     if (!env->export_replay_enabled || !env->export_log.traj_x ||
         env->timestep < 0 || env->timestep >= env->export_log.capacity) return;
 
-    // Replay slots match agent_XX.bin / observation rows, rather than entity IDs.
-    for (int slot = 0; slot < env->export_log.num_agents; slot++) {
-        const Entity* e = &env->entities[env->active_agent_indices[slot]];
+    // The first num_agents slots still match agent_XX.bin / observation rows.
+    for (int slot = 0; slot < env->export_log.num_actors; slot++) {
+        const Entity* e = &env->entities[env->export_log.actor_indices[slot]];
         size_t index = (size_t)slot * env->export_log.capacity + env->timestep;
         env->export_log.traj_x[index] = e->x;
         env->export_log.traj_y[index] = e->y;
@@ -906,7 +917,15 @@ static void record_replay_trajectories(Drive* env) {
         env->export_log.traj_vy[index] = e->vy;
         env->export_log.traj_vz[index] = e->vz;
         env->export_log.heading[index] = e->heading;
+        int valid = isfinite(e->x) && isfinite(e->y) &&
+            e->x != INVALID_POSITION && e->y != INVALID_POSITION;
+        if (!e->active_agent && e->mark_as_expert && !env->dynamic_map_generation)
+            valid = valid && env->timestep < e->array_size && e->traj_valid[env->timestep];
+        env->export_log.valid[index] = valid;
     }
+    for (int i = 0; i < env->num_traffic_lights; i++)
+        env->export_log.traffic_light_states[(size_t)i * env->export_log.capacity + env->timestep] =
+            env->traffic_lights_enabled ? env->traffic_light_states[i].traffic_light_color : TRAFFIC_LIGHT_OFF;
 }
 
 
@@ -1094,6 +1113,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             e->comfort_reward_coefficient = 0.01f;
             e->lane_align_reward_coefficient = 2.5e-2f;
             e->collision_reward_coefficient = 1.0f;
+            e->safety_reward_coefficient = 1.0f;
             e->offroad_reward_coefficient = 1.0f;
             e->stop_line_reward_coefficient = 1.0f;
             e->lane_center_bias = 0.0f;
@@ -1290,8 +1310,6 @@ void set_start_position(Drive* env){
         e->displacement_sample_count = 0;
         e->respawn_timestep = -1;
         e->respawn_count = 0;
-        e->last_ttc_penalty_timestep = -1;
-        e->last_lateral_penalty_timestep = -1;
 
         // Dynamics
         e->a_long = 0.0f;
@@ -1307,7 +1325,6 @@ void set_start_position(Drive* env){
     }
     reset_exit_orders(env);
     env->eval_traffic_light_violation = 0;
-    record_replay_trajectories(env);
     //EndDrawing();
 }
 
@@ -1835,23 +1852,16 @@ static float vehicle_clearance_squared(Entity* ego, Entity* other) {
     return distance;
 }
 
-static int safety_penalty_ready(const Drive* env, int last_timestep) {
-    return last_timestep < 0 || (env->timestep - last_timestep) * env->dt >= SAFETY_TIME_SECONDS;
-}
-
 static void apply_safety_penalties(Drive* env, int agent_slot, int agent_idx) {
     Entity* ego = &env->entities[agent_idx];
     float speed_squared = ego->vx * ego->vx + ego->vy * ego->vy;
     if (ego->type != VEHICLE || ego->x == INVALID_POSITION || ego->respawn_timestep != -1 ||
-        ego->collision_state == VEHICLE_COLLISION || speed_squared <= SAFETY_MIN_SPEED * SAFETY_MIN_SPEED ||
-        ego->collision_reward_coefficient == 0.0f) return;
+        ego->collision_state == VEHICLE_COLLISION || speed_squared <= SAFETY_MIN_SPEED * SAFETY_MIN_SPEED) return;
 
-    int check_ttc = safety_penalty_ready(env, ego->last_ttc_penalty_timestep);
-    int check_lateral = safety_penalty_ready(env, ego->last_lateral_penalty_timestep);
     int ttc_violation = 0, lateral_violation = 0;
     // Include pedestrians/cyclists even when they are excluded from policy
     // selection, and do not restrict safety checks to visible observations.
-    for (int index = 0; index < env->num_objects && (check_ttc || check_lateral); index++) {
+    for (int index = 0; index < env->num_objects; index++) {
         if (index == agent_idx) continue;
         Entity* other = &env->entities[index];
         if (other->type < VEHICLE || other->type > CYCLIST || other->x == INVALID_POSITION ||
@@ -1860,26 +1870,22 @@ static void apply_safety_penalties(Drive* env, int agent_slot, int agent_idx) {
         // Conservative world-axis bounds avoid detailed geometry for distant
         // actors without imposing an observation-distance or partner-count cap.
         float extent = 0.5f * (ego->length + ego->width + other->length + other->width);
-        if (check_lateral && dx < extent + SAFETY_CLEARANCE && dy < extent + SAFETY_CLEARANCE &&
+        if (dx < extent + SAFETY_CLEARANCE && dy < extent + SAFETY_CLEARANCE &&
             vehicle_clearance_squared(ego, other) < SAFETY_CLEARANCE * SAFETY_CLEARANCE) {
             lateral_violation = 1;
-            check_lateral = 0;
         }
-        if (check_ttc && other->type == VEHICLE &&
+        if (other->type == VEHICLE &&
             dx <= extent + SAFETY_TIME_SECONDS * fabsf(other->vx - ego->vx) &&
             dy <= extent + SAFETY_TIME_SECONDS * fabsf(other->vy - ego->vy) &&
             !vehicle_approaches_from_behind(ego, other) &&
             vehicle_time_to_collision(ego, other) < SAFETY_TIME_SECONDS) {
             ttc_violation = 1;
-            check_ttc = 0;
         }
     }
-    if (ttc_violation) ego->last_ttc_penalty_timestep = env->timestep;
-    if (lateral_violation) ego->last_lateral_penalty_timestep = env->timestep;
     float reward = -(ttc_violation + lateral_violation) * SAFETY_COLLISION_FRACTION *
-        ego->collision_reward_coefficient * (1.0f + 0.1f * sqrtf(speed_squared));
+        ego->safety_reward_coefficient * (1.0f + 0.1f * sqrtf(speed_squared));
     env->rewards[agent_slot] += reward;
-    record_reward_component(env, agent_slot, REWARD_COMPONENT_COLLISION, reward);
+    record_reward_component(env, agent_slot, REWARD_COMPONENT_SAFETY, reward);
 }
 
 int check_lane_aligned(Entity* car, const StaticRoadEntity* lane, int geometry_idx) {
@@ -2638,14 +2644,14 @@ static void saveReplayToFile(Drive* env) {
         return;
     }
 
-    fwrite(&env->export_log.num_agents, sizeof(int), 1, file);
+    fwrite(&env->export_log.num_actors, sizeof(int), 1, file);
     int road_records = env->num_roads + env->num_eval_traffic_light_lines;
     fwrite(&road_records, sizeof(int), 1, file);
 
     int exported_steps = fmin(env->timestep+1, env->export_log.capacity);
 
-    for (int i = 0; i < env->export_log.num_agents; i++) {
-        Entity* e = &env->entities[env->active_agent_indices[i]];
+    for (int i = 0; i < env->export_log.num_actors; i++) {
+        Entity* e = &env->entities[env->export_log.actor_indices[i]];
         fwrite(&e->type, sizeof(int), 1, file);
 
         if (e->type == VEHICLE || e->type == PEDESTRIAN || e->type == CYCLIST) {
@@ -2657,10 +2663,7 @@ static void saveReplayToFile(Drive* env) {
             fwrite(env->export_log.traj_vy + i * env->export_log.capacity, sizeof(float), exported_steps, file);
             fwrite(env->export_log.traj_vz + i * env->export_log.capacity, sizeof(float), exported_steps, file);
             fwrite(env->export_log.heading + i * env->export_log.capacity, sizeof(float), exported_steps, file);
-            for (int t = 0; t < exported_steps; t++) {
-                int valid = 1;
-                fwrite(&valid, sizeof(int), 1, file);
-            }
+            fwrite(env->export_log.valid + i * env->export_log.capacity, sizeof(int), exported_steps, file);
         } else {
             fwrite(&e->array_size, sizeof(int), 1, file);
             fwrite(e->traj_x, sizeof(float), e->array_size, file);
@@ -2689,9 +2692,9 @@ static void saveReplayToFile(Drive* env) {
     for (int i = 0; i < env->num_roads; i++) {
         const StaticRoadEntity* road = &env->static_road_entities[i];
         int raw_type = road->type;
-        const TrafficLightState* light = road->traffic_light_idx >= 0
-            ? &env->traffic_light_states[road->traffic_light_idx] : NULL;
-        if (light && light->sequence) raw_type |= MAP_TRAFFIC_LIGHT_SEQUENCE_FLAG;
+        const int* light_states = road->traffic_light_idx >= 0
+            ? env->export_log.traffic_light_states + (size_t)road->traffic_light_idx * env->export_log.capacity : NULL;
+        if (light_states) raw_type |= MAP_TRAFFIC_LIGHT_SEQUENCE_FLAG;
         if (road->type == TRAFFIC_LIGHT_STOP_LINE && road->traffic_light_off_type == STOP_SIGN)
             raw_type |= MAP_TRAFFIC_LIGHT_YIELD_FLAG;
         fwrite(&raw_type, sizeof(int), 1, file);
@@ -2704,9 +2707,10 @@ static void saveReplayToFile(Drive* env) {
         int mark_as_expert = 0;
         fwrite(unused, sizeof(float), 6, file);
         fwrite(&mark_as_expert, sizeof(int), 1, file);
-        if (light && light->sequence) {
-            fwrite(&light->sequence_length, sizeof(int), 1, file);
-            fwrite(light->sequence, sizeof(int), light->sequence_length, file);
+        if (light_states) {
+            // Reuse the map sequence field for actual colors at each recorded frame.
+            fwrite(&exported_steps, sizeof(int), 1, file);
+            fwrite(light_states, sizeof(int), exported_steps, file);
         }
     }
     for (int i = 0; i < env->num_eval_traffic_light_lines; i++) {
@@ -2770,6 +2774,9 @@ void c_close(Drive* env){
     free(env->export_log.traj_vy);
     free(env->export_log.traj_vz);
     free(env->export_log.heading);
+    free(env->export_log.actor_indices);
+    free(env->export_log.valid);
+    free(env->export_log.traffic_light_states);
     free(env->export_log.observations);
     free(env->export_log.reward_components);
     free(env->export_log.action_indices);
@@ -2866,8 +2873,16 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         if (agent->acceleration_gain != 0.0f) acceleration *= agent->acceleration_gain;
         if (agent->steering_gain != 0.0f) steering *= agent->steering_gain;
 
-        float max_steering_rate = agent->max_steering_rate;
-        if (max_steering_rate == 0.0f) max_steering_rate = 0.03f;
+        float max_steering_rate;
+        if (agent->low_steering_rate && agent->high_steering_rate) {
+            float steering_error = fabsf(steering - agent->steering_angle);
+            float slope = (agent->high_steering_rate - agent->low_steering_rate) / (agent->high_steering_rate_error - agent->low_steering_rate_error);
+            float intercept = agent->low_steering_rate - slope * agent->low_steering_rate_error;
+            max_steering_rate = fmaxf(agent->low_steering_rate, fminf(agent->high_steering_rate, steering_error * slope + intercept));
+        } else {
+            max_steering_rate = 0.033f;
+        }
+
         steering = agent->steering_angle + fmaxf(fminf(steering - agent->steering_angle, max_steering_rate), -max_steering_rate);
 
         // Current state
@@ -3126,36 +3141,38 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
     const float c = e->heading_x, s = e->heading_y;
     // Safety penalties, comfort, then lane-following preferences.
     obs[0] = e->collision_reward_coefficient;
-    obs[1] = e->offroad_reward_coefficient;
-    obs[2] = e->stop_line_reward_coefficient;
-    obs[3] = e->comfort_reward_coefficient;
-    obs[4] = e->lane_center_reward_coefficient;
-    obs[5] = e->lane_align_reward_coefficient;
-    obs[6] = e->lane_center_bias;
-    // Current speed, speed limit, and vehicle dimensions.
-    obs[7] = hypotf(e->vx, e->vy) / MAX_SPEED;
-    obs[8] = e->max_speed == 0.0f ? 1.0f : fminf(e->max_speed / MAX_SPEED, 1.0f);
-    obs[9] = e->width / MAX_VEH_WIDTH;
-    obs[10] = e->length / MAX_VEH_LEN;
+    obs[1] = e->safety_reward_coefficient;
+    obs[2] = e->offroad_reward_coefficient;
+    obs[3] = e->stop_line_reward_coefficient;
+    obs[4] = e->comfort_reward_coefficient;
+    obs[5] = e->lane_center_reward_coefficient;
+    obs[6] = e->lane_align_reward_coefficient;
+    obs[7] = e->lane_center_bias;
+    // Current speed, steering angle, speed limit, and vehicle dimensions.
+    obs[8] = hypotf(e->vx, e->vy) / MAX_SPEED;
+    obs[9] = e->steering_angle / 0.667f;
+    obs[10] = e->max_speed == 0.0f ? 1.0f : fminf(e->max_speed / MAX_SPEED, 1.0f);
+    obs[11] = e->width / MAX_VEH_WIDTH;
+    obs[12] = e->length / MAX_VEH_LEN;
     // Goal geometry and remaining-goal flags.
-    obs[11] = e->goal_radius / 3.0f;
+    obs[13] = e->goal_radius / 3.0f;
     float dx = e->goal_position_x - e->x, dy = e->goal_position_y - e->y;
-    obs[12] = (dx * c + dy * s) * 0.005f;
-    obs[13] = (-dx * s + dy * c) * 0.005f;
+    obs[14] = (dx * c + dy * s) * 0.005f;
+    obs[15] = (-dx * s + dy * c) * 0.005f;
     int next = e->multi_goal_idx + 1;
     if (next < e->multi_goal_count) {
         dx = e->multi_goal_position_x[next] - e->x;
         dy = e->multi_goal_position_y[next] - e->y;
     }
-    obs[14] = (dx * c + dy * s) * 0.005f;
-    obs[15] = (-dx * s + dy * c) * 0.005f;
+    obs[16] = (dx * c + dy * s) * 0.005f;
+    obs[17] = (-dx * s + dy * c) * 0.005f;
     int remaining = e->reached_final_goal ? 0 : e->multi_goal_count > 0
         ? e->multi_goal_count - e->multi_goal_idx : 1;
-    obs[16] = remaining >= 2;
-    obs[17] = remaining >= 1;
+    obs[18] = remaining >= 2;
+    obs[19] = remaining >= 1;
     // Current lane-relative pose.
-    obs[18] = e->lane_heading_angle_diff;
-    obs[19] = e->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f
+    obs[20] = e->lane_heading_angle_diff;
+    obs[21] = e->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f
         ? e->metrics_array[LANE_LATERAL_OFFSET_IDX] / 4.0f : 0.0f;
     // Ten past poses (XY and heading cos/sin), speeds and selected commands.
     for (int k = 0; k < 10; k++) {
@@ -3163,24 +3180,24 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
         const float* h = e->ego_history[index];
         dx = h[0] - e->x;
         dy = h[1] - e->y;
-        obs[20 + 2*k] = (dx * c + dy * s) * 0.02f;
-        obs[20 + 2*k + 1] = (-dx * s + dy * c) * 0.02f;
-        obs[40 + 2*k] = h[2] * c + h[3] * s;
-        obs[40 + 2*k + 1] = h[3] * c - h[2] * s;
-        obs[60 + k] = h[4] / MAX_SPEED;
-        obs[75 + 2*k] = h[5];
-        obs[75 + 2*k + 1] = h[6];
+        obs[22 + 2*k] = (dx * c + dy * s) * 0.02f;
+        obs[22 + 2*k + 1] = (-dx * s + dy * c) * 0.02f;
+        obs[42 + 2*k] = h[2] * c + h[3] * s;
+        obs[42 + 2*k + 1] = h[3] * c - h[2] * s;
+        obs[62 + k] = h[4] / MAX_SPEED;
+        obs[77 + 2*k] = h[5];
+        obs[77 + 2*k + 1] = h[6];
     }
     // Speeds 20, 30, 40, 50 and 60 steps ago, adjacent to recent speeds.
     for (int k = 0; k < 5; k++) {
         int lag = 20 + 10*k;
         int index = (e->ego_history_head + EGO_HISTORY_CAPACITY - lag) % EGO_HISTORY_CAPACITY;
-        obs[70 + k] = e->ego_history[index][4] / MAX_SPEED;
+        obs[72 + k] = e->ego_history[index][4] / MAX_SPEED;
     }
     if (dynamics_model == JERK) {
-        obs[95] = e->steering_angle / M_PI;
-        obs[95 + 1] = e->a_long < 0 ? e->a_long / (-JERK_LONG[0]) : e->a_long / JERK_LONG[3];
-        obs[95 + 2] = e->a_lat / JERK_LAT[2];
+        obs[97] = e->steering_angle / M_PI;
+        obs[97 + 1] = e->a_long < 0 ? e->a_long / (-JERK_LONG[0]) : e->a_long / JERK_LONG[3];
+        obs[97 + 2] = e->a_lat / JERK_LAT[2];
     }
 }
 
@@ -3481,12 +3498,18 @@ void c_reset(Drive* env){
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
 
     if (env->export_replay_enabled && env->export_log.traj_x == NULL) {
-        env->export_log.num_agents = env->active_agent_count < 64
+        int export_all_agents = getenv("EXPORT_ALL_AGENTS") && strcmp(getenv("EXPORT_ALL_AGENTS"), "1") == 0;
+        env->export_log.num_agents = (env->active_agent_count < 64 || export_all_agents)
             ? env->active_agent_count : 64;
-        env->export_log.capacity = env->scenario_length < MAX_EXPORT_STEPS - 2
+        env->export_log.num_actors = env->export_log.num_agents + env->static_car_count;
+        env->export_log.actor_indices = malloc((size_t)env->export_log.num_actors * sizeof(int));
+        for (int i = 0; i < env->export_log.num_actors; i++)
+            env->export_log.actor_indices[i] = i < env->export_log.num_agents
+                ? env->active_agent_indices[i] : env->static_car_indices[i - env->export_log.num_agents];
+        env->export_log.capacity = (env->scenario_length < MAX_EXPORT_STEPS - 2 || export_all_agents)
             ? env->scenario_length + 2 : MAX_EXPORT_STEPS;
         if (env->export_log.capacity < 1) env->export_log.capacity = 1;
-        size_t actor_steps = (size_t)env->export_log.num_agents * env->export_log.capacity;
+        size_t actor_steps = (size_t)env->export_log.num_actors * env->export_log.capacity;
         env->export_log.traj_x = calloc(actor_steps, sizeof(float));
         env->export_log.traj_y = calloc(actor_steps, sizeof(float));
         env->export_log.traj_z = calloc(actor_steps, sizeof(float));
@@ -3494,15 +3517,23 @@ void c_reset(Drive* env){
         env->export_log.traj_vy = calloc(actor_steps, sizeof(float));
         env->export_log.traj_vz = calloc(actor_steps, sizeof(float));
         env->export_log.heading = calloc(actor_steps, sizeof(float));
+        env->export_log.valid = calloc(actor_steps, sizeof(int));
+        env->export_log.traffic_light_states =
+            calloc((size_t)env->num_traffic_lights * env->export_log.capacity, sizeof(int));
 
+        size_t agent_steps = (size_t)env->export_log.num_agents * env->export_log.capacity;
         int ego_dim = drive_ego_features(env->dynamics_model);
         int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
-        env->export_log.observations = calloc(actor_steps * max_obs, sizeof(float));
+        env->export_log.observations = calloc(agent_steps * max_obs, sizeof(float));
         env->export_log.reward_components =
-            calloc(actor_steps * REPLAY_REWARD_COMPONENT_COUNT, sizeof(float));
+            calloc(agent_steps * REPLAY_REWARD_COMPONENT_COUNT, sizeof(float));
         env->export_log.action_indices =
-            malloc(actor_steps * REPLAY_ACTION_COMPONENT_COUNT * sizeof(int));
+            malloc(agent_steps * REPLAY_ACTION_COMPONENT_COUNT * sizeof(int));
     }
+    if (env->export_replay_enabled && env->export_log.valid)
+        memset(env->export_log.valid, 0, (size_t)env->export_log.num_actors * env->export_log.capacity * sizeof(int));
+    if (env->export_replay_enabled && env->export_log.traffic_light_states)
+        memset(env->export_log.traffic_light_states, 0, (size_t)env->num_traffic_lights * env->export_log.capacity * sizeof(int));
     if (env->export_replay_enabled && env->export_log.reward_components != NULL) {
         memset(
             env->export_log.reward_components,
@@ -3521,6 +3552,7 @@ void c_reset(Drive* env){
     env->timestep = env->init_steps;
     set_start_position(env);
     init_traffic_lights(env);
+    record_replay_trajectories(env);
     for(int x = 0;x<env->active_agent_count; x++){
         env->logs[x] = (Log){0};
         int agent_idx = env->active_agent_indices[x];
@@ -3618,8 +3650,6 @@ void c_step(Drive* env){
 
     if (env->timestep == env->scenario_length) {
         add_log(env);
-	    if (env->export_replay_enabled && env->export_log.traj_x)
-            saveReplayToFile(env);
         memset(env->truncations, 1, env->active_agent_count * sizeof(unsigned char));
     }
 
@@ -3818,6 +3848,8 @@ void c_step(Drive* env){
     record_replay_trajectories(env);
 
     compute_observations(env);
+    if (env->timestep == env->scenario_length && env->export_replay_enabled && env->export_log.traj_x)
+        saveReplayToFile(env);
 }
 
 const Color STONE_GRAY = (Color){80, 80, 80, 255};
@@ -3989,8 +4021,8 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
     float px = env->entities[active_idx].x;
     float py = env->entities[active_idx].y;
     // draw goal
-    float goal_x = agent_obs[12] * 200;
-    float goal_y = agent_obs[13] * 200;
+    float goal_x = agent_obs[14] * 200;
+    float goal_y = agent_obs[15] * 200;
     if(mode == 0 ){
         DrawSphere((Vector3){goal_x, goal_y, 1}, 0.5f, LIGHTGREEN);
         DrawCircle3D((Vector3){goal_x, goal_y, 0.1f}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f, Fade(LIGHTGREEN, 0.3f));

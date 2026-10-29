@@ -107,6 +107,7 @@ class Entity(Structure):
         ("comfort_reward_coefficient", c_float),
         ("lane_align_reward_coefficient", c_float),
         ("collision_reward_coefficient", c_float),
+        ("safety_reward_coefficient", c_float),
         ("offroad_reward_coefficient", c_float),
         ("stop_line_reward_coefficient", c_float),
         ("lane_center_bias", c_float),
@@ -121,15 +122,16 @@ class Entity(Structure):
         ("jerk_lat", c_float),
         ("steering_angle", c_float),
         ("wheelbase", c_float),
-        ("max_steering_rate", c_float),
+        ("low_steering_rate", c_float),
+        ("high_steering_rate", c_float),
+        ("low_steering_rate_error", c_float),
+        ("high_steering_rate_error", c_float),
         # Private actuator state; must match ACTION_QUEUE_CAPACITY in drive.h.
         ("action_delay_steps", c_int),
         ("action_queue_head", c_int),
         ("action_queue", (c_float * 2) * 4),
         ("ego_history_head", c_int),
-        ("ego_history", (c_float * 7) * HISTORY_CAPACITY),
-        ("last_ttc_penalty_timestep", c_int),
-        ("last_lateral_penalty_timestep", c_int),
+        ("ego_history", (c_float * 7) * HISTORY_CAPACITY)
     ]
 
 class StaticRoadEntity(Structure):
@@ -1350,16 +1352,20 @@ def generate_map():
         ent.comfort_reward_coefficient = random.uniform(0, 0.01)
         ent.lane_align_reward_coefficient = random.uniform(5e-5, 5e-3) if random.uniform(0, 1) < 0.5 else random.uniform(5e-3, 5e-2)
         ent.collision_reward_coefficient = random.uniform(0.25, 1.0)
+        ent.safety_reward_coefficient = random.uniform(0, 1.0)
         ent.offroad_reward_coefficient = random.uniform(0, 1.0)
         ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
-        ent.goal_radius = random.uniform(1, 3)
+        ent.goal_radius = random.uniform(0.5, 3)
         ent.object_detection_distance = random.uniform(14, 16) if random.uniform(0, 1) < 0.1 else random.uniform(30, 60)
         ent.friction_coefficient = random.uniform(0.7, 1.3)
         ent.acceleration_gain = random.uniform(0.9, 1.1)
         ent.steering_gain = random.uniform(0.9, 1.1)
         ent.wheelbase = random.uniform(0.55, 0.65) * ent.length
-        ent.max_steering_rate = 0.03 * random.uniform(0.8, 1.2)
+        ent.low_steering_rate = 0.018 * random.uniform(0.8, 1.2)
+        ent.high_steering_rate = 0.033 * random.uniform(0.8, 1.2)
+        ent.low_steering_rate_error = 0.01 * random.uniform(0.8, 1.2)
+        ent.high_steering_rate_error = 0.1 * random.uniform(0.8, 1.2)
         ent.mark_as_expert = 0
 
     for i in range(num_stationary_objects):

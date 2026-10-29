@@ -428,11 +428,11 @@ TORCH_MODULE(SceneEncoderBlock);
 struct SceneEncoderImpl : torch::nn::Module {
     SceneEncoderImpl(int64_t ego_dim_, int64_t hidden_dim_, int num_blocks)
         : ego_dim(ego_dim_), hidden_dim(hidden_dim_) {
-        for (int i = 7; i < 12; i++) ego_state_indices.push_back(i);
-        for (int i = 18; i < ego_dim; i++) ego_state_indices.push_back(i);
-        goal_indices = {12, 13, 16, 17};
-        next_goal_indices = {14, 15};
-        for (int i = 0; i < 7; i++) reward_pref_indices.push_back(i);
+        for (int i = 8; i < 14; i++) ego_state_indices.push_back(i);
+        for (int i = 20; i < ego_dim; i++) ego_state_indices.push_back(i);
+        goal_indices = {14, 15, 18, 19};
+        next_goal_indices = {16, 17, 18, 19};
+        for (int i = 0; i < 8; i++) reward_pref_indices.push_back(i);
 
         map_proj = register_module(
             "map_proj",

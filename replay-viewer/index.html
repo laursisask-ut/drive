@@ -78,6 +78,8 @@ function decode(buffer) {
     const dimensions = array(6), mark = int(); // Width, length, height, goal XYZ, expert / signal index.
     if (raw & 0x100) reserve(int() * 12); // Optional multi-goal XYZ arrays.
     const sequence = raw & 0x400 ? array(int(), Int32Array) : null;
+    if (sequence && (!sequence.length || sequence.some(state => state < 0 || state > 3)))
+      throw Error('Invalid traffic-light sequence.');
     const record = {type, n, x, y, heading, valid, width: dimensions[0], length: dimensions[1],
       mark, sequence, yieldWhenOff: !!(raw & 0x200)};
     if (moving) { actors.push(record); frames = Math.max(frames, n); }
