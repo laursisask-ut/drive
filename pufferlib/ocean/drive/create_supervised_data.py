@@ -138,6 +138,7 @@ def process_scenario(filepath):
     steering_angle = 0
 
     for t in range(steps):
+        steering_angles.append(steering_angle)
         speed = scenario["ego"]["speed"][t]
         next_speed = scenario["ego"]["speed"][t + 1]
         next_heading = normalize_heading(scenario["ego"]["heading"][t + 1])
@@ -163,7 +164,6 @@ def process_scenario(filepath):
             max_steer_rate = calculate_steering_rate(STEERING_VALUES[steering_action_idx], steering_angle) * 0.1
             steering_angle += max(min(STEERING_VALUES[steering_action_idx] - steering_angle, max_steer_rate), -max_steer_rate)
             prev_heading = normalize_heading(prev_heading + speed * 0.1 * math.tan(steering_angle) / wheelbase)
-        steering_angles.append(steering_angle)
 
     action_delay_steps = 2
     issued_actions = expert_actions[action_delay_steps:]

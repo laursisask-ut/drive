@@ -474,6 +474,10 @@ struct SceneEncoderImpl : torch::nn::Module {
         for (int i = 0; i < num_blocks; i++) {
             blocks->push_back(SceneEncoderBlock(hidden_dim));
         }
+        final_norm = register_module(
+            "final_norm",
+            torch::nn::LayerNorm(
+                torch::nn::LayerNormOptions({hidden_dim}).elementwise_affine(false)));
     }
 
     torch::Tensor forward(const torch::Tensor& observations) {
@@ -526,7 +530,7 @@ struct SceneEncoderImpl : torch::nn::Module {
         for (const auto& block : *blocks) {
             x = block->as<SceneEncoderBlock>()->forward(x);
         }
-        return x;
+        return final_norm->forward(x);
     }
 
     int64_t ego_dim;
@@ -543,6 +547,7 @@ struct SceneEncoderImpl : torch::nn::Module {
     torch::nn::Sequential reward_pref_proj{nullptr};
     torch::nn::Sequential reward_film{nullptr};
     torch::nn::ModuleList blocks{nullptr};
+    torch::nn::LayerNorm final_norm{nullptr};
 };
 
 TORCH_MODULE(SceneEncoder);
@@ -739,9 +744,9 @@ extern "C" TorchModel* torch_model_load(
             int64_t hidden_dim = dim0(state, "encoder.map_proj.0.weight");
             int64_t ego_state_dim = dim1(state, "encoder.ego_state_proj.0.weight");
             int64_t ego_dim = drive_ego_features(dynamics_model);
-            // Seven preferences, four goal features and two next-goal features
-            // have their existing tokens; everything else is in the ego token.
-            if (ego_state_dim != ego_dim - 13) {
+            // Eight preferences and six distinct goal features use other tokens;
+            // everything else is in the ego token.
+            if (ego_state_dim != ego_dim - 14) {
                 throw std::runtime_error("Wayformer checkpoint uses an incompatible observation layout; retrain for ego history");
             }
             int64_t action_size = dim0(state, "decoder.actor.weight");
