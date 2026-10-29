@@ -1852,42 +1852,6 @@ static float vehicle_clearance_squared(Entity* ego, Entity* other) {
     return distance;
 }
 
-static void apply_safety_penalties(Drive* env, int agent_slot, int agent_idx) {
-    Entity* ego = &env->entities[agent_idx];
-    float speed_squared = ego->vx * ego->vx + ego->vy * ego->vy;
-    if (ego->type != VEHICLE || ego->x == INVALID_POSITION || ego->respawn_timestep != -1 ||
-        ego->collision_state == VEHICLE_COLLISION || speed_squared <= SAFETY_MIN_SPEED * SAFETY_MIN_SPEED) return;
-
-    int ttc_violation = 0, lateral_violation = 0;
-    // Include pedestrians/cyclists even when they are excluded from policy
-    // selection, and do not restrict safety checks to visible observations.
-    for (int index = 0; index < env->num_objects; index++) {
-        if (index == agent_idx) continue;
-        Entity* other = &env->entities[index];
-        if (other->type < VEHICLE || other->type > CYCLIST || other->x == INVALID_POSITION ||
-            other->respawn_timestep != -1) continue;
-        float dx = fabsf(other->x - ego->x), dy = fabsf(other->y - ego->y);
-        // Conservative world-axis bounds avoid detailed geometry for distant
-        // actors without imposing an observation-distance or partner-count cap.
-        float extent = 0.5f * (ego->length + ego->width + other->length + other->width);
-        if (dx < extent + SAFETY_CLEARANCE && dy < extent + SAFETY_CLEARANCE &&
-            vehicle_clearance_squared(ego, other) < SAFETY_CLEARANCE * SAFETY_CLEARANCE) {
-            lateral_violation = 1;
-        }
-        if (other->type == VEHICLE &&
-            dx <= extent + SAFETY_TIME_SECONDS * fabsf(other->vx - ego->vx) &&
-            dy <= extent + SAFETY_TIME_SECONDS * fabsf(other->vy - ego->vy) &&
-            !vehicle_approaches_from_behind(ego, other) &&
-            vehicle_time_to_collision(ego, other) < SAFETY_TIME_SECONDS) {
-            ttc_violation = 1;
-        }
-    }
-    float reward = -(ttc_violation + lateral_violation) * SAFETY_COLLISION_FRACTION *
-        ego->safety_reward_coefficient * (1.0f + 0.1f * sqrtf(speed_squared));
-    env->rewards[agent_slot] += reward;
-    record_reward_component(env, agent_slot, REWARD_COMPONENT_SAFETY, reward);
-}
-
 int check_lane_aligned(Entity* car, const StaticRoadEntity* lane, int geometry_idx) {
     // Validate lane geometry length
     if (!lane || lane->array_size < 2) {
@@ -3050,9 +3014,17 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
 #define ACTOR_OBSERVATION_WORDS ((MAX_AGENTS + 63) / 64)
 
 typedef struct {
+    int count;  // -1 until this agent's visible partners have been selected.
+    int indices[MAX_VISIBLE_AGENTS - 1];
+} ActorObservationPartners;
+
+// Zero-initialize before the first build; release the cache after the last use.
+typedef struct {
     int heads[ACTOR_OBSERVATION_BUCKETS];
     int next[MAX_AGENTS];
     int usable;
+    ActorObservationPartners* partners;
+    int partner_capacity;
 } ActorObservationGrid;
 
 static inline float actor_detection_distance(const Entity* entity) {
@@ -3080,6 +3052,18 @@ static inline unsigned actor_observation_bucket(int x, int y) {
 
 static void build_actor_observation_grid(const Drive* env, ActorObservationGrid* grid) {
     grid->usable = 0;
+    if (grid->partner_capacity < env->active_agent_count) {
+        ActorObservationPartners* partners = realloc(grid->partners,
+            (size_t)env->active_agent_count * sizeof(ActorObservationPartners));
+        if (!partners) {
+            fprintf(stderr, "Failed to allocate actor observation cache\n");
+            abort();
+        }
+        grid->partners = partners;
+        grid->partner_capacity = env->active_agent_count;
+    }
+    // The grid and cached partners describe the same snapshot of actor state.
+    for (int i = 0; i < env->active_agent_count; i++) grid->partners[i].count = -1;
     // For small scenarios a direct scan costs less than constructing the grid.
     if (env->num_controllable_agents <= 128) return;
     assert(env->num_controllable_agents <= MAX_AGENTS);
@@ -3093,6 +3077,13 @@ static void build_actor_observation_grid(const Drive* env, ActorObservationGrid*
         grid->heads[bucket] = rank;
     }
     grid->usable = 1;
+}
+
+static void free_actor_observation_grid(ActorObservationGrid* grid) {
+    free(grid->partners);
+    grid->partners = NULL;
+    grid->partner_capacity = 0;
+    grid->usable = 0;
 }
 
 static int nearby_observation_actors(const Drive* env, const ActorObservationGrid* grid,
@@ -3134,6 +3125,67 @@ static int nearby_observation_actors(const Drive* env, const ActorObservationGri
         }
     }
     return count;
+}
+
+// Cache the final observation selection, so either consumer can run first.
+// Rebuild the grid after changing actor positions, lists, respawns or radii.
+static const ActorObservationPartners* visible_observation_actors(
+        const Drive* env, ActorObservationGrid* grid, int agent_slot) {
+    ActorObservationPartners* partners = &grid->partners[agent_slot];
+    if (partners->count >= 0) return partners;
+    partners->count = 0;
+    int agent_idx = env->active_agent_indices[agent_slot];
+    const Entity* ego = &env->entities[agent_idx];
+    float radius = actor_detection_distance(ego);
+    float max_distance = radius * radius;
+    int nearby_actors[MAX_AGENTS];
+    int nearby_count = nearby_observation_actors(env, grid, ego, nearby_actors);
+    for (int j = 0; j < nearby_count && partners->count < MAX_VISIBLE_AGENTS - 1; j++) {
+        int index = nearby_actors[j];
+        const Entity* other = &env->entities[index];
+        if (other->type > 3) break;
+        if (index == agent_idx || other->respawn_timestep != -1) continue;
+        float dx = other->x - ego->x, dy = other->y - ego->y;
+        if (dx * dx + dy * dy > max_distance) continue;
+        partners->indices[partners->count++] = index;
+    }
+    return partners;
+}
+
+static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid) {
+    for (int agent_slot = 0; agent_slot < env->active_agent_count; agent_slot++) {
+        int agent_idx = env->active_agent_indices[agent_slot];
+        Entity* ego = &env->entities[agent_idx];
+        if (ego->type > 3) break;
+        float speed_squared = ego->vx * ego->vx + ego->vy * ego->vy;
+        if (ego->type != VEHICLE || ego->x == INVALID_POSITION || ego->respawn_timestep != -1 ||
+            ego->collision_state == VEHICLE_COLLISION || speed_squared <= SAFETY_MIN_SPEED * SAFETY_MIN_SPEED) continue;
+
+        const ActorObservationPartners* partners = visible_observation_actors(env, actor_grid, agent_slot);
+        int ttc_violation = 0, lateral_violation = 0;
+        for (int j = 0; j < partners->count; j++) {
+            Entity* other = &env->entities[partners->indices[j]];
+            if (other->type < VEHICLE || other->x == INVALID_POSITION) continue;
+            float dx = fabsf(other->x - ego->x), dy = fabsf(other->y - ego->y);
+            // Conservative world-axis bounds avoid unnecessary detailed geometry.
+            float extent = 0.5f * (ego->length + ego->width + other->length + other->width);
+            if (dx < extent + SAFETY_CLEARANCE && dy < extent + SAFETY_CLEARANCE &&
+                vehicle_clearance_squared(ego, other) < SAFETY_CLEARANCE * SAFETY_CLEARANCE) {
+                lateral_violation = 1;
+            }
+            if (other->type == VEHICLE &&
+                dx <= extent + SAFETY_TIME_SECONDS * fabsf(other->vx - ego->vx) &&
+                dy <= extent + SAFETY_TIME_SECONDS * fabsf(other->vy - ego->vy) &&
+                !vehicle_approaches_from_behind(ego, other) &&
+                vehicle_time_to_collision(ego, other) < SAFETY_TIME_SECONDS) {
+                ttc_violation = 1;
+            }
+        }
+        float reward = -(ttc_violation + lateral_violation) * SAFETY_COLLISION_FRACTION *
+            ego->safety_reward_coefficient * (1.0f + 0.1f * sqrtf(speed_squared));
+        env->rewards[agent_slot] += reward;
+        record_reward_component(env, agent_slot, REWARD_COMPONENT_SAFETY, reward);
+    }
 }
 
 // Pure observation conversion: repeated calls never advance history.
@@ -3201,10 +3253,7 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
     }
 }
 
-void compute_observations(Drive* env) {
-    ActorObservationGrid actor_grid;
-    build_actor_observation_grid(env, &actor_grid);
-    int nearby_actors[MAX_AGENTS];
+void compute_observations(Drive* env, ActorObservationGrid* actor_grid) {
     int ego_dim = drive_ego_features(env->dynamics_model);
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs*env->active_agent_count*sizeof(float));
@@ -3218,25 +3267,15 @@ void compute_observations(Drive* env) {
         float sin_heading = ego_entity->heading_y;
         write_ego_observation(ego_entity, env->dynamics_model, obs);
 
-        float radius = actor_detection_distance(ego_entity);
-        float max_distance = radius * radius;
-
         // Relative Pos of other cars
         int obs_idx = ego_dim;
         int cars_seen = 0;
-        int nearby_count = nearby_observation_actors(env, &actor_grid, ego_entity, nearby_actors);
-        for(int j = 0; j < nearby_count && cars_seen < MAX_VISIBLE_AGENTS - 1; j++) {
-            int index = nearby_actors[j];
-            if(env->entities[index].type > 3) break;
-            if(index == env->active_agent_indices[i]) continue;  // Skip self, but don't increment obs_idx
-            Entity* other_entity = &env->entities[index];
-            if(ego_entity->respawn_timestep != -1) continue;
-            if(other_entity->respawn_timestep != -1) continue;
+        const ActorObservationPartners* partners = visible_observation_actors(env, actor_grid, i);
+        for(int j = 0; j < partners->count; j++) {
+            Entity* other_entity = &env->entities[partners->indices[j]];
             // Store original relative positions
             float dx = other_entity->x - ego_entity->x;
             float dy = other_entity->y - ego_entity->y;
-            float dist = (dx*dx + dy*dy);
-            if(dist > max_distance) continue;
             // Rotate to ego vehicle's frame
             float rel_x = dx*cos_heading + dy*sin_heading;
             float rel_y = -dx*sin_heading + dy*cos_heading;
@@ -3589,7 +3628,11 @@ void c_reset(Drive* env){
 
         compute_agent_metrics(env, agent_idx);
     }
-    compute_observations(env);
+
+    ActorObservationGrid actor_grid = {0};
+    build_actor_observation_grid(env, &actor_grid);
+    compute_observations(env, &actor_grid);
+    free_actor_observation_grid(&actor_grid);
 }
 
 void respawn_agent(Drive* env, int agent_idx){
@@ -3744,8 +3787,6 @@ void c_step(Drive* env){
             }
         }
 
-        apply_safety_penalties(env, i, agent_idx);
-
         int lane_aligned = e->metrics_array[LANE_ALIGNED_IDX];
         float lateral_offset = e->metrics_array[LANE_LATERAL_OFFSET_IDX];
         float lane_heading_angle_diff = e->lane_heading_angle_diff;
@@ -3847,7 +3888,12 @@ void c_step(Drive* env){
     if (env->num_exit_orders > 0 && env->timestep < env->scenario_length) update_exit_orders(env);
     record_replay_trajectories(env);
 
-    compute_observations(env);
+    ActorObservationGrid actor_grid = {0};
+    build_actor_observation_grid(env, &actor_grid);
+    apply_safety_penalties(env, &actor_grid);
+    compute_observations(env, &actor_grid);
+    free_actor_observation_grid(&actor_grid);
+
     if (env->timestep == env->scenario_length && env->export_replay_enabled && env->export_log.traj_x)
         saveReplayToFile(env);
 }
