@@ -610,6 +610,10 @@ struct TrajectoryDecoderImpl : torch::nn::Module {
         for (int i = 0; i < num_blocks; i++) {
             blocks->push_back(TrajectoryDecoderBlock(hidden_dim));
         }
+        final_norm = register_module(
+            "final_norm",
+            torch::nn::LayerNorm(
+                torch::nn::LayerNormOptions({hidden_dim}).elementwise_affine(false)));
         actor = register_module(
             "actor",
             torch::nn::Linear(hidden_dim, action_dims[0] + action_dims[1]));
@@ -627,6 +631,7 @@ struct TrajectoryDecoderImpl : torch::nn::Module {
             x = block->as<TrajectoryDecoderBlock>()->forward(x, encoder_outputs);
         }
 
+        x = final_norm->forward(x);
         torch::Tensor flat = x.reshape({-1, hidden_dim});
         torch::Tensor action = actor->forward(flat);
         ModelOutput output;
@@ -645,6 +650,7 @@ struct TrajectoryDecoderImpl : torch::nn::Module {
     int64_t hidden_dim;
     torch::Tensor seed;
     torch::nn::ModuleList blocks{nullptr};
+    torch::nn::LayerNorm final_norm{nullptr};
     torch::nn::Linear actor{nullptr};
     torch::nn::Linear value_fn{nullptr};
     torch::nn::Linear waypoints{nullptr};

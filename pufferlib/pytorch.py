@@ -187,6 +187,16 @@ def entropy_probs(logits, probs):
     return -p_log_p.sum(-1)
 
 
+@torch.no_grad()
+def sample_priority_indices(weights, num_samples):
+    """Sample distinct replay indices from finite, nonnegative, nonzero weights."""
+    # Same exponential-race algorithm as multinomial(replacement=False), without
+    # its 2**24 category limit. Reuse the noise buffer for the ranking scores.
+    scores = torch.empty_like(weights).exponential_(1)
+    torch.div(weights, scores, out=scores)
+    return scores.topk(num_samples, dim=-1).indices
+
+
 def sample_logits(logits, action=None):
     is_discrete = isinstance(logits, torch.Tensor)
     if isinstance(logits, torch.distributions.Normal):

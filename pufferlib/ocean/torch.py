@@ -231,6 +231,7 @@ class TrajectoryDecoder(torch.nn.Module):
         self.hidden_dim = hidden_dim
         self.seed = torch.nn.Parameter(torch.randn((1, 1, hidden_dim)) * 0.02)
         self.blocks = torch.nn.ModuleList([TrajectoryDecoderBlock(hidden_dim=hidden_dim) for _ in range(num_blocks)])
+        self.final_norm = torch.nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.actor = pufferlib.pytorch.layer_init(torch.nn.Linear(hidden_dim, sum(action_dim)), std=0.01)
         self.value_fn = pufferlib.pytorch.layer_init(torch.nn.Linear(hidden_dim, 1), std=1)
     
@@ -239,6 +240,7 @@ class TrajectoryDecoder(torch.nn.Module):
         for block in self.blocks:
             x = block(x, encoder_outputs)
 
+        x = self.final_norm(x)
         actions, value = self.decode_actions(x.reshape(-1, self.hidden_dim))
         return actions, value
 

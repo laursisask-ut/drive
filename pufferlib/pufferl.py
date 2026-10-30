@@ -571,7 +571,7 @@ class PuffeRL:
                 adv = advantages.abs().sum(axis=1)
                 prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
                 prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
-                idx = torch.multinomial(prio_probs, self.minibatch_segments)
+                idx = pufferlib.pytorch.sample_priority_indices(prio_probs, self.minibatch_segments)
                 mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
                 mb_obs = self.observations[idx]
                 mb_actions = self.actions[idx]
@@ -586,7 +586,7 @@ class PuffeRL:
                 adv = advantages.abs().reshape(-1)
                 prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
                 prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
-                idx = torch.multinomial(prio_probs, self.minibatch_size)
+                idx = pufferlib.pytorch.sample_priority_indices(prio_probs, self.minibatch_size)
                 mb_prio = (flat_count * prio_probs[idx]) ** -anneal_beta
                 mb_obs = self.observations.reshape(flat_count, *self.observations.shape[2:])[idx]
                 mb_actions = self.actions.reshape(flat_count, *self.actions.shape[2:])[idx]
