@@ -81,6 +81,9 @@
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 200
 #define MAX_AGENTS 16384  // 5120 policy vehicles + 2048 parked + 8192 pedestrians + 1024 obstacles.
 #define MAX_VISIBLE_AGENTS 64
+#define MAX_HIDDEN_VEHICLES 3
+#define HIDDEN_VEHICLE_STEPS 30  // Three seconds at the 10 Hz simulation rate.
+#define HIDDEN_VEHICLE_REVEAL_DISTANCE 2.0f
 // Observation Space Constants
 #define MAX_SPEED 27.7f
 #define MAX_VEH_LEN 30.0f
@@ -193,6 +196,11 @@ struct Log {
     float traffic_light_violations;
 };
 
+typedef struct {
+    int entity_idx;
+    int until_timestep; // Exclusive; zero marks an unused slot.
+} HiddenVehicle;
+
 typedef struct Entity Entity;
 struct Entity {
     int type;
@@ -258,6 +266,7 @@ struct Entity {
     float stop_line_reward_coefficient;
     float lane_center_bias;
     float object_detection_distance; // Actor visibility radius in meters; zero defaults to 50 m.
+    float hide_other_vehicles_fraction; // Zero disables intermittent actor hiding.
     float friction_coefficient;
     float steering_gain;
     float acceleration_gain;
@@ -283,6 +292,9 @@ struct Entity {
     // Ring of pre-action states and normalized commands selected by the policy.
     int ego_history_head;
     float ego_history[EGO_HISTORY_CAPACITY][7];
+
+    HiddenVehicle hidden_vehicles[MAX_HIDDEN_VEHICLES];
+    int hidden_vehicles_update_step; // Last sampled timestep + 1; zero means never.
 };
 
 typedef struct StaticRoadEntity StaticRoadEntity;
@@ -1252,6 +1264,11 @@ static void reset_ego_history(Entity* agent) {
     agent->ego_history_head = 0;
 }
 
+static void reset_hidden_vehicles(Entity* agent) {
+    memset(agent->hidden_vehicles, 0, sizeof(agent->hidden_vehicles));
+    agent->hidden_vehicles_update_step = 0;
+}
+
 void set_start_position(Drive* env){
     //InitWindow(800, 600, "GPU Drive");
     //BeginDrawing();
@@ -1264,6 +1281,7 @@ void set_start_position(Drive* env){
             }
         }
         Entity* e = &env->entities[i];
+        reset_hidden_vehicles(e);
 
         // Clamp init_steps to ensure we don't go out of bounds
         int step = env->init_steps;
@@ -3127,7 +3145,8 @@ static int nearby_observation_actors(const Drive* env, const ActorObservationGri
     return count;
 }
 
-// Cache the final observation selection, so either consumer can run first.
+// Cache observable candidates before intermittent hiding in compute_observations,
+// so either the observation or safety consumer can run first.
 // Rebuild the grid after changing actor positions, lists, respawns or radii.
 static const ActorObservationPartners* visible_observation_actors(
         const Drive* env, ActorObservationGrid* grid, int agent_slot) {
@@ -3253,6 +3272,50 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
     }
 }
 
+// Expiry follows simulation time even when an actor leaves the observation list.
+// Observation refreshes within the same timestep must not resample hiding.
+static int update_hidden_vehicles(Drive* env, Entity* ego) {
+    if (!(ego->hide_other_vehicles_fraction > 0.0f) || ego->respawn_timestep != -1) {
+        reset_hidden_vehicles(ego);
+        return 0;
+    }
+    for (int i = 0; i < MAX_HIDDEN_VEHICLES; i++) {
+        HiddenVehicle* hidden = &ego->hidden_vehicles[i];
+        if (hidden->until_timestep == 0) continue;
+        Entity* other = &env->entities[hidden->entity_idx];
+        if (hidden->until_timestep <= env->timestep || other->respawn_timestep != -1 ||
+            vehicle_clearance_squared(ego, other) <
+                HIDDEN_VEHICLE_REVEAL_DISTANCE * HIDDEN_VEHICLE_REVEAL_DISTANCE) {
+            hidden->until_timestep = 0;
+        }
+    }
+    int sample_hiding = ego->hidden_vehicles_update_step != env->timestep + 1;
+    ego->hidden_vehicles_update_step = env->timestep + 1;
+    return sample_hiding;
+}
+
+static int hide_observation_actor(Drive* env, Entity* ego, int other_idx, int sample_hiding) {
+    int free_slot = -1;
+    for (int i = 0; i < MAX_HIDDEN_VEHICLES; i++) {
+        const HiddenVehicle* hidden = &ego->hidden_vehicles[i];
+        if (hidden->until_timestep == 0) {
+            if (free_slot == -1) free_slot = i;
+        } else if (hidden->entity_idx == other_idx) {
+            return 1;
+        }
+    }
+    if (!sample_hiding || free_slot == -1) return 0;
+    // Each sampled miss persists for 30 steps, so scale its probability.
+    double probability = ego->hide_other_vehicles_fraction / HIDDEN_VEHICLE_STEPS;
+    if (rand() / ((double)RAND_MAX + 1.0) >= probability) return 0;
+    Entity* other = &env->entities[other_idx];
+    if (vehicle_clearance_squared(ego, other) <
+        HIDDEN_VEHICLE_REVEAL_DISTANCE * HIDDEN_VEHICLE_REVEAL_DISTANCE) return 0;
+    ego->hidden_vehicles[free_slot].entity_idx = other_idx;
+    ego->hidden_vehicles[free_slot].until_timestep = env->timestep + HIDDEN_VEHICLE_STEPS;
+    return 1;
+}
+
 void compute_observations(Drive* env, ActorObservationGrid* actor_grid) {
     int ego_dim = drive_ego_features(env->dynamics_model);
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
@@ -3270,8 +3333,11 @@ void compute_observations(Drive* env, ActorObservationGrid* actor_grid) {
         // Relative Pos of other cars
         int obs_idx = ego_dim;
         int cars_seen = 0;
+        int sample_hiding = update_hidden_vehicles(env, ego_entity);
         const ActorObservationPartners* partners = visible_observation_actors(env, actor_grid, i);
         for(int j = 0; j < partners->count; j++) {
+            if (ego_entity->hide_other_vehicles_fraction > 0.0f &&
+                hide_observation_actor(env, ego_entity, partners->indices[j], sample_hiding)) continue;
             Entity* other_entity = &env->entities[partners->indices[j]];
             // Store original relative positions
             float dx = other_entity->x - ego_entity->x;
@@ -3661,6 +3727,7 @@ void respawn_agent(Drive* env, int agent_idx){
     env->entities[agent_idx].multi_goal_idx = 0;
     clear_action_queue(env, &env->entities[agent_idx]);
     reset_ego_history(&env->entities[agent_idx]);
+    reset_hidden_vehicles(&env->entities[agent_idx]);
 }
 
 float compute_distance_to_goal(Entity* e) {

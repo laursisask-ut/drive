@@ -46,7 +46,11 @@ libc.calloc.restype = c_void_p
 libc.malloc.argtypes = (c_size_t,)
 libc.malloc.restype = c_void_p
 
-# MUST have same definition as the Entity struct in drive.h!
+# MUST match the corresponding structs in drive.h!
+class HiddenVehicle(Structure):
+    _fields_ = [("entity_idx", c_int), ("until_timestep", c_int)]
+
+
 class Entity(Structure):
     _fields_ = [
         ("type", c_int),
@@ -112,6 +116,7 @@ class Entity(Structure):
         ("stop_line_reward_coefficient", c_float),
         ("lane_center_bias", c_float),
         ("object_detection_distance", c_float),
+        ("hide_other_vehicles_fraction", c_float),
         ("friction_coefficient", c_float),
         ("steering_gain", c_float),
         ("acceleration_gain", c_float),
@@ -131,7 +136,9 @@ class Entity(Structure):
         ("action_queue_head", c_int),
         ("action_queue", (c_float * 2) * 4),
         ("ego_history_head", c_int),
-        ("ego_history", (c_float * 7) * HISTORY_CAPACITY)
+        ("ego_history", (c_float * 7) * HISTORY_CAPACITY),
+        ("hidden_vehicles", HiddenVehicle * 3),
+        ("hidden_vehicles_update_step", c_int),
     ]
 
 class StaticRoadEntity(Structure):
@@ -1357,7 +1364,8 @@ def generate_map():
         ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(0.5, 3)
-        ent.object_detection_distance = random.uniform(14, 16) if random.uniform(0, 1) < 0.1 else random.uniform(30, 60)
+        ent.object_detection_distance = random.uniform(30, 60)
+        ent.hide_other_vehicles_fraction = random.uniform(0.08, 0.12)
         ent.friction_coefficient = random.uniform(0.7, 1.3)
         ent.acceleration_gain = random.uniform(0.9, 1.1)
         ent.steering_gain = random.uniform(0.9, 1.1)
