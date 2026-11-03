@@ -3145,8 +3145,7 @@ static int nearby_observation_actors(const Drive* env, const ActorObservationGri
     return count;
 }
 
-// Cache observable candidates before intermittent hiding in compute_observations,
-// so either the observation or safety consumer can run first.
+// Cache observable candidates before intermittent hiding in compute_observations.
 // Rebuild the grid after changing actor positions, lists, respawns or radii.
 static const ActorObservationPartners* visible_observation_actors(
         const Drive* env, ActorObservationGrid* grid, int agent_slot) {
@@ -3171,6 +3170,8 @@ static const ActorObservationPartners* visible_observation_actors(
     return partners;
 }
 
+// Run after compute_observations so newly hidden and revealed actors take effect
+// in the same timestep's rewards.
 static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid) {
     for (int agent_slot = 0; agent_slot < env->active_agent_count; agent_slot++) {
         int agent_idx = env->active_agent_indices[agent_slot];
@@ -3183,7 +3184,17 @@ static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid)
         const ActorObservationPartners* partners = visible_observation_actors(env, actor_grid, agent_slot);
         int ttc_violation = 0, lateral_violation = 0;
         for (int j = 0; j < partners->count; j++) {
-            Entity* other = &env->entities[partners->indices[j]];
+            int other_idx = partners->indices[j];
+            int hidden = 0;
+            for (int k = 0; k < MAX_HIDDEN_VEHICLES; k++) {
+                const HiddenVehicle* slot = &ego->hidden_vehicles[k];
+                if (slot->entity_idx == other_idx && slot->until_timestep > env->timestep) {
+                    hidden = 1;
+                    break;
+                }
+            }
+            if (hidden) continue;
+            Entity* other = &env->entities[other_idx];
             if (other->type < VEHICLE || other->x == INVALID_POSITION) continue;
             float dx = fabsf(other->x - ego->x), dy = fabsf(other->y - ego->y);
             // Conservative world-axis bounds avoid unnecessary detailed geometry.
@@ -3957,8 +3968,8 @@ void c_step(Drive* env){
 
     ActorObservationGrid actor_grid = {0};
     build_actor_observation_grid(env, &actor_grid);
-    apply_safety_penalties(env, &actor_grid);
     compute_observations(env, &actor_grid);
+    apply_safety_penalties(env, &actor_grid);
     free_actor_observation_grid(&actor_grid);
 
     if (env->timestep == env->scenario_length && env->export_replay_enabled && env->export_log.traj_x)
