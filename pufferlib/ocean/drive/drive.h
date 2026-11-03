@@ -84,6 +84,9 @@
 #define MAX_HIDDEN_VEHICLES 3
 #define HIDDEN_VEHICLE_STEPS 30  // Three seconds at the 10 Hz simulation rate.
 #define HIDDEN_VEHICLE_REVEAL_DISTANCE 2.0f
+#define HIDDEN_VEHICLE_MIN_SPEED 2.0f
+#define HIDDEN_VEHICLE_FRONT_DISTANCE 12.0f
+#define HIDDEN_VEHICLE_FRONT_COS 0.95
 // Observation Space Constants
 #define MAX_SPEED 27.7f
 #define MAX_VEH_LEN 30.0f
@@ -3283,6 +3286,26 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
     }
 }
 
+static int observation_actor_requires_visibility(Entity* ego, Entity* other) {
+    float speed_squared = other->vx * other->vx + other->vy * other->vy;
+    if (speed_squared < HIDDEN_VEHICLE_MIN_SPEED * HIDDEN_VEHICLE_MIN_SPEED) return 1;
+
+    float dx = other->x - ego->x;
+    float dy = other->y - ego->y;
+    float length = hypotf(dx, dy) + 1e-6;
+    dx /= length;
+    dy /= length;
+
+    float clearance_squared = vehicle_clearance_squared(ego, other);
+    if (clearance_squared < HIDDEN_VEHICLE_FRONT_DISTANCE * HIDDEN_VEHICLE_FRONT_DISTANCE) {
+        float heading_dot = ego->heading_x * other->heading_x + ego->heading_y * other->heading_y;
+        float forward_dot = dx * ego->heading_x + dy * ego->heading_y;
+        if (heading_dot >= HIDDEN_VEHICLE_FRONT_COS && forward_dot >= HIDDEN_VEHICLE_FRONT_COS) return 1;
+    }
+
+    return clearance_squared < HIDDEN_VEHICLE_REVEAL_DISTANCE * HIDDEN_VEHICLE_REVEAL_DISTANCE;
+}
+
 // Expiry follows simulation time even when an actor leaves the observation list.
 // Observation refreshes within the same timestep must not resample hiding.
 static int update_hidden_vehicles(Drive* env, Entity* ego) {
@@ -3295,8 +3318,7 @@ static int update_hidden_vehicles(Drive* env, Entity* ego) {
         if (hidden->until_timestep == 0) continue;
         Entity* other = &env->entities[hidden->entity_idx];
         if (hidden->until_timestep <= env->timestep || other->respawn_timestep != -1 ||
-            vehicle_clearance_squared(ego, other) <
-                HIDDEN_VEHICLE_REVEAL_DISTANCE * HIDDEN_VEHICLE_REVEAL_DISTANCE) {
+            observation_actor_requires_visibility(ego, other)) {
             hidden->until_timestep = 0;
         }
     }
@@ -3320,8 +3342,7 @@ static int hide_observation_actor(Drive* env, Entity* ego, int other_idx, int sa
     double probability = ego->hide_other_vehicles_fraction / HIDDEN_VEHICLE_STEPS;
     if (rand() / ((double)RAND_MAX + 1.0) >= probability) return 0;
     Entity* other = &env->entities[other_idx];
-    if (vehicle_clearance_squared(ego, other) <
-        HIDDEN_VEHICLE_REVEAL_DISTANCE * HIDDEN_VEHICLE_REVEAL_DISTANCE) return 0;
+    if (observation_actor_requires_visibility(ego, other)) return 0;
     ego->hidden_vehicles[free_slot].entity_idx = other_idx;
     ego->hidden_vehicles[free_slot].until_timestep = env->timestep + HIDDEN_VEHICLE_STEPS;
     return 1;
