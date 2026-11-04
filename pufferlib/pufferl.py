@@ -1761,6 +1761,9 @@ def load_env(env_name, args):
 
 
 def load_anchor_policy(args, vecenv):
+    if "policy_name" not in args["behavioral_anchor"]:
+        return
+
     package = args["package"]
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
