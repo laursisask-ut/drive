@@ -105,6 +105,30 @@ class Drive(nn.Module):
 
         return action, value
 
+def _wayformer_attention(attn, query, key_value=None, *, key_bias=None, use_fast=False):
+    """Apply MHA weights in batch-first layout, without MHA's sequence transposes."""
+    batch, length, width = query.shape
+    heads = attn.num_heads
+    head_dim = width // heads
+    if key_value is None:
+        qkv = F.linear(query, attn.in_proj_weight, attn.in_proj_bias)
+        q, k, v = qkv.reshape(batch, length, 3, heads, head_dim).permute(2, 0, 3, 1, 4).unbind(0)
+    else:
+        q = F.linear(query, attn.in_proj_weight[:width], attn.in_proj_bias[:width])
+        kv = F.linear(key_value, attn.in_proj_weight[width:], attn.in_proj_bias[width:])
+        q = q.reshape(batch, length, heads, head_dim).transpose(1, 2)
+        k, v = kv.reshape(batch, key_value.size(1), 2, heads, head_dim).permute(2, 0, 3, 1, 4).unbind(0)
+    if use_fast:
+        from pufferlib.ocean.drive.wayformer_attention import attention
+        output = attention(q, k, v, key_bias)
+    else:
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=key_bias, dropout_p=attn.dropout if attn.training else 0.0,
+        )
+    output = output.transpose(1, 2).reshape(batch, length, width)
+    return F.linear(output, attn.out_proj.weight, attn.out_proj.bias)
+
+
 class SceneEncoderBlock(torch.nn.Module):
     def __init__(self, hidden_dim=256):
         super().__init__()
@@ -119,7 +143,7 @@ class SceneEncoderBlock(torch.nn.Module):
     
     def forward(self, x):
         norm_x = self.layer_norm1(x)
-        attn_out, _ = self.attn(norm_x, norm_x, norm_x, need_weights=False)
+        attn_out = _wayformer_attention(self.attn, norm_x)
         x = x + attn_out
 
         mlp_out = self.mlp(self.layer_norm2(x))
@@ -218,7 +242,7 @@ class TrajectoryDecoderBlock(torch.nn.Module):
     
     def forward(self, x, encoder_outputs):
         norm_x = self.layer_norm1(x)
-        attn_out, _ = self.attn(norm_x, encoder_outputs, encoder_outputs, need_weights=False)
+        attn_out = _wayformer_attention(self.attn, norm_x, encoder_outputs)
         x = x + attn_out
 
         mlp_out = self.mlp(self.layer_norm2(x))
@@ -251,8 +275,11 @@ class TrajectoryDecoder(torch.nn.Module):
         return action, value
 
 class Wayformer(torch.nn.Module):
-    def __init__(self, env=None, ego_dim=None, action_dim=None, **kwargs):
+    _attention = staticmethod(_wayformer_attention)
+
+    def __init__(self, env=None, ego_dim=None, action_dim=None, compress_padding=True, **kwargs):
         super().__init__()
+        self.compress_padding = compress_padding
         hidden_dim = 128
         if ego_dim is None:
             ego_dim = drive_obs.ego_features(env.dynamics_model if env is not None else "classic")
@@ -262,6 +289,13 @@ class Wayformer(torch.nn.Module):
         self.decoder = TrajectoryDecoder(action_dim=action_dim, hidden_dim=hidden_dim, num_blocks=1)
 
     def forward(self, x, state=None):
+        if (self.compress_padding and torch.compiler.is_compiling()
+                and x.is_cuda and x.size(0) >= 256 and not x.requires_grad):
+            from pufferlib.ocean.drive.wayformer import compact_forward
+            return compact_forward(self, x)
+        return self._forward_dense(x)
+
+    def _forward_dense(self, x):
         x = self.encoder(x)
         x = self.decoder(x)
         return x
