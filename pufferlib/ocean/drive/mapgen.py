@@ -139,6 +139,7 @@ class Entity(Structure):
         ("ego_history", (c_float * 7) * HISTORY_CAPACITY),
         ("hidden_vehicles", HiddenVehicle * 3),
         ("hidden_vehicles_update_step", c_int),
+        ("stop_line_timestep", c_int)
     ]
 
 class StaticRoadEntity(Structure):

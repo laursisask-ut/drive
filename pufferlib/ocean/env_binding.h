@@ -116,8 +116,8 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_ValueError, "Rewards must be contiguous");
         return NULL;
     }
-    if (PyArray_NDIM(rewards) != 1) {
-        PyErr_SetString(PyExc_ValueError, "Rewards must be 1D");
+    if (PyArray_NDIM(rewards) != 2) {
+        PyErr_SetString(PyExc_ValueError, "Rewards must be 2D");
         return NULL;
     }
     env->rewards = PyArray_DATA(rewards);
@@ -382,7 +382,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         return NULL;
     }
     if (PyArray_NDIM(rewards) != 1) {
-        PyErr_SetString(PyExc_ValueError, "Rewards must be 1D");
+        PyErr_SetString(PyExc_ValueError, "Rewards must be 2D");
         return NULL;
     }
 

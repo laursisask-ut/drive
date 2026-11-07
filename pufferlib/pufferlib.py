@@ -20,7 +20,7 @@ def set_buffers(env, buf=None):
     if buf is None:
         obs_space = env.single_observation_space
         env.observations = np.zeros((env.num_agents, *obs_space.shape), dtype=obs_space.dtype)
-        env.rewards = np.zeros(env.num_agents, dtype=np.float32)
+        env.rewards = np.zeros((env.num_agents, 32), dtype=np.float32)
         env.terminals = np.zeros(env.num_agents, dtype=bool)
         env.truncations = np.zeros(env.num_agents, dtype=bool)
         env.masks = np.ones(env.num_agents, dtype=bool)

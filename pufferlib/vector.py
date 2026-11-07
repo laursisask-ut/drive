@@ -202,7 +202,7 @@ def _worker_process(
     atn_arr = np.ndarray((*shape, *atn_shape), dtype=atn_dtype, buffer=shm["actions"])[worker_idx]
     buf = dict(
         observations=np.ndarray((*shape, *obs_shape), dtype=obs_dtype, buffer=shm["observations"])[worker_idx],
-        rewards=np.ndarray(shape, dtype=np.float32, buffer=shm["rewards"])[worker_idx],
+        rewards=np.ndarray((*shape, 32), dtype=np.float32, buffer=shm["rewards"])[worker_idx],
         terminals=np.ndarray(shape, dtype=bool, buffer=shm["terminals"])[worker_idx],
         truncations=np.ndarray(shape, dtype=bool, buffer=shm["truncateds"])[worker_idx],
         masks=np.ndarray(shape, dtype=bool, buffer=shm["masks"])[worker_idx],
@@ -341,7 +341,7 @@ class Multiprocessing:
         self.shm = dict(
             observations=RawArray(obs_ctype, num_agents * int(np.prod(obs_shape))),
             actions=RawArray(atn_ctype, num_agents * int(np.prod(atn_shape))),
-            rewards=RawArray("f", num_agents),
+            rewards=RawArray("f", num_agents * 32),
             terminals=RawArray("b", num_agents),
             truncateds=RawArray("b", num_agents),
             masks=RawArray("b", num_agents),
@@ -354,7 +354,7 @@ class Multiprocessing:
         self.actions = np.ndarray((*shape, *atn_shape), dtype=atn_dtype, buffer=self.shm["actions"])
         self.buf = dict(
             observations=np.ndarray((*shape, *obs_shape), dtype=obs_dtype, buffer=self.shm["observations"]),
-            rewards=np.ndarray(shape, dtype=np.float32, buffer=self.shm["rewards"]),
+            rewards=np.ndarray((*shape, 32), dtype=np.float32, buffer=self.shm["rewards"]),
             terminals=np.ndarray(shape, dtype=bool, buffer=self.shm["terminals"]),
             truncations=np.ndarray(shape, dtype=bool, buffer=self.shm["truncateds"]),
             masks=np.ndarray(shape, dtype=bool, buffer=self.shm["masks"]),
@@ -493,7 +493,7 @@ class Multiprocessing:
         buf = self.buf
 
         o = buf["observations"][w_slice].reshape(self.obs_batch_shape)
-        r = buf["rewards"][w_slice].ravel()
+        r = buf["rewards"][w_slice].reshape((self.agents_per_batch, 32))
         d = buf["terminals"][w_slice].ravel()
         t = buf["truncations"][w_slice].ravel()
 
