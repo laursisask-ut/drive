@@ -457,6 +457,7 @@ static int my_log(
     assign_to_dict(dict, "stop_line_reward", log->stop_line_reward);
     assign_to_dict(dict, "velocity_reward", log->velocity_reward);
     assign_to_dict(dict, "ade_reward", log->ade_reward);
+    assign_to_dict(dict, "speed_limit_reward", log->speed_limit_reward);
     assign_to_dict(dict, "dnf_rate", log->dnf_rate);
     assign_to_dict(dict, "avg_displacement_error", log->avg_displacement_error);
     //assign_to_dict(dict, "num_goals_reached", log->num_goals_reached);

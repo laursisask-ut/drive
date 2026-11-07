@@ -428,11 +428,11 @@ TORCH_MODULE(SceneEncoderBlock);
 struct SceneEncoderImpl : torch::nn::Module {
     SceneEncoderImpl(int64_t ego_dim_, int64_t hidden_dim_, int num_blocks)
         : ego_dim(ego_dim_), hidden_dim(hidden_dim_) {
-        for (int i = 8; i < 14; i++) ego_state_indices.push_back(i);
-        for (int i = 20; i < ego_dim; i++) ego_state_indices.push_back(i);
-        goal_indices = {14, 15, 18, 19};
-        next_goal_indices = {16, 17, 18, 19};
-        for (int i = 0; i < 8; i++) reward_pref_indices.push_back(i);
+        for (int i = 9; i < 15; i++) ego_state_indices.push_back(i);
+        for (int i = 21; i < ego_dim; i++) ego_state_indices.push_back(i);
+        goal_indices = {15, 16, 19, 20};
+        next_goal_indices = {17, 18, 19, 20};
+        for (int i = 0; i < 9; i++) reward_pref_indices.push_back(i);
 
         map_proj = register_module(
             "map_proj",
@@ -750,9 +750,9 @@ extern "C" TorchModel* torch_model_load(
             int64_t hidden_dim = dim0(state, "encoder.map_proj.0.weight");
             int64_t ego_state_dim = dim1(state, "encoder.ego_state_proj.0.weight");
             int64_t ego_dim = drive_ego_features(dynamics_model);
-            // Eight preferences and six distinct goal features use other tokens;
+            // Nine preferences and six distinct goal features use other tokens;
             // everything else is in the ego token.
-            if (ego_state_dim != ego_dim - 14) {
+            if (ego_state_dim != ego_dim - 15 || dim1(state, "encoder.reward_pref_proj.0.weight") != 9) {
                 throw std::runtime_error("Wayformer checkpoint uses an incompatible observation layout; retrain for ego history");
             }
             int64_t action_size = dim0(state, "decoder.actor.weight");

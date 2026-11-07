@@ -80,16 +80,16 @@ def write_history(data, t, x, y, heading, speed, policy_actions):
     past_steps = np.maximum(t - np.arange(1, 11), 0)
     cosine, sine = np.cos(heading[t]), np.sin(heading[t])
     dx, dy = x[past_steps] - x[t], y[past_steps] - y[t]
-    positions = data[22:42].reshape(-1, 2)
+    positions = data[23:43].reshape(-1, 2)
     positions[:, 0] = (dx * cosine + dy * sine) * 0.02
     positions[:, 1] = (-dx * sine + dy * cosine) * 0.02
     delta = heading[past_steps] - heading[t]
-    headings = data[42:62].reshape(-1, 2)
+    headings = data[43:63].reshape(-1, 2)
     headings[:, 0], headings[:, 1] = np.cos(delta), np.sin(delta)
-    data[62:72] = speed[past_steps] / 27.7
+    data[63:73] = speed[past_steps] / 27.7
     # Older speed samples repeat the initial speed if they predate the scenario.
-    data[72:77] = speed[np.maximum(t - np.array([20, 30, 40, 50, 60]), 0)] / 27.7
-    commands = data[77:97].reshape(10, 2)
+    data[73:78] = speed[np.maximum(t - np.array([20, 30, 40, 50, 60]), 0)] / 27.7
+    commands = data[78:98].reshape(10, 2)
     commands[:] = 0  # Normalized physical zero: no acceleration or steering.
     count = min(t, 10)
     commands[:count] = policy_actions[t-count:t][::-1]
@@ -226,22 +226,23 @@ def process_scenario(filepath):
         data[4] = 0.01  # Comfort reward coefficient
         data[5] = 2.5e-3  # Lane-center reward coefficient
         data[6] = 2.5e-2  # Lane-alignment reward coefficient
-        data[7] = 0.0  # Lane-center bias
-        data[8] = speed / 27.7
-        data[9] = steering_angles[t] / 0.667
-        data[10] = 50 / 3.6 / 27.7
-        data[11] = scenario["ego"]["width"] / 15.0
-        data[12] = scenario["ego"]["length"] / 30.0
-        data[13] = 1.0  # Goal radius / 3 m
-        data[14:16] = rel_goal_x * 0.005, rel_goal_y * 0.005
-        data[16:18] = rel_next_goal_x * 0.005, rel_next_goal_y * 0.005
+        data[7] = 5e-4  # Speed-limit reward coefficient
+        data[8] = 0.0  # Lane-center bias
+        data[9] = speed / 27.7
+        data[10] = steering_angles[t] / 0.667
+        data[11] = 50 / 3.6 / 27.7
+        data[12] = scenario["ego"]["width"] / 15.0
+        data[13] = scenario["ego"]["length"] / 30.0
+        data[14] = 1.0  # Goal radius / 3 m
+        data[15:17] = rel_goal_x * 0.005, rel_goal_y * 0.005
+        data[17:19] = rel_next_goal_x * 0.005, rel_next_goal_y * 0.005
         remaining = scenario["ego"].get("remaining_goals", 3)
         if isinstance(remaining, list):
             remaining = remaining[t]
-        data[18] = remaining >= 2
-        data[19] = remaining >= 1
-        data[20] = lane_heading_angle_diff
-        data[21] = lateral_offset / 4.0
+        data[19] = remaining >= 2
+        data[20] = remaining >= 1
+        data[21] = lane_heading_angle_diff
+        data[22] = lateral_offset / 4.0
         write_history(data, t, **trajectory, policy_actions=policy_actions)
 
         assert len(scenario["others"]) <= 63

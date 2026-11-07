@@ -6,7 +6,7 @@
 #define EGO_HISTORY_CAPACITY 60
 
 static inline int drive_ego_features(int dynamics_model) {
-    return dynamics_model == 1 ? 100 : 97;
+    return dynamics_model == 1 ? 101 : 98;
 }
 
 #endif

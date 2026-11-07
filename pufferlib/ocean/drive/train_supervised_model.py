@@ -24,8 +24,8 @@ class PregeneratedDataset(Dataset):
                 raise ValueError("Wrong input shape: regenerate supervised_data.npz with create_supervised_data.py")
             self.inputs = torch.from_numpy(inputs).to(torch.float32)
             # Hide reward preferences and all history in both splits, keeping the full shape.
-            self.inputs[..., :8] = 0
-            self.inputs[..., 22:ego_features()] = 0
+            self.inputs[..., :9] = 0
+            self.inputs[..., 23:ego_features()] = 0
             self.actions = torch.from_numpy(data["actions"]).to(torch.int64)
             self.waypoints = torch.from_numpy(data["waypoints"]).to(torch.float32)
             self.waypoint_masks = torch.from_numpy(data["waypoint_masks"]).to(torch.bool)
@@ -62,7 +62,7 @@ def main():
     # features too. Preferences enter through both a token and FiLM conditioning.
     history_columns = [
         i for i, obs_index in enumerate(model.encoder.ego_state_indices)
-        if 22 <= obs_index < model.encoder.ego_dim
+        if 23 <= obs_index < model.encoder.ego_dim
     ]
     with torch.no_grad():
         model.encoder.ego_state_proj[0].weight[:, history_columns] = 0

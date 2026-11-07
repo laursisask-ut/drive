@@ -89,6 +89,7 @@
 #define HIDDEN_VEHICLE_FRONT_COS 0.95
 // Observation Space Constants
 #define MAX_SPEED 27.7f
+#define DEFAULT_SPEED_LIMIT (50.0f / 3.6f) // Lane speed limit in m/s.
 #define MAX_VEH_LEN 30.0f
 #define MAX_VEH_WIDTH 15.0f
 #define MAX_VEH_HEIGHT 10.0f
@@ -119,6 +120,7 @@
 #define REWARD_COMPONENT_STOP_LINE 7
 #define REWARD_COMPONENT_VELOCITY 8
 #define REWARD_COMPONENT_ADE 9
+#define REWARD_COMPONENT_SPEED_LIMIT 10
 
 #define COLLISION_COUNT_BINS 101
 #define COLLISION_COUNT_BUCKETS 5151
@@ -174,6 +176,7 @@ struct Log {
     float stop_line_reward;
     float velocity_reward;
     float ade_reward;
+    float speed_limit_reward;
     float episode_length;
     float score;
     float offroad_rate;
@@ -267,6 +270,7 @@ struct Entity {
     float safety_reward_coefficient;
     float offroad_reward_coefficient;
     float stop_line_reward_coefficient;
+    float speed_limit_coefficient;
     float lane_center_bias;
     float object_detection_distance; // Actor visibility radius in meters; zero defaults to 50 m.
     float hide_other_vehicles_fraction; // Zero disables intermittent actor hiding.
@@ -310,6 +314,7 @@ struct StaticRoadEntity {
     float* traj_z;
     int traffic_light_idx;
     int traffic_light_off_type; // STOP_SIGN for yield rules, NONE for priority.
+    float speed_limit; // m/s; zero uses DEFAULT_SPEED_LIMIT.
 };
 
 typedef struct TrafficLightState TrafficLightState;
@@ -653,6 +658,24 @@ static int effective_road_type(const Drive* env, const StaticRoadEntity* road) {
     return road->type;
 }
 
+static inline float road_speed_limit(const StaticRoadEntity* road) {
+    return road->speed_limit > 0.0f ? road->speed_limit : DEFAULT_SPEED_LIMIT;
+}
+
+static inline float compute_speed_limit_reward(const Drive* env, const Entity* agent, float speed) {
+    if (agent->type != VEHICLE) return 0.0f;
+
+    float speed_limit = DEFAULT_SPEED_LIMIT;
+    if (agent->current_lane_idx >= 0 && agent->current_lane_idx < env->num_roads) {
+        speed_limit = road_speed_limit(&env->static_road_entities[agent->current_lane_idx]);
+    }
+    float max_speed = agent->max_speed > 0.0f ? fminf(agent->max_speed, MAX_SPEED) : MAX_SPEED;
+    int at_limit = max_speed < speed_limit
+        ? speed >= 0.99f * max_speed
+        : speed >= 0.9f * speed_limit && speed <= 1.1f * speed_limit;
+    return at_limit ? agent->speed_limit_coefficient : 0.0f;
+}
+
 typedef struct {
     int candidates[MAX_AGENTS];
     int candidates_count;
@@ -778,6 +801,7 @@ void add_log(Drive* env) {
         env->log.stop_line_reward += env->logs[i].stop_line_reward;
         env->log.velocity_reward += env->logs[i].velocity_reward;
         env->log.ade_reward += env->logs[i].ade_reward;
+        env->log.speed_limit_reward += env->logs[i].speed_limit_reward;
         // Log composition counts per agent so vec_log averaging recovers the per-env value
         env->log.active_agent_count += env->active_agent_count;
         env->log.expert_static_car_count += env->expert_static_car_count;
@@ -817,6 +841,9 @@ static inline void accumulate_reward_component(Log* log, int component, float re
         break;
     case REWARD_COMPONENT_ADE:
         log->ade_reward += reward;
+        break;
+    case REWARD_COMPONENT_SPEED_LIMIT:
+        log->speed_limit_reward += reward;
         break;
     default:
         break;
@@ -1063,6 +1090,7 @@ static void split_legacy_entities(Drive* env) {
         road->traj_y = e->traj_y;
         road->traj_z = e->traj_z;
         road->traffic_light_idx = road->type == TRAFFIC_LIGHT_STOP_LINE ? traffic_light_idx++ : -1;
+        road->speed_limit = DEFAULT_SPEED_LIMIT;
         e->traj_x = e->traj_y = e->traj_z = NULL;
         free_entity(e);
     }
@@ -1132,6 +1160,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             e->safety_reward_coefficient = 1.0f;
             e->offroad_reward_coefficient = 1.0f;
             e->stop_line_reward_coefficient = 1.0f;
+            e->speed_limit_coefficient = 1e-3f;
             e->lane_center_bias = 0.0f;
             e->goal_radius = 3.0f;
         }
@@ -1184,6 +1213,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             road->traj_z = e->traj_z;
             road->traffic_light_idx = road->type == TRAFFIC_LIGHT_STOP_LINE ? traffic_light_idx++ : -1;
             road->traffic_light_off_type = light_off_type;
+            road->speed_limit = DEFAULT_SPEED_LIMIT;
             if (road->type == TRAFFIC_LIGHT_STOP_LINE) {
                 env->traffic_light_states = realloc(env->traffic_light_states,
                     traffic_light_idx * sizeof(TrafficLightState));
@@ -3243,32 +3273,33 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
     obs[4] = e->comfort_reward_coefficient;
     obs[5] = e->lane_center_reward_coefficient;
     obs[6] = e->lane_align_reward_coefficient;
-    obs[7] = e->lane_center_bias;
-    // Current speed, steering angle, speed limit, and vehicle dimensions.
-    obs[8] = hypotf(e->vx, e->vy) / MAX_SPEED;
-    obs[9] = e->steering_angle / 0.667f;
-    obs[10] = e->max_speed == 0.0f ? 1.0f : fminf(e->max_speed / MAX_SPEED, 1.0f);
-    obs[11] = e->width / MAX_VEH_WIDTH;
-    obs[12] = e->length / MAX_VEH_LEN;
+    obs[7] = e->speed_limit_coefficient;
+    obs[8] = e->lane_center_bias;
+    // Current speed, steering angle, vehicle maximum speed, and dimensions.
+    obs[9] = hypotf(e->vx, e->vy) / MAX_SPEED;
+    obs[10] = e->steering_angle / 0.667f;
+    obs[11] = e->max_speed == 0.0f ? 1.0f : fminf(e->max_speed / MAX_SPEED, 1.0f);
+    obs[12] = e->width / MAX_VEH_WIDTH;
+    obs[13] = e->length / MAX_VEH_LEN;
     // Goal geometry and remaining-goal flags.
-    obs[13] = e->goal_radius / 3.0f;
+    obs[14] = e->goal_radius / 3.0f;
     float dx = e->goal_position_x - e->x, dy = e->goal_position_y - e->y;
-    obs[14] = (dx * c + dy * s) * 0.005f;
-    obs[15] = (-dx * s + dy * c) * 0.005f;
+    obs[15] = (dx * c + dy * s) * 0.005f;
+    obs[16] = (-dx * s + dy * c) * 0.005f;
     int next = e->multi_goal_idx + 1;
     if (next < e->multi_goal_count) {
         dx = e->multi_goal_position_x[next] - e->x;
         dy = e->multi_goal_position_y[next] - e->y;
     }
-    obs[16] = (dx * c + dy * s) * 0.005f;
-    obs[17] = (-dx * s + dy * c) * 0.005f;
+    obs[17] = (dx * c + dy * s) * 0.005f;
+    obs[18] = (-dx * s + dy * c) * 0.005f;
     int remaining = e->reached_final_goal ? 0 : e->multi_goal_count > 0
         ? e->multi_goal_count - e->multi_goal_idx : 1;
-    obs[18] = remaining >= 2;
-    obs[19] = remaining >= 1;
+    obs[19] = remaining >= 2;
+    obs[20] = remaining >= 1;
     // Current lane-relative pose.
-    obs[20] = e->lane_heading_angle_diff;
-    obs[21] = e->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f
+    obs[21] = e->lane_heading_angle_diff;
+    obs[22] = e->metrics_array[LANE_LATERAL_OFFSET_IDX] > -100.0f
         ? e->metrics_array[LANE_LATERAL_OFFSET_IDX] / 4.0f : 0.0f;
     // Ten past poses (XY and heading cos/sin), speeds and selected commands.
     for (int k = 0; k < 10; k++) {
@@ -3276,24 +3307,24 @@ static void write_ego_observation(const Entity* e, int dynamics_model, float* ob
         const float* h = e->ego_history[index];
         dx = h[0] - e->x;
         dy = h[1] - e->y;
-        obs[22 + 2*k] = (dx * c + dy * s) * 0.02f;
-        obs[22 + 2*k + 1] = (-dx * s + dy * c) * 0.02f;
-        obs[42 + 2*k] = h[2] * c + h[3] * s;
-        obs[42 + 2*k + 1] = h[3] * c - h[2] * s;
-        obs[62 + k] = h[4] / MAX_SPEED;
-        obs[77 + 2*k] = h[5];
-        obs[77 + 2*k + 1] = h[6];
+        obs[23 + 2*k] = (dx * c + dy * s) * 0.02f;
+        obs[23 + 2*k + 1] = (-dx * s + dy * c) * 0.02f;
+        obs[43 + 2*k] = h[2] * c + h[3] * s;
+        obs[43 + 2*k + 1] = h[3] * c - h[2] * s;
+        obs[63 + k] = h[4] / MAX_SPEED;
+        obs[78 + 2*k] = h[5];
+        obs[78 + 2*k + 1] = h[6];
     }
     // Speeds 20, 30, 40, 50 and 60 steps ago, adjacent to recent speeds.
     for (int k = 0; k < 5; k++) {
         int lag = 20 + 10*k;
         int index = (e->ego_history_head + EGO_HISTORY_CAPACITY - lag) % EGO_HISTORY_CAPACITY;
-        obs[72 + k] = e->ego_history[index][4] / MAX_SPEED;
+        obs[73 + k] = e->ego_history[index][4] / MAX_SPEED;
     }
     if (dynamics_model == JERK) {
-        obs[97] = e->steering_angle / M_PI;
-        obs[97 + 1] = e->a_long < 0 ? e->a_long / (-JERK_LONG[0]) : e->a_long / JERK_LONG[3];
-        obs[97 + 2] = e->a_lat / JERK_LAT[2];
+        obs[98] = e->steering_angle / M_PI;
+        obs[98 + 1] = e->a_long < 0 ? e->a_long / (-JERK_LONG[0]) : e->a_long / JERK_LONG[3];
+        obs[98 + 2] = e->a_lat / JERK_LAT[2];
     }
 }
 
@@ -3468,6 +3499,8 @@ void compute_observations(Drive* env, ActorObservationGrid* actor_grid) {
                 float line_attribute = 0.0f;
                 if (road_type == TRAFFIC_LIGHT_STOP_LINE) {
                     line_attribute = traffic_light_observation_value(road_traffic_light_color(env, entity));
+                } else if (road_type == ROAD_LANE) {
+                    line_attribute = road_speed_limit(entity) / MAX_SPEED;
                 }
                 // Calculate angle from ego to midpoint (vector from ego to midpoint)
                 float dx = end_x - mid_x;
@@ -3923,6 +3956,10 @@ void c_step(Drive* env){
 
         float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
 
+        float speed_limit_reward = compute_speed_limit_reward(env, e, speed);
+        env->rewards[32 * i + 31] += speed_limit_reward;
+        record_reward_component(env, i, REWARD_COMPONENT_SPEED_LIMIT, speed_limit_reward);
+
         if (lateral_offset > -100.0f) {
             env->logs[i].lane_lateral_offset += fabsf(lateral_offset);
             env->logs[i].lane_heading_angle_diff += lane_heading_angle_diff;
@@ -4186,8 +4223,8 @@ void draw_agent_obs(Drive* env, int agent_index, int mode, int obs_only, int las
     float px = env->entities[active_idx].x;
     float py = env->entities[active_idx].y;
     // draw goal
-    float goal_x = agent_obs[14] * 200;
-    float goal_y = agent_obs[15] * 200;
+    float goal_x = agent_obs[15] * 200;
+    float goal_y = agent_obs[16] * 200;
     if(mode == 0 ){
         DrawSphere((Vector3){goal_x, goal_y, 1}, 0.5f, LIGHTGREEN);
         DrawCircle3D((Vector3){goal_x, goal_y, 0.1f}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f, Fade(LIGHTGREEN, 0.3f));

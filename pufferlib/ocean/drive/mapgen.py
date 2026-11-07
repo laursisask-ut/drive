@@ -114,6 +114,7 @@ class Entity(Structure):
         ("safety_reward_coefficient", c_float),
         ("offroad_reward_coefficient", c_float),
         ("stop_line_reward_coefficient", c_float),
+        ("speed_limit_coefficient", c_float),
         ("lane_center_bias", c_float),
         ("object_detection_distance", c_float),
         ("hide_other_vehicles_fraction", c_float),
@@ -151,6 +152,7 @@ class StaticRoadEntity(Structure):
         ("traj_z", POINTER(c_float)),
         ("traffic_light_idx", c_int),
         ("traffic_light_off_type", c_int),
+        ("speed_limit", c_float),  # m/s
     ]
 
 utm_origin_lat = 58.385345
@@ -195,7 +197,7 @@ PARKED_BORDER_DEVIATION = 0.10  # Maximum bend across a full parking position.
 
 VEHICLE_PROFILES = [
     (0.30, 65, (1.90, 4.82, 1.46)),  # sedans
-    (0.20, 40, (2.50, 5.00, 1.69)),  # Lexus 450h
+    (0.20, 45, (2.50, 5.00, 1.69)),  # Lexus 450h
     (0.12, 55, (2.00, 5.02, 1.78)),  # SUVs
     (0.05, 55, (2.03, 5.88, 1.97)),  # pickup trucks
     (0.07, 55, (1.95, 5.40, 1.97)),  # vans
@@ -1108,8 +1110,14 @@ def generate_obstacles(count, placed_vehicles):
     return obstacles
 
 
+def lanelet_speed_limit(lanelet):
+    """Return the lanelet's speed limit in m/s, defaulting to 50 kph."""
+    speed_limit_kph = float(lanelet.attributes["speed_limit"]) if "speed_limit" in lanelet.attributes else 50.0
+    return speed_limit_kph / 3.6
+
+
 def generate_shared_static_road_entities():
-    def add_linestring_segments_in_box(entity_type, linestring, traffic_light_idx=-1):
+    def add_linestring_segments_in_box(entity_type, linestring, traffic_light_idx=-1, speed_limit=0.0):
         x = []
         y = []
         z = []
@@ -1119,14 +1127,14 @@ def generate_shared_static_road_entities():
             z.append(p.z)
         if x:
             off_type = stop_line_fallback_type(linestring.attributes) if entity_type == TRAFFIC_LIGHT_STOP_LINE else 0
-            roads.append((entity_type, x, y, z, traffic_light_idx, off_type))
+            roads.append((entity_type, x, y, z, traffic_light_idx, off_type, speed_limit))
 
     roads = []
     for lanelet in lanelet2_map.laneletLayer:
         if "subtype" not in lanelet.attributes:
             continue
         if lanelet.attributes["subtype"] == "road":
-            add_linestring_segments_in_box(4, lanelet.centerline)
+            add_linestring_segments_in_box(4, lanelet.centerline, speed_limit=lanelet_speed_limit(lanelet))
         elif lanelet.attributes["subtype"] == "crosswalk":
             add_linestring_segments_in_box(8, lanelet.leftBound)
             add_linestring_segments_in_box(8, lanelet.rightBound)
@@ -1155,7 +1163,7 @@ def generate_shared_static_road_entities():
 
     entities = alloc_static_road_entities(len(roads))
 
-    for i, (entity_type, x, y, z, traffic_light_idx, off_type) in enumerate(roads):
+    for i, (entity_type, x, y, z, traffic_light_idx, off_type, speed_limit) in enumerate(roads):
         ent = entities[i]
         ent.type = entity_type
         ent.array_size = len(x)
@@ -1164,6 +1172,7 @@ def generate_shared_static_road_entities():
         ent.traj_z = alloc_float_array(z)
         ent.traffic_light_idx = traffic_light_idx
         ent.traffic_light_off_type = off_type
+        ent.speed_limit = speed_limit
 
     return entities, len(roads)
 
@@ -1230,18 +1239,14 @@ def generate_map():
         spawn_pos = BasicPoint2d(*vehicle_pose[:2])
         heading = vehicle_pose[2] + math.pi
 
-        speed_limit = 50
-        if "speed_limit" in lanelet.attributes:
-            speed_limit = float(lanelet.attributes["speed_limit"])
-
-        vehicle_speed_limit = vehicle_samples[i][1]
-        speed_limit = min(speed_limit, vehicle_speed_limit)
+        vehicle_speed_limit = vehicle_samples[i][1] / 3.6
+        speed_limit = min(lanelet_speed_limit(lanelet), vehicle_speed_limit)
 
         if is_initially_parked:
             initial_speed_fraction = 0
         else:
             initial_speed_fraction = random.uniform(0.2, 1.0)
-        initial_speed = speed_limit*initial_speed_fraction/3.6
+        initial_speed = speed_limit * initial_speed_fraction
 
         current_lanelet = lanelet
         current_lanelet_offset = s
@@ -1250,7 +1255,7 @@ def generate_map():
         for _ in range(goals_per_agent):
             can_add_more_goals = True
             # 3-9 seconds away
-            goal_distance = speed_limit / 3.6 * random.uniform(3, 9)
+            goal_distance = speed_limit * random.uniform(3, 9)
             while True:
                 line = to2D(current_lanelet.centerline)
                 following_lanelets = routing_graph.following(current_lanelet, withLaneChanges=True)
@@ -1363,6 +1368,7 @@ def generate_map():
         ent.safety_reward_coefficient = random.uniform(0, 1.0)
         ent.offroad_reward_coefficient = random.uniform(0, 1.0)
         ent.stop_line_reward_coefficient = random.uniform(0, 1.0)
+        ent.speed_limit_coefficient = random.uniform(0, 1e-3)
         ent.lane_center_bias = random.uniform(-0.3, 0.3)
         ent.goal_radius = random.uniform(0.5, 3)
         ent.object_detection_distance = random.uniform(30, 60)
