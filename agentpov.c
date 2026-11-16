@@ -368,7 +368,9 @@ int main(int argc, char *argv[]) {
     const int other_agent_count = 63;
     const int road_segment_count = 200;
     int ego_dim = max_obs - other_agent_count * 7 - road_segment_count * 7;
-    if (ego_dim != 97 && ego_dim != 100) {
+    // The speed-limit preference shifts state fields in the newer layouts.
+    int ego_state_shift = ego_dim == 98 || ego_dim == 101;
+    if (ego_dim != 97 && ego_dim != 98 && ego_dim != 100 && ego_dim != 101) {
         fprintf(stderr, "invalid replay layout: max_obs=%d inferred ego_dim=%d\n", max_obs, ego_dim);
         free(obs_buf);
         free(reward_values);
@@ -443,19 +445,19 @@ int main(int argc, char *argv[]) {
         rlDisableBackfaceCulling();
         rlPushMatrix();
         rlScalef(-1, 1, 1);
-        float goal_x = obs[t][14] / 0.005f;
-        float goal_y = obs[t][15] / 0.005f;
-        float speed = obs[t][8] * 27.7f;
-        float steering_angle_degrees = obs[t][9] * 0.667f * 180.0f / PI;
-        float width = obs[t][11] * 15.0f;
-        float length = obs[t][12] * 30.0f;
-        float lane_heading_angle_diff = obs[t][20];
-        float lane_lateral_offset = obs[t][21] * 4.0f;
-        float next_goal_x = obs[t][16] / 0.005f;
-        float next_goal_y = obs[t][17] / 0.005f;
-        float goal_radius = obs[t][13] * 3.0f;
+        float goal_x = obs[t][14 + ego_state_shift] / 0.005f;
+        float goal_y = obs[t][15 + ego_state_shift] / 0.005f;
+        float speed = obs[t][8 + ego_state_shift] * 27.7f;
+        float steering_angle_degrees = obs[t][9 + ego_state_shift] * 0.667f * 180.0f / PI;
+        float width = obs[t][11 + ego_state_shift] * 15.0f;
+        float length = obs[t][12 + ego_state_shift] * 30.0f;
+        float lane_heading_angle_diff = obs[t][20 + ego_state_shift];
+        float lane_lateral_offset = obs[t][21 + ego_state_shift] * 4.0f;
+        float next_goal_x = obs[t][16 + ego_state_shift] / 0.005f;
+        float next_goal_y = obs[t][17 + ego_state_shift] / 0.005f;
+        float goal_radius = obs[t][13 + ego_state_shift] * 3.0f;
         float collision_reward_coefficient = obs[t][0];
-        int remaining_goals = (int)(obs[t][18] + obs[t][19]);
+        int remaining_goals = (int)(obs[t][18 + ego_state_shift] + obs[t][19 + ego_state_shift]);
 
         // Draw roads beneath the history trail and vehicle outlines.
         int valid_road_points = 0;
@@ -502,8 +504,8 @@ int main(int argc, char *argv[]) {
         Vector2 previous = {0.0f, 0.0f};
         for (int k = 0; k < 10; k++) {
             Vector2 position = {
-                obs[t][22 + 2*k] / 0.02f,
-                obs[t][22 + 2*k + 1] / 0.02f,
+                obs[t][22 + ego_state_shift + 2*k] / 0.02f,
+                obs[t][22 + ego_state_shift + 2*k + 1] / 0.02f,
             };
             DrawLineEx(previous, position, 2.0f * line_thickness, GOLD);
             previous = position;

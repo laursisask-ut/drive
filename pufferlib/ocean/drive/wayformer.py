@@ -120,7 +120,12 @@ def forward_group(model, observations, counts, capacity, fast_attention=False):
             key_bias=key_bias,
             use_fast=fast_attention,
         )
-        x = x + block.mlp(block.layer_norm2(x))
+        if fast_attention:
+            from pufferlib.ocean.drive.wayformer_mlp import fused_mlp
+
+            x = fused_mlp(block.layer_norm2(x), block.mlp, x)
+        else:
+            x = x + block.mlp(block.layer_norm2(x))
     encoded = encoder.final_norm(x)
 
     x = decoder.seed.expand(batch, -1, -1)
@@ -169,13 +174,17 @@ def _compiled_group(capacity, mode):
 @torch.compiler.disable
 def compact_forward(model, observations):
     prepare, dense = _compiled_functions()
-    amp_bfloat16 = torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
-    native_bfloat16 = model.encoder.map_proj[0].weight.dtype == torch.bfloat16
+    # Autocast selects the compute dtype even when the stored weights are BF16.
+    compute_dtype = (
+        torch.get_autocast_dtype("cuda")
+        if torch.is_autocast_enabled("cuda")
+        else model.encoder.map_proj[0].weight.dtype
+    )
     blocks = [*model.encoder.blocks, *model.decoder.blocks]
     if (
         torch.cuda.get_device_capability(observations.device) != (10, 0)
         or observations.dtype != torch.bfloat16
-        or not (amp_bfloat16 or native_bfloat16)
+        or compute_dtype != torch.bfloat16
         or any(block.attn.dropout != 0 for block in blocks)
     ):
         return dense(model, observations)

@@ -255,6 +255,7 @@ def dall_kernel(
     D: tl.constexpr,
     SCALE: tl.constexpr,
     BL: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     bh = tl.program_id(0)
     b, h = bh // H, bh % H
@@ -269,20 +270,29 @@ def dall_kernel(
     bias = tl.load(Bias + b * N + n, n < N, float("-inf"))
     p = tl.exp(tl.dot(q, tl.trans(k)) * SCALE + bias[None, :] - lse[:, None])
     p = tl.where(n[:, None] < N, p, 0.0)
-    ptr = (bh * N + n[:, None]) * D + d[None, :]
+    if PACKED:
+        ptr = ((b * N + n[:, None]) * 3 * H + h) * D + d[None, :]
+    else:
+        ptr = (bh * N + n[:, None]) * D + d[None, :]
     dv = tl.dot(tl.trans(p.to(do.dtype)), do)
-    tl.store(DV + ptr, dv, n[:, None] < N)
+    if PACKED:
+        tl.store(DQ + ptr + 2 * H * D, dv, n[:, None] < N)
+    else:
+        tl.store(DV + ptr, dv, n[:, None] < N)
     delta = tl.sum(do.to(tl.float32) * o.to(tl.float32), 1)
     dp = tl.dot(do, tl.trans(v))
     ds = (p * (dp - delta[:, None]) * SCALE).to(q.dtype)
     dq = tl.dot(ds, k)
     tl.store(DQ + ptr, dq, n[:, None] < N)
     dk = tl.dot(tl.trans(ds), q)
-    tl.store(DK + ptr, dk, n[:, None] < N)
+    if PACKED:
+        tl.store(DQ + ptr + H * D, dk, n[:, None] < N)
+    else:
+        tl.store(DK + ptr, dk, n[:, None] < N)
 
 
 @tr.jit
-def dall_split_kernel(
+def bwd_stream(
     Q,
     K,
     V,
@@ -305,37 +315,44 @@ def dall_split_kernel(
     H: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
-    SCALE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
     bh = tl.program_id(1)
-    b, h = bh // H, bh % H
+    b = bh // H
+    h = bh % H
     m = tl.program_id(0) * BM + tl.arange(0, BM)
-    n = tl.arange(0, BN)
     d = tl.arange(0, D)
     q = tl.load(Q + b * QS0 + h * QS1 + m[:, None] * QS2 + d[None, :], m[:, None] < N, 0)
-    k = tl.load(K + b * KS0 + h * KS1 + n[:, None] * KS2 + d[None, :], n[:, None] < N, 0)
-    v = tl.load(V + b * VS0 + h * VS1 + n[:, None] * VS2 + d[None, :], n[:, None] < N, 0)
     do = tl.load(DO + ((b * N + m[:, None]) * H + h) * D + d[None, :], m[:, None] < N, 0)
     o = tl.load(O + ((b * N + m[:, None]) * H + h) * D + d[None, :], m[:, None] < N, 0)
     lse = tl.load(Lse + bh * N + m, m < N, 0)
-    bias = tl.load(Bias + b * N + n, n < N, float("-inf"))
-    p = tl.exp(tl.dot(q, tl.trans(k)) * SCALE + bias[None, :] - lse[:, None])
-    p = tl.where(m[:, None] < N, p, 0.0)
-    ptr = (bh * N + n[:, None]) * D + d[None, :]
-    dv = tl.dot(tl.trans(p.to(do.dtype)), do)
-    tl.atomic_add(DV + ptr, dv, n[:, None] < N, sem="relaxed")
     delta = tl.sum(do.to(tl.float32) * o.to(tl.float32), 1)
-    dp = tl.dot(do, tl.trans(v))
-    ds = (p * (dp - delta[:, None]) * SCALE).to(q.dtype)
-    dq = tl.dot(ds, k)
-    tl.store(DQ + (bh * N + m[:, None]) * D + d[None, :], dq, m[:, None] < N)
-    dk = tl.dot(tl.trans(ds), q)
-    tl.atomic_add(DK + ptr, dk, n[:, None] < N, sem="relaxed")
+    dq = tl.full((BM, D), 0.0, tl.float32)
+    for i in range(tl.cdiv(N, BN)):
+        n = i * BN + tl.arange(0, BN)
+        k = tl.load(K + b * KS0 + h * KS1 + n[:, None] * KS2 + d[None, :], n[:, None] < N, 0)
+        v = tl.load(V + b * VS0 + h * VS1 + n[:, None] * VS2 + d[None, :], n[:, None] < N, 0)
+        bias = tl.load(Bias + b * N + n, n < N, float("-inf"))
+        p = tl.exp2((tl.dot(q, tl.trans(k)) * (D**-0.5) + bias[None, :] - lse[:, None]) * 1.4426950408889634)
+        p = tl.where(m[:, None] < N, p, 0.0)
+        dv = tl.dot(tl.trans(p.to(do.dtype)), do)
+        ptr = (bh * N + n[:, None]) * D + d[None, :]
+        tl.atomic_add(DV + ptr, dv, n[:, None] < N, sem="relaxed")
+        dp = tl.dot(do, tl.trans(v))
+        ds = (p * (dp - delta[:, None]) * (D**-0.5)).to(q.dtype)
+        dq = tl.dot(ds, k, dq)
+        dk = tl.dot(tl.trans(ds), q)
+        tl.atomic_add(DK + ptr, dk, n[:, None] < N, sem="relaxed")
+    if PACKED:
+        ptr = ((b * N + m[:, None]) * 3 * H + h) * D + d[None, :]
+    else:
+        ptr = (bh * N + m[:, None]) * D + d[None, :]
+    tl.store(DQ + ptr, dq, m[:, None] < N)
 
 
-@torch.library.triton_op("puffer_wayformer::attention_forward", mutates_args=())
+@torch.library.triton_op("puffer_wayformer_v2::attention_forward", mutates_args=())
 def _attention_forward(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -406,7 +423,7 @@ def _attention_forward(
     return out, lse
 
 
-@torch.library.triton_op("puffer_wayformer::attention_backward", mutates_args=())
+@torch.library.triton_op("puffer_wayformer_v2::attention_backward", mutates_args=())
 def _attention_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -465,6 +482,7 @@ def _attention_backward(
                 dim,
                 dim**-0.5,
                 tr.next_power_of_2(keys),
+                False,
                 num_warps=4,
             )
     else:
@@ -472,9 +490,8 @@ def _attention_backward(
         # before the BF16 cast, as in other fused attention implementations.
         dk = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
         dv = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
-        block = 64 if keys <= 192 else 32768 // tr.next_power_of_2(keys)
-        warps = 4 if keys <= 192 else 8
-        wrap_triton(dall_split_kernel)[(tr.cdiv(queries, block), batch * heads)](
+        block = 64 if keys <= 160 else 128
+        wrap_triton(bwd_stream)[(tr.cdiv(queries, block), batch * heads)](
             q,
             k,
             v,
@@ -491,10 +508,10 @@ def _attention_backward(
             heads,
             keys,
             dim,
-            dim**-0.5,
             block,
-            tr.next_power_of_2(keys),
-            num_warps=warps,
+            64,
+            False,
+            num_warps=4,
         )
         dk, dv = dk.to(k.dtype), dv.to(v.dtype)
     return dq, dk, dv
@@ -516,3 +533,79 @@ _attention_forward.register_autograd(_backward, setup_context=_setup_context)
 
 def attention(q, k, v, bias):
     return _attention_forward(q, k, v, bias)[0]
+
+
+@tr.jit
+def pack_kv(DK, DV, Packed, M, H: tl.constexpr, N: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    d = i % D
+    h = (i // D) % H
+    n = (i // (D * H)) % N
+    b = i // (D * H * N)
+    source = ((b * H + h) * N + n) * D + d
+    k = tl.load(DK + source, i < M, 0)
+    v = tl.load(DV + source, i < M, 0)
+    target = ((b * N + n) * 3 * H + h) * D + d
+    tl.store(Packed + target + H * D, k, i < M)
+    tl.store(Packed + target + 2 * H * D, v, i < M)
+
+
+@torch.library.triton_op("puffer_wayformer_v2::packed_backward", mutates_args=())
+def _packed_backward(
+    qkv: torch.Tensor, bias: torch.Tensor, out: torch.Tensor, lse: torch.Tensor, grad: torch.Tensor
+) -> torch.Tensor:
+    batch, keys, _, heads, dim = qkv.shape
+    q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+    grad = grad.transpose(1, 2).contiguous().transpose(1, 2)
+    # Pass the whole allocation to kernels. Mutating output views makes
+    # functionalization insert expensive copies of the complete QKV tensor.
+    packed = torch.empty(qkv.shape, dtype=qkv.dtype, device=qkv.device)
+    args = (*q.stride()[:3], *k.stride()[:3], *v.stride()[:3], heads, keys, dim)
+    if keys <= 128:
+        wrap_triton(dall_kernel)[(batch * heads,)](
+            q,
+            k,
+            v,
+            bias,
+            out,
+            lse,
+            grad,
+            packed,
+            None,
+            None,
+            *args,
+            dim**-0.5,
+            tr.next_power_of_2(keys),
+            True,
+            num_warps=4,
+        )
+    else:
+        dk = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
+        dv = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
+        block = 64 if keys <= 160 else 128
+        wrap_triton(bwd_stream)[(tr.cdiv(keys, block), batch * heads)](
+            q, k, v, bias, out, lse, grad, packed, dk, dv, *args, block, 64, True, num_warps=4
+        )
+        count = batch * keys * heads * dim
+        wrap_triton(pack_kv)[(tr.cdiv(count, 1024),)](dk, dv, packed, count, heads, keys, dim, 1024, num_warps=4)
+    return packed
+
+
+class _PackedAttention(torch.autograd.Function):
+    # Reuse the existing forward operator directly. A second, nested forward
+    # dispatcher operator was slower in the B200 benchmark.
+    @staticmethod
+    def forward(ctx, qkv, bias):
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        out, lse = _attention_forward(q, k, v, bias)
+        ctx.save_for_backward(qkv, bias, out, lse)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _packed_backward(*ctx.saved_tensors, grad), None
+
+
+def packed_attention(qkv, bias):
+    """Self-attention whose backward writes the projection's packed Q/K/V layout."""
+    return _PackedAttention.apply(qkv, bias)

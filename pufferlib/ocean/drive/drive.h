@@ -1458,12 +1458,17 @@ void init_topology_graph(Drive* env){
         // Get end point of current lane
         float end_x = lane_i->traj_x[lane_i->array_size - 1];
         float end_y = lane_i->traj_y[lane_i->array_size - 1];
-        float end_vector_x = lane_i->traj_x[lane_i->array_size - 1] - lane_i->traj_x[lane_i->array_size - 2];
-        float end_vector_y = lane_i->traj_y[lane_i->array_size - 1] - lane_i->traj_y[lane_i->array_size - 2];
+        int previous = lane_i->array_size - 2;
+        while (previous >= 0 && hypotf(end_x - lane_i->traj_x[previous],
+                                      end_y - lane_i->traj_y[previous]) < 1e-5f) previous--;
+        if (previous < 0) continue;
+        float end_vector_x = end_x - lane_i->traj_x[previous];
+        float end_vector_y = end_y - lane_i->traj_y[previous];
         float end_heading = atan2f(end_vector_y, end_vector_x);
 
-        // Find lanes that start near this lane's end
-        for(int j = 0; j < env->num_roads; j++){
+        // Prepending in reverse order keeps the first branch deterministic by
+        // road index, independent of actor count.
+        for(int j = env->num_roads - 1; j >= 0; j--){
             if(i == j || env->static_road_entities[j].type != ROAD_LANE) continue;
 
             const StaticRoadEntity* lane_j = &env->static_road_entities[j];
@@ -1472,18 +1477,21 @@ void init_topology_graph(Drive* env){
             // Get start point of potential next lane
             float start_x = lane_j->traj_x[0];
             float start_y = lane_j->traj_y[0];
-            float start_vector_x = lane_j->traj_x[1] - lane_j->traj_x[0];
-            float start_vector_y = lane_j->traj_y[1] - lane_j->traj_y[0];
+            // Endpoints must coincide within 1 cm. Reject before computing
+            // tangents, since almost all lane pairs are spatially unrelated.
+            if (hypotf(end_x - start_x, end_y - start_y) >= 0.01f) continue;
+            int next = 1;
+            while (next < lane_j->array_size && hypotf(lane_j->traj_x[next] - start_x,
+                                                      lane_j->traj_y[next] - start_y) < 1e-5f) next++;
+            if (next == lane_j->array_size) continue;
+            float start_vector_x = lane_j->traj_x[next] - start_x;
+            float start_vector_y = lane_j->traj_y[next] - start_y;
             float start_heading = atan2f(start_vector_y, start_vector_x);
 
-            // Check if end of lane_i is close to start of lane_j
-            float distance = relative_distance_2d(end_x, end_y, start_x, start_y);
-            float heading_diff = fabsf(end_heading - start_heading);
+            float heading_diff = fabsf(remainderf(end_heading - start_heading, 2.0f * PI));
 
-            // Lane connectivity thresholds:
-            // - 0.01m distance: lanes must connect within 1cm (very strict for clean topology)
-            // - 0.1 (~5.7 degrees) heading difference: allow slight curves
-            if(distance < 0.01f && heading_diff < 0.1f){
+            // Allow bends at a join, but reject a lane pointing back at us.
+            if(heading_diff <= PI / 2.0f){
                 // Add directed edge from i to j (lane i connects to lane j)
                 struct AdjListNode* node = newAdjListNode(j);
                 node->next = env->topology_graph->array[i];
@@ -1834,36 +1842,174 @@ int collision_check(Drive* env, int agent_idx) {
     return car_collided_with_index;
 }
 
-// Continuous separating-axis test for translating oriented rectangles. Heading
-// and world-space velocity stay fixed; return first body contact, in seconds.
-static float vehicle_time_to_collision(const Entity* ego, const Entity* other) {
-    float dx = other->x - ego->x, dy = other->y - ego->y;
-    float vx = other->vx - ego->vx, vy = other->vy - ego->vy;
-    const float axes[4][2] = {
-        {ego->heading_x, ego->heading_y}, {-ego->heading_y, ego->heading_x},
-        {other->heading_x, other->heading_y}, {-other->heading_y, other->heading_x}
-    };
-    float enter = 0.0f, leave = SAFETY_TIME_SECONDS;
-    for (int i = 0; i < 4; i++) {
-        float ax = axes[i][0], ay = axes[i][1];
-        float extent = 0.5f * (
-            ego->length * fabsf(ax * ego->heading_x + ay * ego->heading_y) +
-            ego->width * fabsf(-ax * ego->heading_y + ay * ego->heading_x) +
-            other->length * fabsf(ax * other->heading_x + ay * other->heading_y) +
-            other->width * fabsf(-ax * other->heading_y + ay * other->heading_x));
-        float position = dx * ax + dy * ay;
-        float velocity = vx * ax + vy * ay;
-        if (fabsf(velocity) < 1e-6f) {
-            if (fabsf(position) > extent) return INFINITY;
-            continue;
-        }
-        float first = (-extent - position) / velocity;
-        float last = (extent - position) / velocity;
-        enter = fmaxf(enter, fminf(first, last));
-        leave = fminf(leave, fmaxf(first, last));
-        if (enter > leave) return INFINITY;
+typedef struct {
+    float x, y;
+    float heading_x, heading_y;
+} TTCPose;
+
+static int ttc_prediction_steps(const Drive* env, float horizon) {
+    assert(isfinite(env->dt) && env->dt > 0.0f);
+    return (int)ceilf(horizon / env->dt);
+}
+
+// Match the lane-distance and heading preference used by compute_agent_metrics.
+// Query current geometry so background/expert cars need no reward-metric update.
+static void ttc_lane_candidate(const Entity* vehicle, const StaticRoadEntity* lane,
+        int segment, int lane_idx, float* best_distance, int* best_lane,
+        int* best_segment, float* best_fraction) {
+    if (lane->type != ROAD_LANE) return;
+    float dx = lane->traj_x[segment + 1] - lane->traj_x[segment];
+    float dy = lane->traj_y[segment + 1] - lane->traj_y[segment];
+    float length_squared = dx * dx + dy * dy;
+    if (length_squared < 1e-8f) return;
+    float rx = vehicle->x - lane->traj_x[segment];
+    float ry = vehicle->y - lane->traj_y[segment];
+    float fraction = clip((rx * dx + ry * dy) / length_squared, 0.0f, 1.0f);
+    float distance = hypotf(rx - fraction * dx, ry - fraction * dy);
+    float heading_dot = (vehicle->heading_x * dx + vehicle->heading_y * dy) / sqrtf(length_squared);
+    if (heading_dot < 0.8660254f) distance += 3.0f; // 30 degrees.
+    if (distance < *best_distance) {
+        *best_distance = distance;
+        *best_lane = lane_idx;
+        *best_segment = segment;
+        *best_fraction = fraction;
     }
-    return enter;
+}
+
+// Includes the current pose at index 0 and one pose per simulator tick, ending
+// exactly at horizon. The caller provides ttc_prediction_steps(env, horizon) + 1
+// points. Follow road centerlines at constant speed, regardless of stop lines.
+static void predict_vehicle_trajectory(Drive* env, const Entity* vehicle,
+                                      float horizon, TTCPose* points) {
+    int steps = ttc_prediction_steps(env, horizon);
+    for (int i = 0; i <= steps; i++) {
+        float time = fminf(i * env->dt, horizon);
+        points[i] = (TTCPose){vehicle->x + time * vehicle->vx, vehicle->y + time * vehicle->vy,
+                             vehicle->heading_x, vehicle->heading_y};
+    }
+    float speed = hypotf(vehicle->vx, vehicle->vy);
+    if (vehicle->type != VEHICLE || speed < 1e-6f ||
+        vehicle->x == INVALID_POSITION || vehicle->y == INVALID_POSITION ||
+        !isfinite(speed) || !isfinite(vehicle->x) || !isfinite(vehicle->y)) return;
+
+    int lane_idx = -1, segment = -1;
+    float fraction = 0.0f, best_distance = INFINITY;
+    if (env->grid_map) {
+        GridMapEntity neighbors[MAX_ENTITIES_PER_CELL * 25];
+        int count = checkNeighbors(env, vehicle->x, vehicle->y, neighbors,
+                                  MAX_ENTITIES_PER_CELL * 25, collision_offsets, 25);
+        for (int i = 0; i < count; i++) {
+            int index = neighbors[i].entity_idx;
+            if (index < 0 || index >= env->num_roads) continue;
+            ttc_lane_candidate(vehicle, &env->static_road_entities[index], neighbors[i].geometry_idx,
+                               index, &best_distance, &lane_idx, &segment, &fraction);
+        }
+    } else {
+        for (int i = 0; i < env->num_roads; i++) {
+            const StaticRoadEntity* lane = &env->static_road_entities[i];
+            for (int j = 0; lane->type == ROAD_LANE && j + 1 < lane->array_size; j++)
+                ttc_lane_candidate(vehicle, lane, j, i, &best_distance, &lane_idx, &segment, &fraction);
+        }
+    }
+    if (lane_idx < 0 || best_distance > 4.0f ||
+        vehicle->vx * vehicle->heading_x + vehicle->vy * vehicle->heading_y <= 0.0f)
+        return;
+    const StaticRoadEntity* lane = &env->static_road_entities[lane_idx];
+    float dx = lane->traj_x[segment + 1] - lane->traj_x[segment];
+    float dy = lane->traj_y[segment + 1] - lane->traj_y[segment];
+    float length = hypotf(dx, dy);
+    float heading_x = dx / length, heading_y = dy / length;
+    // Same 15-degree alignment tolerance as lane metrics; reversing uses CV.
+    if (vehicle->heading_x * heading_x + vehicle->heading_y * heading_y < 0.9659258f)
+        return;
+    float x = lane->traj_x[segment] + fraction * dx;
+    float y = lane->traj_y[segment] + fraction * dy;
+    // Preserve the initial position offset and small heading error as the lane bends.
+    float offset_x = vehicle->x - x, offset_y = vehicle->y - y;
+    float heading_cos = vehicle->heading_x * heading_x + vehicle->heading_y * heading_y;
+    float heading_sin = vehicle->heading_y * heading_x - vehicle->heading_x * heading_y;
+
+    for (int i = 1; i <= steps; i++) {
+        float time = (i - 1) * env->dt;
+        float remaining = speed * (fminf(i * env->dt, horizon) - time);
+        int lane_hops = 0;
+        while (remaining > 0.0f) {
+            if (lane_idx >= 0 && segment + 1 >= lane->array_size) {
+                int next_lane = -1;
+                // Bound traversal even for a cycle of zero-length geometry.
+                if (++lane_hops > env->num_roads ||
+                    !getNextLanes(env->topology_graph, lane_idx, &next_lane, 1) ||
+                    next_lane < 0 || next_lane >= env->num_roads ||
+                    env->static_road_entities[next_lane].type != ROAD_LANE ||
+                    env->static_road_entities[next_lane].array_size < 2) {
+                    lane_idx = -1;
+                } else {
+                    lane_idx = next_lane;
+                    lane = &env->static_road_entities[lane_idx];
+                    // Walk the small endpoint gap too, rather than teleporting.
+                    segment = -1;
+                }
+            }
+            length = remaining;
+            if (lane_idx >= 0) {
+                dx = lane->traj_x[segment + 1] - x;
+                dy = lane->traj_y[segment + 1] - y;
+                length = hypotf(dx, dy);
+                if (length < 1e-5f) {
+                    x = lane->traj_x[++segment];
+                    y = lane->traj_y[segment];
+                    continue;
+                }
+                heading_x = dx / length;
+                heading_y = dy / length;
+            }
+            float distance = fminf(remaining, length);
+            x += distance * heading_x;
+            y += distance * heading_y;
+            remaining -= distance;
+            if (lane_idx >= 0 && distance >= length) {
+                x = lane->traj_x[++segment];
+                y = lane->traj_y[segment];
+            }
+        }
+        points[i] = (TTCPose){x + offset_x, y + offset_y,
+            heading_x * heading_cos - heading_y * heading_sin,
+            heading_y * heading_cos + heading_x * heading_sin};
+    }
+}
+
+// Separating-axis test at each predicted pose, including its changing heading.
+// Return the first sampled body contact, or infinity if the horizon is clear.
+// Both paths must be predicted over this same horizon.
+static float vehicle_time_to_collision(const Drive* env, const Entity* ego, const TTCPose* ego_path,
+                                      const Entity* other, const TTCPose* other_path, float horizon) {
+    int steps = ttc_prediction_steps(env, horizon);
+    for (int step = 0; step <= steps; step++) {
+        float time = fminf(step * env->dt, horizon);
+        const TTCPose* a = &ego_path[step];
+        const TTCPose* b = &other_path[step];
+        float dx = b->x - a->x, dy = b->y - a->y;
+        const float axes[4][2] = {
+            {a->heading_x, a->heading_y}, {-a->heading_y, a->heading_x},
+            {b->heading_x, b->heading_y}, {-b->heading_y, b->heading_x}
+        };
+        int overlaps = 1;
+        for (int i = 0; i < 4; i++) {
+            float ax = axes[i][0], ay = axes[i][1];
+            float extent = 0.5f * (
+                ego->length * fabsf(ax * a->heading_x + ay * a->heading_y) +
+                ego->width * fabsf(-ax * a->heading_y + ay * a->heading_x) +
+                other->length * fabsf(ax * b->heading_x + ay * b->heading_y) +
+                other->width * fabsf(-ax * b->heading_y + ay * b->heading_x));
+            // Lane interpolation can accumulate a few micrometers of roundoff.
+            if (fabsf(dx * ax + dy * ay) > extent + 1e-5f) {
+                overlaps = 0;
+                break;
+            }
+        }
+        if (overlaps) return time;
+    }
+    return INFINITY;
 }
 
 static int vehicle_approaches_from_behind(const Entity* ego, const Entity* other) {
@@ -2523,7 +2669,7 @@ void init(Drive* env){
         acquire_static_road_map(env, map);
         release_static_road_map(map);
     }
-    if (env->use_goal_generation && !env->static_road_map->topology_initialized) {
+    if (!env->static_road_map->topology_initialized) {
         init_topology_graph(env);
         env->static_road_map->topology_graph = env->topology_graph;
         env->static_road_map->topology_initialized = 1;
@@ -3213,6 +3359,10 @@ static const ActorObservationPartners* visible_observation_actors(
 // Run after compute_observations so newly hidden and revealed actors take effect
 // in the same timestep's rewards.
 static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid) {
+    // Predict each participating actor at most once for this state snapshot.
+    TTCPose* trajectories = NULL;
+    unsigned char* predicted = NULL;
+    int point_count = ttc_prediction_steps(env, SAFETY_TIME_SECONDS) + 1;
     for (int agent_slot = 0; agent_slot < env->active_agent_count; agent_slot++) {
         int agent_idx = env->active_agent_indices[agent_slot];
         Entity* ego = &env->entities[agent_idx];
@@ -3222,6 +3372,18 @@ static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid)
             ego->collision_state == VEHICLE_COLLISION || speed_squared <= SAFETY_MIN_SPEED * SAFETY_MIN_SPEED) continue;
 
         const ActorObservationPartners* partners = visible_observation_actors(env, actor_grid, agent_slot);
+        if (!partners->count) continue;
+        if (!trajectories) {
+            trajectories = malloc((size_t)env->num_objects * point_count * sizeof(TTCPose));
+            predicted = calloc(env->num_objects, sizeof(unsigned char));
+            if (!trajectories || !predicted) RAISE_MEMORY_ERROR();
+        }
+        TTCPose* ego_path = trajectories + (size_t)agent_idx * point_count;
+        if (!predicted[agent_idx]) {
+            predict_vehicle_trajectory(env, ego, SAFETY_TIME_SECONDS, ego_path);
+            predicted[agent_idx] = 1;
+        }
+        float speed = sqrtf(speed_squared);
         int ttc_violation = 0, lateral_violation = 0;
         for (int j = 0; j < partners->count; j++) {
             int other_idx = partners->indices[j];
@@ -3243,12 +3405,20 @@ static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid)
                 vehicle_clearance_squared(ego, other) < SAFETY_CLEARANCE * SAFETY_CLEARANCE) {
                 lateral_violation = 1;
             }
-            if (other->type == VEHICLE &&
-                dx <= extent + SAFETY_TIME_SECONDS * fabsf(other->vx - ego->vx) &&
-                dy <= extent + SAFETY_TIME_SECONDS * fabsf(other->vy - ego->vy) &&
-                !vehicle_approaches_from_behind(ego, other) &&
-                vehicle_time_to_collision(ego, other) < SAFETY_TIME_SECONDS) {
-                ttc_violation = 1;
+            // Either car can turn: relative world-axis velocity is not a safe
+            // rejection bound. Their total travel distance is conservative.
+            float travel = SAFETY_TIME_SECONDS * (speed + hypotf(other->vx, other->vy));
+            if (!ttc_violation && other->type == VEHICLE &&
+                dx <= extent + travel && dy <= extent + travel &&
+                !vehicle_approaches_from_behind(ego, other)) {
+                TTCPose* other_path = trajectories + (size_t)other_idx * point_count;
+                if (!predicted[other_idx]) {
+                    predict_vehicle_trajectory(env, other, SAFETY_TIME_SECONDS, other_path);
+                    predicted[other_idx] = 1;
+                }
+                float ttc = vehicle_time_to_collision(env, ego, ego_path, other, other_path,
+                                                      SAFETY_TIME_SECONDS);
+                if (ttc <= SAFETY_TIME_SECONDS) ttc_violation = 1;
             }
         }
         float reward = -(ttc_violation + lateral_violation) * SAFETY_COLLISION_FRACTION *
@@ -3260,6 +3430,8 @@ static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid)
         }
         record_reward_component(env, agent_slot, REWARD_COMPONENT_SAFETY, reward);
     }
+    free(trajectories);
+    free(predicted);
 }
 
 // Pure observation conversion: repeated calls never advance history.

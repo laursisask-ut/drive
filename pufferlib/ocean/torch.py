@@ -112,6 +112,12 @@ def _wayformer_attention(attn, query, key_value=None, *, key_bias=None, use_fast
     head_dim = width // heads
     if key_value is None:
         qkv = F.linear(query, attn.in_proj_weight, attn.in_proj_bias)
+        if use_fast:
+            from pufferlib.ocean.drive.wayformer_attention import packed_attention
+
+            output = packed_attention(qkv.reshape(batch, length, 3, heads, head_dim), key_bias)
+            output = output.transpose(1, 2).reshape(batch, length, width)
+            return F.linear(output, attn.out_proj.weight, attn.out_proj.bias)
         q, k, v = qkv.reshape(batch, length, 3, heads, head_dim).permute(2, 0, 3, 1, 4).unbind(0)
     else:
         q = F.linear(query, attn.in_proj_weight[:width], attn.in_proj_bias[:width])

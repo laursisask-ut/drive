@@ -77,6 +77,24 @@ void CloseVideo(VideoRecorder *recorder) {
     waitpid(recorder->pid, NULL, 0);
 }
 
+static void draw_ttc_trajectories(Drive* env) {
+    int steps = ttc_prediction_steps(env, SAFETY_TIME_SECONDS);
+    TTCPose points[steps + 1];
+    for (int rank = 0; rank < env->num_controllable_agents; rank++) {
+        const Entity* vehicle = &env->entities[observation_actor_index(env, rank)];
+        if (vehicle->type != VEHICLE || vehicle->x == INVALID_POSITION ||
+            vehicle->y == INVALID_POSITION || !isfinite(vehicle->x) || !isfinite(vehicle->y)) continue;
+        predict_vehicle_trajectory(env, vehicle, SAFETY_TIME_SECONDS, points);
+        for (int i = 1; i <= steps; i++) {
+            // Road centerlines render at z=1; keep predictions visible above them.
+            Vector3 start = {points[i - 1].x, points[i - 1].y, 1.2f};
+            Vector3 end = {points[i].x, points[i].y, 1.2f};
+            if (Vector3DistanceSqr(start, end) < 1e-8f) continue;
+            DrawCylinderEx(start, end, 0.24f, 0.24f, 6, LIME);
+        }
+    }
+}
+
 void renderTopDownView(Drive* env, Client* client, float map_height, int obs, int lasers, int trajectories, int frame_count, float* path, int log_trajectories, int show_grid, float* reward_log) {
 
     BeginDrawing();
@@ -152,6 +170,9 @@ void renderTopDownView(Drive* env, Client* client, float map_height, int obs, in
 
     // Draw scene
     draw_scene(env, client, 1, obs, lasers, show_grid, camera, labels, MAX_AGENTS, &label_count);
+    const char* show_ttc_trajectories = getenv("SHOW_TTC_TRAJECTORIES");
+    if (show_ttc_trajectories && strcmp(show_ttc_trajectories, "1") == 0)
+        draw_ttc_trajectories(env);
     EndMode3D();
     for(int i = 0; i < label_count; i++) {
         if(!labels[i].visible) continue;
