@@ -302,7 +302,6 @@ struct Entity {
 
     HiddenVehicle hidden_vehicles[MAX_HIDDEN_VEHICLES];
     int hidden_vehicles_update_step; // Last sampled timestep + 1; zero means never.
-    int stop_line_timestep;
 };
 
 typedef struct StaticRoadEntity StaticRoadEntity;
@@ -2255,12 +2254,6 @@ void compute_agent_metrics(Drive* env, int agent_idx) {
         if(entity_list[i].entity_idx == -1) continue;
         const StaticRoadEntity* entity = &env->static_road_entities[entity_list[i].entity_idx];
 
-        if (entity->type == STOP_SIGN && stop_line_overlaps_vehicle(entity, agent, agent->x, agent->y, cos_heading, sin_heading) &&
-                !stop_line_overlaps_vehicle(entity, agent, agent->prev_x, agent->prev_y,
-                                           previous_pose[2], previous_pose[3])) {
-            agent->stop_line_timestep = env->timestep;
-        }
-
         if (env->traffic_lights_enabled && entity->type == TRAFFIC_LIGHT_STOP_LINE && road_traffic_light_color(env, entity) == TRAFFIC_LIGHT_RED) {
             // Test entry into the whole line, regardless of its previous color.
             if (stop_line_overlaps_vehicle(entity, agent, agent->x, agent->y, cos_heading, sin_heading) &&
@@ -2957,7 +2950,7 @@ void allocate(Drive* env){
     int max_obs = ego_dim + 7*(MAX_VISIBLE_AGENTS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float*)calloc(env->active_agent_count*max_obs, sizeof(float));
     env->actions = (float*)calloc(env->active_agent_count*2, sizeof(float));
-    env->rewards = (float*)calloc(env->active_agent_count*32, sizeof(float));
+    env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
     env->terminals= (unsigned char*)calloc(env->active_agent_count, sizeof(unsigned char));
     env->truncations = (unsigned char*)calloc(env->active_agent_count, sizeof(unsigned char));
 }
@@ -3112,7 +3105,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx){
         }
 
         float comfort_reward = -agent->comfort_reward_coefficient * comfort_violations;
-        env->rewards[action_idx * 32 + 31] += comfort_reward;
+        env->rewards[action_idx] += comfort_reward;
         record_reward_component(env, action_idx, REWARD_COMPONENT_COMFORT, comfort_reward);
     } else {
         // JERK dynamics model
@@ -3423,11 +3416,7 @@ static void apply_safety_penalties(Drive* env, ActorObservationGrid* actor_grid)
         }
         float reward = -(ttc_violation + lateral_violation) * SAFETY_COLLISION_FRACTION *
             ego->safety_reward_coefficient * (1.0f + 0.1f * sqrtf(speed_squared));
-        if (ego->stop_line_timestep > 0 && ego->stop_line_timestep < env->timestep && env->timestep - ego->stop_line_timestep < 32) {
-            env->rewards[agent_slot * 32 + 31 - (env->timestep - ego->stop_line_timestep)] += reward;
-        } else {
-            env->rewards[agent_slot * 32 + 31] += reward;
-        }
+        env->rewards[agent_slot] += reward;
         record_reward_component(env, agent_slot, REWARD_COMPONENT_SAFETY, reward);
     }
     free(trajectories);
@@ -3846,7 +3835,7 @@ int subsample_scenario() {
 }
 
 void c_reset(Drive* env){
-    memset(env->rewards, 0, env->active_agent_count * 32 * sizeof(float));
+    memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
 
@@ -3923,7 +3912,6 @@ void c_reset(Drive* env){
         env->entities[agent_idx].metrics_array[AVG_DISPLACEMENT_ERROR_IDX] = 0.0f;
         env->entities[agent_idx].cumulative_displacement = 0.0f;
         env->entities[agent_idx].displacement_sample_count = 0;
-        env->entities[agent_idx].stop_line_timestep = 0;
 
         if (env->use_goal_generation) {
             env->entities[agent_idx].goal_position_x = env->entities[agent_idx].init_goal_x;
@@ -3999,7 +3987,7 @@ float compute_distance_to_goal(Entity* e) {
 }
 
 void c_step(Drive* env){
-    memset(env->rewards, 0, env->active_agent_count * 32 * sizeof(float));
+    memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
 
@@ -4046,11 +4034,7 @@ void c_step(Drive* env){
             if (collision_state == VEHICLE_COLLISION && prev_collision_state != VEHICLE_COLLISION) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float collision_reward = -e->collision_reward_coefficient * (1 + 0.1 * speed);
-                if (e->stop_line_timestep > 0 && e->stop_line_timestep < env->timestep && env->timestep - e->stop_line_timestep < 32) {
-                    env->rewards[i * 32 + 31 - (env->timestep - e->stop_line_timestep)] += collision_reward;
-                } else {
-                    env->rewards[i * 32 + 31] += collision_reward;
-                }
+                env->rewards[i] = collision_reward;
                 record_reward_component(env, i, REWARD_COMPONENT_COLLISION, collision_reward);
                 env->logs[i].collision_rate = 1.0f;
                 env->logs[i].avg_collisions_per_agent += 1.0f;
@@ -4078,16 +4062,12 @@ void c_step(Drive* env){
                 // Continuing contact costs 1% per step, without another collision event.
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float collision_reward = -0.01f * e->collision_reward_coefficient * (1 + 0.1f * speed);
-                if (e->stop_line_timestep > 0 && e->stop_line_timestep < env->timestep && env->timestep - e->stop_line_timestep < 32) {
-                    env->rewards[i * 32 + 31 - (env->timestep - e->stop_line_timestep)] += collision_reward;
-                } else {
-                    env->rewards[i * 32 + 31] += collision_reward;
-                }
+                env->rewards[i] += collision_reward;
                 record_reward_component(env, i, REWARD_COMPONENT_COLLISION, collision_reward);
             } else if (collision_state == OFFROAD && prev_collision_state != OFFROAD) {
                 float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
                 float offroad_reward = -e->offroad_reward_coefficient * (1 + 0.1 * speed);
-                env->rewards[32 * i + 31] = offroad_reward;
+                env->rewards[i] = offroad_reward;
                 env->logs[i].offroad_rate = 1.0f;
                 record_reward_component(env, i, REWARD_COMPONENT_OFFROAD, offroad_reward);
                 env->logs[i].avg_offroad_per_agent += 1.0f;
@@ -4099,7 +4079,7 @@ void c_step(Drive* env){
             } else if (collision_state == RED_TRAFFIC_LIGHT_CROSSED) {
                 // Geometry already requires new overlap with a specific red line.
                 float stop_line_reward = -e->stop_line_reward_coefficient;
-                env->rewards[32 * i + 31] = stop_line_reward;
+                env->rewards[i] = stop_line_reward;
                 env->logs[i].stop_line_rate = 1.0f;
                 record_reward_component(env, i, REWARD_COMPONENT_STOP_LINE, stop_line_reward);
                 env->logs[i].avg_stop_line_per_agent += 1.0f;
@@ -4119,7 +4099,7 @@ void c_step(Drive* env){
 
         if (lateral_offset > -100.0f && lane_heading_angle_diff < M_PI/3.0f) {
             float lane_center_reward = e->lane_center_reward_coefficient * (-fabsf(e->lane_center_bias - lateral_offset) + 0.05f / expf(fabsf(lateral_offset - e->lane_center_bias) - 0.5f));
-            env->rewards[32 * i + 31] += lane_center_reward;
+            env->rewards[i] += lane_center_reward;
             record_reward_component(env, i, REWARD_COMPONENT_LANE_CENTER, lane_center_reward);
             if (e->lane_center_reward_coefficient > 0.0f) {
                 record_lane_center_offset_count(env, lateral_offset, e->lane_center_bias);
@@ -4129,7 +4109,7 @@ void c_step(Drive* env){
         float speed = sqrtf(e->vx*e->vx + e->vy*e->vy);
 
         float speed_limit_reward = compute_speed_limit_reward(env, e, speed);
-        env->rewards[32 * i + 31] += speed_limit_reward;
+        env->rewards[i] += speed_limit_reward;
         record_reward_component(env, i, REWARD_COMPONENT_SPEED_LIMIT, speed_limit_reward);
 
         if (lateral_offset > -100.0f) {
@@ -4138,12 +4118,12 @@ void c_step(Drive* env){
             env->logs[i].close_to_lane += 1.0f;
 
             float lane_align_reward = e->lane_align_reward_coefficient * (fminf(cosf(lane_heading_angle_diff), 0.0f) + 0.0025f * (1 - lane_heading_angle_diff / M_PI * 2.0f));
-            env->rewards[32 * i + 31] += lane_align_reward;
+            env->rewards[i] += lane_align_reward;
             record_reward_component(env, i, REWARD_COMPONENT_LANE_ALIGNMENT, lane_align_reward);
 
             if (speed > 2.5f) {
                 float velocity_reward = 2.5e-4f * fmax(cosf(lane_heading_angle_diff), 0.0f);
-                env->rewards[32 * i + 31] += velocity_reward;
+                env->rewards[i] += velocity_reward;
                 record_reward_component(env, i, REWARD_COMPONENT_VELOCITY, velocity_reward);
             }
         }
@@ -4153,7 +4133,7 @@ void c_step(Drive* env){
         // Reward agent if it is within X meters of goal
         if (!env->entities[agent_idx].reached_final_goal && distance_to_goal < env->entities[agent_idx].goal_radius) {
             if (short_term_goals()) {
-                env->rewards[32 * i + 31] += env->reward_goal;
+                env->rewards[i] += env->reward_goal;
                 record_reward_component(env, i, REWARD_COMPONENT_GOAL, env->reward_goal);
                 env->logs[i].num_goals_reached += 1;
                 env->entities[agent_idx].reached_goal_this_episode = 1;
@@ -4171,7 +4151,7 @@ void c_step(Drive* env){
                 // The vehicle must slow down to 1 m/s to obtain the last goal reward
                 if (speed < 1 || env->entities[agent_idx].multi_goal_idx < env->entities[agent_idx].multi_goal_count - 1) {
                     float reward = env->reward_goal;
-                    env->rewards[32 * i + 31] += reward;
+                    env->rewards[i] += reward;
                     record_reward_component(env, i, REWARD_COMPONENT_GOAL, reward);
                     env->entities[agent_idx].sampled_new_goal = 1;
                     env->logs[i].num_goals_reached += 1;
@@ -4188,7 +4168,7 @@ void c_step(Drive* env){
                     }
                 }
             } else {
-                env->rewards[32 * i + 31] += env->reward_goal;
+                env->rewards[i] += env->reward_goal;
                 record_reward_component(env, i, REWARD_COMPONENT_GOAL, env->reward_goal);
                 env->entities[agent_idx].sampled_new_goal = 1;
                 env->logs[i].num_goals_reached += 1;
@@ -4207,7 +4187,7 @@ void c_step(Drive* env){
         float current_ade = env->entities[agent_idx].metrics_array[AVG_DISPLACEMENT_ERROR_IDX];
         if(current_ade > 0.0f && env->reward_ade != 0.0f) {
             float ade_reward = env->reward_ade * current_ade;
-            env->rewards[32 * i + 31] += ade_reward;
+            env->rewards[i] += ade_reward;
             record_reward_component(env, i, REWARD_COMPONENT_ADE, ade_reward);
         }
         env->logs[i].avg_displacement_error = current_ade;

@@ -432,8 +432,6 @@ class PuffeRL:
         config = self.config
         device = config["device"]
 
-        self.rewards.zero_()
-
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile("env", epoch)
@@ -495,8 +493,7 @@ class PuffeRL:
 
                 self.actions[batch_rows, l] = action
                 self.logprobs[batch_rows, l] = logprob
-                self.rewards[batch_rows, :l + 1] += r[:, max(0, 31 - l):]
-                self.rewards[batch_rows, l] += r[:, :max(0, 31 - l)].sum(dim=-1)
+                self.rewards[batch_rows, l] = r
                 self.terminals[batch_rows, l] = d.float()
                 self.truncations[batch_rows, l] = t.float()
                 self.values[batch_rows, l] = value.flatten()
